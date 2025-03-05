@@ -37,7 +37,7 @@ pandas==2.2.2
 psycopg2==2.9.9
 psycopg2-binary==2.9.9
 pycparser==2.22
-pydal==20240428.2
+pydal
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 pytz==2024.1

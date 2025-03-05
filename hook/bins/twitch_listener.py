@@ -12,7 +12,7 @@ import requests
 
 import logging
 
-from src.dataclasses.dataclasses import identityPayload, activity, contextPayload
+from libs.botClasses import identityPayload, activity, contextPayload
 from dataclasses import asdict
 
 # Set the logging level
