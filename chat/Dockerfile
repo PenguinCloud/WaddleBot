@@ -52,7 +52,7 @@ RUN pip install -r requirements.txt
 WORKDIR /opt/manager
 
 # BUILD IT!
-RUN ansible-playbook entrypoint.yml -c local --tags "build,run"
+RUN ansible-playbook entrypoint.yml -c local --tags "build"
 
 
 # Switch to non-root user
