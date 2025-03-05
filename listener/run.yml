@@ -1,6 +1,0 @@
----
-- name: Run the WaddleBot-Listener configure script
-  ansible.builtin.script: /opt/manager/listener_main.py
-  args:
-    executable: python3
-
