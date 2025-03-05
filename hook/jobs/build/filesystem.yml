@@ -1,0 +1,24 @@
+---
+- name: Add the user and create needed paths
+  hosts: all
+  tasks:
+    - name: Add the run user
+      ansible.builtin.user:
+        name: "{{ run.user }}"
+        comment: Specified Run User
+        groups: root
+        append: true
+
+    - name: Ensure manager files are present and executable
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state | default('file') }}"
+        owner: "{{ run.user }}"
+        group: "{{ run.user }}"
+        mode: '0755'
+      loop:
+        - { path: "/opt/manager/listener_main.py" }
+        - { path: "/opt/manager/squeeker.txt", state: "touch" }
+        - { path: "/opt/manager/bananafile.json", state: "touch" }
+        - { path: "/etc/{{ app.title }}", state: "directory" } 
+

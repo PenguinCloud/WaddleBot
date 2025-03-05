@@ -1,0 +1,11 @@
+---
+- name: Install apt packages
+  ansbile.builtin.apt:
+    packages:
+      - python3-dev
+      - libpq-dev
+      - postgresql
+- name: Install pip packages
+  ansible.builtin.pip:
+    requirements: "/opt/manager/requirements.txt"
+    virtualenv: "venv/"
