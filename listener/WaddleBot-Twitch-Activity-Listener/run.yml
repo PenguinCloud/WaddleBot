@@ -1,5 +1,0 @@
----
-- name: Run the WaddleBot-Gateway-Manager configure script
-  ansible.builtin.script: /opt/manager/app.py
-  args:
-    executable: python3
