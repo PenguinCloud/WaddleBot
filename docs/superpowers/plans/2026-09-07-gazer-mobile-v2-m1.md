@@ -554,8 +554,8 @@ Append to `Makefile` (repo root), after the existing `pre-commit:` target — do
 # host. Host Flutter (snap) is never invoked directly; see docs/superpowers/
 # specs/2026-09-07-gazer-mobile-v2-design.md Toolchain, CI, Versioning.
 .PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
-# mobile-test-integration/mobile-screenshots/seed-mock-data-mobile are added by writer E in
-# Tasks 21-22, not this task -- pre-declared phony here (harmless before those targets exist)
+# added later: mobile-test-integration by Task 21; mobile-screenshots and seed-mock-data-mobile
+# by Task 26 -- pre-declared phony here (harmless before those targets exist)
 # so the whole mobile-* target set is uniformly a .PHONY gate from the very first commit.
 
 MOBILE_IMAGE := gazer-toolchain:3.47.2
@@ -779,7 +779,6 @@ cat > mobile/gazer/l10n.yaml <<'L10N_EOF'
 arb-dir: lib/l10n
 template-arb-file: app_en.arb
 output-localization-file: app_localizations.dart
-output-dir: lib/l10n/generated
 output-class: AppLocalizations
 nullable-getter: false
 synthetic-package: false
@@ -3314,8 +3313,8 @@ would fail before build_runner ever executes.
   `make mobile-test-android`
   Expected PASS: gradle `testDebugUnitTest` and `jacocoTestReport` succeed; `Pipeline.g.kt`
   compiles as part of the module (no Kotlin unit tests target it directly yet — it is pure
-  generated glue, excluded from the JaCoCo coverage denominator by the exclusion pattern Task 1
-  configured for `**/pigeon/*.g.kt`).
+  generated glue, excluded from the JaCoCo coverage denominator by the exclusion pattern Task 2
+  Step 10 configured (`exclude("**/pigeon/**")` in the JaCoCo report task)).
 
 - [ ] **Step 10: Lint**
 
@@ -6212,10 +6211,10 @@ provider or test double but Task 12/11 owns its file placement or internal shape
 the following explicit, minimal assumptions so every import path and test call below is a real
 name, never an invented one:
 
-1. **l10n output**: `l10n.yaml` (Task 2) sets `synthetic-package: false` with no `output-dir`
-   override, so Flutter's default applies (`output-dir` = `arb-dir`) and `flutter gen-l10n`
-   (run by `make mobile-codegen`) emits `lib/l10n/app_localizations.dart` directly — imported
-   here as `l10n/app_localizations.dart` (relative) or `package:gazer/l10n/app_localizations.dart`.
+1. **l10n output**: l10n.yaml has no output-dir override, so `flutter gen-l10n` writes
+   `lib/l10n/app_localizations.dart` (Flutter 3.47 default: output goes into the arb dir)
+   (run by `make mobile-codegen`) — imported here as `l10n/app_localizations.dart` (relative)
+   or `package:gazer/l10n/app_localizations.dart`.
 2. **Leaf-provider file placement** (Task 9/12): each overridable leaf provider lives beside its
    primary consumer, per the file map — `gazerHostApiProvider` in `lib/providers/devices_provider.dart`
    (Task 9; `pipelineControllerProvider` in `lib/providers/pipeline_provider.dart` imports it from
@@ -6242,10 +6241,10 @@ name, never an invented one:
    needs a populated device list (e.g. `SourcePicker`, "Go Live" enablement) sets
    `hostApi.videoDevices = [...]` in its own `setUp`/test body before pumping.
 4. **`TargetValidator.validate()` messageKey values** (Task 5): `'errorUrlScheme'`,
-   `'errorUrlHost'`, `'errorUrlPath'`, `'errorAuthBothOrNeither'` — `ValidationIssue` itself is
-   declared in `lib/services/target_validator.dart` (no dedicated model file for it in the file
-   map). `validateGazerSettings` (Task 14, `lib/services/settings_validation.dart`) additionally
-   emits `messageKey: 'rtmpAuthDisabled'` (no `error` prefix) for the license-gated auth check.
+   `'errorUrlHost'`, `'errorUrlPath'`, `'errorAuthBothOrNeither'` — `ValidationIssue` is declared
+   in `lib/models/validation_issue.dart` (Task 4) and merely imported by `target_validator.dart`;
+   screens import it directly. `validateGazerSettings` (Task 14, `lib/services/settings_validation.dart`)
+   additionally emits `messageKey: 'rtmpAuthDisabled'` (no `error` prefix) for the license-gated auth check.
 5. **Riverpod codegen naming**: `@riverpod`/`@Riverpod` functions/classes generate a provider
    named `<name>Provider` (e.g. `license(Ref ref)` → `licenseProvider`), per riverpod_generator
    4.0.9 convention — matches every provider name the SHARED CONTRACT already uses verbatim.
@@ -7144,6 +7143,7 @@ not `'../l10n/app_localizations.dart'`.
 
 ```dart
 import '../models/gazer_settings.dart';
+import '../models/validation_issue.dart';
 import '../services/feature_flags.dart';
 import '../services/target_validator.dart';
 import '../config/flag_keys.dart';
@@ -7344,11 +7344,13 @@ import '../l10n/app_localizations.dart';
 import '../l10n/error_text.dart';
 import '../models/gazer_settings.dart';
 import '../models/pipeline_state.dart';
+import '../models/validation_issue.dart';
 import '../pigeon/pipeline.g.dart';
 import '../providers/devices_provider.dart';
 import '../providers/license_provider.dart';
 import '../providers/pipeline_provider.dart';
 import '../providers/settings_provider.dart';
+import '../services/feature_flags.dart';
 import '../services/settings_validation.dart';
 import '../widgets/source_picker.dart';
 import '../widgets/status_chip.dart';
@@ -7764,8 +7766,10 @@ import '../l10n/app_localizations.dart';
 import '../models/gazer_settings.dart';
 import '../models/quality.dart';
 import '../models/stream_target_settings.dart';
+import '../models/validation_issue.dart';
 import '../providers/license_provider.dart';
 import '../providers/settings_provider.dart';
+import '../services/feature_flags.dart';
 import '../services/settings_validation.dart';
 import '../services/target_validator.dart';
 
@@ -8375,11 +8379,13 @@ import '../l10n/app_localizations.dart';
 import '../l10n/error_text.dart';
 import '../models/gazer_settings.dart';
 import '../models/pipeline_state.dart';
+import '../models/validation_issue.dart';
 import '../pigeon/pipeline.g.dart';
 import '../providers/devices_provider.dart';
 import '../providers/license_provider.dart';
 import '../providers/pipeline_provider.dart';
 import '../providers/settings_provider.dart';
+import '../services/feature_flags.dart';
 import '../services/settings_validation.dart';
 import '../widgets/source_picker.dart';
 import '../widgets/status_chip.dart';
@@ -12378,21 +12384,21 @@ change needed in this task.
   import '../l10n/error_text.dart';
   import '../models/gazer_settings.dart';
   import '../models/pipeline_state.dart';
+  import '../models/validation_issue.dart';
   import '../pigeon/pipeline.g.dart';
   import '../providers/devices_provider.dart';
   import '../providers/license_provider.dart';
   import '../providers/pipeline_provider.dart';
   import '../providers/settings_provider.dart';
+  import '../services/feature_flags.dart';
   import '../services/settings_validation.dart';
   import '../widgets/source_picker.dart';
   import '../widgets/status_chip.dart';
   import 'status_panel.dart';
   ```
-  Replace with (new `permission_handler` package import; new `feature_flags.dart` and
-  `permission_gate.dart` relative imports — `feature_flags.dart` closes a pre-existing gap: the
-  existing `build()` method already declares `final FeatureFlags flags = ref.watch(featureFlagsProvider);`
-  and this task's new method takes a `FeatureFlags` parameter too, so the type must be in scope
-  directly rather than relying on `license_provider.dart` re-exporting it):
+  Replace with (new `permission_handler` package import; new `permission_gate.dart` relative
+  import — `feature_flags.dart` is already imported above, since Task 16 Step 4 added it, so this
+  step only verifies it rather than re-adding it):
   ```dart
   import 'package:flutter/material.dart';
   import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12404,6 +12410,7 @@ change needed in this task.
   import '../l10n/error_text.dart';
   import '../models/gazer_settings.dart';
   import '../models/pipeline_state.dart';
+  import '../models/validation_issue.dart';
   import '../pigeon/pipeline.g.dart';
   import '../providers/devices_provider.dart';
   import '../providers/license_provider.dart';
@@ -12416,6 +12423,12 @@ change needed in this task.
   import '../widgets/status_chip.dart';
   import 'status_panel.dart';
   ```
+  Verify the pre-existing `feature_flags.dart` import (the one this step used to re-add) is
+  actually present rather than assuming it:
+  ```bash
+  grep -n "services/feature_flags.dart" mobile/gazer/lib/screens/home_screen.dart
+  ```
+  Expected: 1 line.
 
   Quote the exact existing Go Live `FilledButton` block (Task 16's final `home_screen.dart` —
   identical text also appears, now superseded, in Task 14's version):
@@ -14948,12 +14961,14 @@ Expected: `1` (appears once, inside `env:`, never inside a `run:` string).
 
 - [ ] **Step 6: Modify `.github/workflows/gazer-mobile.yml` `release` job — reject debug-signed artifacts**
 
-Anchor (Task 3 Step 2's exact `release` job header, to be replaced — only the `needs:`/missing
-`container:` lines change; steps after `Checkout code` gain one new step):
+Anchor (the `release` job header as Task 21 Step 15b already left it — that step appended
+`integration` to Task 3 Step 2's original `needs:` list before this task runs; only the
+`needs:`/missing `container:` lines change here, and steps after `Checkout code` gain one new
+step):
 ```yaml
   release:
     name: GitHub Release
-    needs: [build, test, android-unit, security]
+    needs: [build, test, android-unit, security, integration]
     if: startsWith(github.ref, 'refs/tags/gazer-v')
     runs-on: ubuntu-latest
     permissions:
@@ -14980,7 +14995,7 @@ Replace with:
 ```yaml
   release:
     name: GitHub Release
-    needs: [toolchain, build, test, android-unit, security]
+    needs: [toolchain, build, test, android-unit, security, integration]
     if: startsWith(github.ref, 'refs/tags/gazer-v')
     runs-on: ubuntu-latest
     permissions:
@@ -15031,10 +15046,11 @@ Replace with:
 ```
 (`GITHUB_TOKEN` masking is automatic for all workflow secrets — no extra step needed.)
 
-**Reminder for whoever lands Task 21's writer-E note:** Task 3's own `release` job comment says
-Task 21 must extend `needs:` to `[build, test, android-unit, security, integration]`. This task's
-`needs:` list above already includes `toolchain` for the container pull — Task 21's edit must
-produce `needs: [toolchain, build, test, android-unit, security, integration]`, not drop `toolchain`.
+**Note:** Task 3's own `release` job comment told Task 21 to extend `needs:` to
+`[build, test, android-unit, security, integration]`, and Task 21 Step 15b already applied that
+sed before this task runs — the anchor above reflects that post-Task-21 state. This task's
+replacement adds `toolchain` for the container pull while preserving `integration`, producing
+the final `needs: [toolchain, build, test, android-unit, security, integration]`.
 
 Run: `grep -c 'CN=Android Debug' .github/workflows/gazer-mobile.yml`
 Expected: `1`
@@ -15671,7 +15687,9 @@ COMMIT_EOF
       await tester.pumpAndSettle(const Duration(seconds: 5));
 
       // Home, idle, mock target/quality already seeded by --dart-define=GAZER_SEED=true at launch.
-      await binding.takeScreenshot('home-idle-$_formFactor');
+      // Phone keeps the historical "home-idle-phone" name; tablet uses "home-tablet" to match
+      // the fixed 5-file marketing set (see the Produces line and collect_screenshots.sh NAMES).
+      await binding.takeScreenshot(_formFactor == 'phone' ? 'home-idle-phone' : 'home-tablet');
 
       if (_formFactor == 'phone') {
         await tester.tap(find.byKey(const Key('settingsGearButton')));
@@ -15687,7 +15705,7 @@ COMMIT_EOF
     });
   }
   ```
-  This produces exactly 3 files on the phone run (`home-idle-phone`, `settings-phone`, `status-panel-phone`) and 2 on the tablet run (`home-idle-tablet`, `status-panel-tablet`) — 5 total, matching the fixed-name set below. Cannot run standalone yet — Step 9's entrypoint drives both AVDs.
+  This produces exactly 3 files on the phone run (`home-idle-phone`, `settings-phone`, `status-panel-phone`) and 2 on the tablet run (`home-tablet`, `status-panel-tablet`) — 5 total, matching the fixed-name set below. Cannot run standalone yet — Step 9's entrypoint drives both AVDs.
   Commit:
   ```
   git add mobile/gazer/integration_test/screenshots_test.dart
