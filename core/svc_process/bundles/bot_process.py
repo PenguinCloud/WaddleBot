@@ -127,6 +127,8 @@ _FEATURE_MODULES: dict[str, str] = {
     "reputation": "bundles.community_reputation_process",
     "rep": "bundles.community_reputation_process",
     "inventory": "bundles.inventory_process",
+    "sr": "bundles.social_music_process",
+    "songrequest": "bundles.social_music_process",
 }
 
 
@@ -172,6 +174,7 @@ _HELP_COMMUNITY_FEATURES = (
     "channels",
     "reputation",
     "inventory",
+    "sr",
 )
 
 

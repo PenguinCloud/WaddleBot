@@ -32,11 +32,22 @@ from quart_schema import validate_request, validate_response
 
 from services import community_music_queue_service as svc
 from services.community_authz import authorize_community
+from services.community_common import is_valid_service_key
 from services.current_user import get_current_user_id, get_optional_current_user_id
 from services.dto_response import jsonify_dto
-from services.errors import ApiError, bad_request
+from services.errors import ApiError, bad_request, not_found
 
 music_queue_bp = Blueprint("v1_community_music_queue", __name__, url_prefix="/api/v1/admin")
+
+#: Service-to-service only -- a chat command (`!sr`/`!songrequest`,
+#: `core/svc_action/bundles/social_music_action.py`) has no user JWT to
+#: present, so it can't call `music_queue_bp`'s own admin-scoped enqueue
+#: route above. Mirrors `core/reputation_module`'s `POST /api/v1/internal/
+#: events` pattern (`X-Service-Key`, no tenant/JWT) -- see
+#: `services.community_common.is_valid_service_key`'s own docstring.
+music_internal_bp = Blueprint(
+    "v1_community_music_queue_internal", __name__, url_prefix="/api/v1/internal"
+)
 
 
 def _dal() -> tuple[Any, Any]:
@@ -373,4 +384,102 @@ async def advance_queue(community_id: int) -> Any:
     return jsonify_dto(AdvanceResponse(success=True, previous=previous, next=next_item))
 
 
-BLUEPRINTS: list[Blueprint] = [music_queue_bp]
+# ---------------------------------------------------------------------------
+# Internal: service-to-service enqueue (chat commands)
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_requester(
+    dal: Any, *, community_id: int, platform: str | None, platform_user_id: str | None
+) -> int | None:
+    """Best-effort `hub_users.id` lookup from a chat requester's platform identity.
+
+    `community_members.user_id` is a stringified `hub_users.id` (legacy
+    platform-identity membership model, see `hub_api/services/schema.py::
+    bind_auth_tables`'s own comment) -- returns `None` on no match/no
+    platform info/a non-integer `user_id`, never raises: an unlinked
+    chatter can still queue a song, just with no hub user attribution.
+    """
+    if not platform or not platform_user_id:
+        return None
+    row = (
+        dal(
+            (dal.community_members.community_id == community_id)
+            & (dal.community_members.platform == platform)
+            & (dal.community_members.platform_user_id == platform_user_id)
+        )
+        .select()
+        .first()
+    )
+    if row is None or not row.user_id:
+        return None
+    try:
+        return int(row.user_id)
+    except (TypeError, ValueError):
+        return None
+
+
+@music_internal_bp.route("/music/queue/requests", methods=["POST"])
+# NOT typed `tuple[dict[str, object], int]` -- the success path returns
+# `jsonify_dto(...)`'s `tuple[Response, int]` (see that helper's own
+# docstring: bypasses quart-schema's `TypeAdapter` crash on a nested-
+# dataclass response), matching `set_policy`/the admin `enqueue_song_
+# request` route's own `-> Any` above.
+async def internal_enqueue_song_request() -> Any:
+    """`POST /api/v1/internal/music/queue/requests` -- service-to-service only.
+
+    Lets a pipeline action bundle (no user JWT -- a chat command, not an
+    admin API call) enqueue a Music Station song request on a viewer's
+    behalf. `communityId`/`urlOrQuery` are required; `tenantId` is
+    deliberately NOT accepted from the caller -- it's derived from the
+    community row itself (security.md: never trust a tenant claim from
+    the caller when it can instead come from an already-tenant-scoped
+    row), same trust boundary reasoning as `communityId` being trusted at
+    all here: this route is service-key gated, not open to the internet.
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    body = await request.get_json(force=True, silent=True) or {}
+    community_id = body.get("communityId")
+    url_or_query = body.get("urlOrQuery")
+    if (
+        not isinstance(community_id, int)
+        or not isinstance(url_or_query, str)
+        or not url_or_query.strip()
+    ):
+        return {"success": False, "error": "communityId and urlOrQuery are required"}, 400
+
+    async_dal, dal = _dal()
+
+    community_row = dal(dal.communities.id == community_id).select().first()
+    if community_row is None:
+        return _err(not_found("Community not found"))
+    tenant_id = int(community_row.tenant_id)
+
+    platform = body.get("platform")
+    platform_user_id = body.get("platformUserId")
+    requested_by = await _resolve_requester(
+        dal,
+        community_id=community_id,
+        platform=platform if isinstance(platform, str) else None,
+        platform_user_id=platform_user_id if isinstance(platform_user_id, str) else None,
+    )
+
+    try:
+        item = await svc.enqueue_request(
+            async_dal,
+            dal,
+            tenant_id=tenant_id,
+            community_id=community_id,
+            url_or_query=url_or_query,
+            provider=body.get("provider"),
+            requested_by=requested_by,
+            is_admin_override=False,
+        )
+    except ApiError as exc:
+        return _err(exc)
+    return jsonify_dto(QueueItemResponse(success=True, item=item), 201)
+
+
+BLUEPRINTS: list[Blueprint] = [music_queue_bp, music_internal_bp]
