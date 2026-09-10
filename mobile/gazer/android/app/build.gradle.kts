@@ -166,6 +166,17 @@ tasks.register<JacocoReport>("jacocoTestReport") {
             // real logic added later.
             "**/MainActivity.class",
             "**/MainActivity\$*.class",
+            // RootEncoderEngine wraps RootEncoder's GenericStream (real Camera2/MediaCodec/
+            // socket stack); it cannot run on the JVM unit-test target and is exercised by the
+            // instrumented StreamServiceTest (Task 20) instead. Excluded here so the JaCoCo
+            // >=90% gate does not count admittedly-uncovered forwarding calls against a class
+            // that unit tests structurally cannot reach - narrow, single class, documented, not
+            // a blanket exclusion. (Folded into this shared fileFilter -- rather than a separate
+            // tasks.withType<JacocoReport>().configureEach{} block -- because classDirectories
+            // below is already set to this filtered debugTree; a second post-hoc
+            // classDirectories.files.map{fileTree(it){...}} would re-wrap already-resolved leaf
+            // .class files instead of directories and silently produce an empty report.)
+            "**/pipeline/RootEncoderEngine.class",
         )
     val debugTree =
         fileTree("${layout.buildDirectory.get()}/tmp/kotlin-classes/debug") {
