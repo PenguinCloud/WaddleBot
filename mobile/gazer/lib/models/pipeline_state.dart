@@ -1,25 +1,11 @@
-/// Error codes reported by the native pipeline across the Pigeon boundary.
-///
-/// TEMPORARY (Task 4 only): hand-written here so [GazerError] and
-/// [PipelineState] compile before Task 6 generates the canonical Pigeon
-/// enum. Task 6 replaces this declaration with an import of
-/// `package:gazer/pigeon/pipeline.g.dart`'s `GazerErrorCode` (same 13
-/// members, same order) and deletes this block — see Task 6 Step 5.
-enum GazerErrorCode {
-  usbPermissionDenied,
-  uvcNoUsableFormat,
-  uvcOpenFailed,
-  cameraUnavailable,
-  cameraInUse,
-  encoderFailed,
-  audioSourceFailed,
-  rtmpAuthFailed,
-  rtmpConnectFailed,
-  rtmpDisconnected,
-  usbDetached,
-  serviceStartDenied,
-  unknown,
-}
+// GazerErrorCode is Pigeon-generated (see pigeons/pipeline.dart) and is the
+// single canonical source of truth for these 13 members (ruling R21: one
+// enum, not a hand-written duplicate). It is imported here for local use in
+// [GazerError] below, and re-exported so callers that already import this
+// file for GazerErrorCode (predating the Pigeon contract) keep resolving it
+// without changing their imports.
+import 'package:gazer/pigeon/pipeline.g.dart';
+export 'package:gazer/pigeon/pipeline.g.dart' show GazerErrorCode;
 
 /// An error surfaced by the native pipeline, carried inside [ErrorState].
 ///
