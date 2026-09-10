@@ -15952,3 +15952,1978 @@ COMMIT_EOF
   (Use the actual date the manual test is run for both the filename and the note's contents, not necessarily 2026-09-07 if verification happens later.)
 
   **Merge gate:** Merge to `release/v3.0.X` happens via PR per the `merging-to-release` skill, and only once every gate above — `make mobile-lint`, `make mobile-test` (>=90%), `make mobile-test-android` (>=90%), `make mobile-security` (0 findings, non-zero denominator recorded), `make mobile-build` (all ABIs < 100MB), `make mobile-test-integration` (non-zero test count), CI green on every job, and the manual physical-device recovery test — is green. No direct merge, no `--admin`, no exceptions.
+
+
+### Task 27: OpenTelemetry emission
+
+**Files:**
+- Create: `mobile/gazer/lib/telemetry/telemetry_config.dart`, `mobile/gazer/lib/telemetry/otlp_http_exporter.dart`, `mobile/gazer/lib/telemetry/gazer_telemetry.dart`, `mobile/gazer/lib/providers/telemetry_provider.dart`
+- Test: `mobile/gazer/test/telemetry/telemetry_config_test.dart`, `mobile/gazer/test/telemetry/otlp_sink_test.dart`
+- Modify: `mobile/gazer/lib/services/gazer_log.dart` (Task 24 — feed every emitted log line to `GazerTelemetry.recordLog`)
+- Modify: `mobile/gazer/lib/services/pipeline_controller.dart` (Task 11/24 — spans for prepare/start/stop, `gazer.rtmp.connect_latency_ms` histogram, `gazer.pipeline.state_change` counter, `gazer.stream.bitrate_kbps` histogram)
+- Modify: `mobile/gazer/lib/main.dart` (Task 13/26 — resolve+apply `TelemetryConfig`, `gazer.app.startup_ms` histogram)
+- Modify: `mobile/gazer/lib/screens/settings_screen.dart` (Task 15/24 — Developer "Telemetry endpoint" field)
+- Test: `mobile/gazer/test/screens/settings_screen_test.dart` (Task 15/24 — provider override + 1 new test)
+- Modify: `mobile/gazer/lib/screens/status_panel.dart` (Task 16 — telemetry status row)
+- Test: `mobile/gazer/test/screens/status_panel_test.dart` (Task 16 — provider override + 1 new test)
+- Modify: `mobile/gazer/lib/l10n/app_en.arb` (Task 24 — 6 new keys)
+- Modify: `Makefile` (repo root; Task 1 Step 8 — `mobile-telemetry-check` target + `.PHONY`)
+- Modify: `docs/superpowers/plans/2026-09-07-gazer-mobile-v2-m1.md` (Task 26 Step 13 checklist — one gate line + merge-gate bullet)
+
+**Interfaces:**
+- Consumes: `GazerLog` (Task 24, `sink`/`sanitize`/`_emit`), `PipelineController` (Task 11, `goLive`/`stop`/`_retryAfter`/`_emit`/`_onNativeStats`), `GazerSettings`/`SecureSettingsRepository` (unchanged — telemetry config is deliberately **not** part of `GazerSettings`; see rationale below), `settingsNotifierProvider`/`featureFlagsProvider` (Task 12/15), `StatusPanel`'s existing `_row` helper (Task 16), `package:dio/dio.dart`, `package:shared_preferences/shared_preferences.dart`, `package:flutter_secure_storage/flutter_secure_storage.dart`, `package:package_info_plus/package_info_plus.dart` — all already-pinned dependencies; this task adds zero new pub.dev packages.
+- Produces: `class TelemetryConfig` + `TelemetryConfig.resolve(...)`/`TelemetryConfig.load(...)`/`TelemetryConfig.saveEndpointOverride(...)`, `const kTelemetryEndpointKey`/`kTelemetryHeadersKey`; `class OtlpHttpExporter` + `OtlpLogRecord`/`OtlpMetricPoint`/`OtlpSpanRecord` typedefs; `class GazerTelemetry` (`init`, `recordLog`, `histogram`, `counter`, `gauge`, `startSpan`, `flush`, `exportFailures`, `exportSuccesses`, `isExporting`, `resetForTest`) + `class Span`; `@Riverpod(keepAlive: true) Future<TelemetryConfig> telemetryConfig(Ref ref)`; `make mobile-telemetry-check`.
+
+**Package research (2026-09-09, WebFetch against pub.dev):**
+
+| Package | Publisher | Latest | Published | Traces | Metrics | Logs | Verdict |
+|---|---|---|---|---|---|---|---|
+| `opentelemetry` (https://pub.dev/packages/opentelemetry) | Workiva (US, verified publisher), Apache-2.0 | 0.18.11 | 6 months ago | Beta (HTTP `CollectorExporter` only, no gRPC documented) | Alpha | **Unimplemented** | Not adopted — logs unimplemented, metrics alpha; 9 transitive deps (grpc/http/protobuf/quiver/...) for a partial signal set |
+| `opentelemetry_api` (https://pub.dev/packages/opentelemetry_api) | open-telemetry.com | 0.5.0-dev.2 | 4 years ago | — | — | — | Not adopted — discontinued/retracted |
+| `dartastic_opentelemetry` (https://pub.dev/packages/dartastic_opentelemetry, repo `github.com/MindfulSoftwareLLC/dartastic_opentelemetry`) | Dartastic.io / MindfulSoftwareLLC (US-named LLC), Apache-2.0 | 0.11.0 | 12 days ago | claims Full (gRPC+HTTP/protobuf) | claims Full | claims Full | Not adopted — 12 days old, 13 likes, single small vendor, self-described as merely "positioned as a candidate for CNCF donation" (i.e. not yet standard); too new/unproven a dependency for the app's core observability path per the house supply-chain conservatism (`security.md`/`general.md` Supply Chain Security) |
+
+No maintained pub.dev package today delivers logs+metrics+traces OTLP export at a maturity/adoption level this app's supply-chain bar accepts. Per the parent task's explicit guidance, this task instead ships a minimal in-app OTLP/HTTP JSON exporter (`lib/telemetry/otlp_http_exporter.dart`) built on the already-pinned `dio` — **zero new pub.dev dependencies**, one code path for all three signal types, fully auditable in ~150 lines. JSON encoding follows the OTLP spec's JSON Protobuf Encoding mapping (https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding): `/v1/logs`, `/v1/metrics`, `/v1/traces` request paths, `Content-Type: application/json`, 64-bit integers (including `timeUnixNano`) as decimal strings. Revisit `dartastic_opentelemetry` at a future milestone once it has a longer track record; do not silently swap it in without repeating this vetting pass.
+
+**Why telemetry config lives outside `GazerSettings`:** `GazerSettings`/`SecureSettingsRepository` (Tasks 4/7) model *stream* settings — the round-trip contract in `test/services/settings_repository_test.dart` and `SettingsNotifier` assume every field is stream-relevant and safe to log at `debug` level. The telemetry endpoint/headers are an orthogonal, license-independent developer knob (per the parent task's design) with their own storage split (endpoint non-secret in `shared_preferences`, headers secret in `flutter_secure_storage`, mirroring `StreamTargetSettings`'s own url/streamKey vs username/password split) — bolting them onto `GazerSettings` would force every `GazerSettings` equality check, JSON round-trip test, and mock-data fixture (Task 26) to grow two more fields for a concern that changes independently of stream configuration. `TelemetryConfig` + `telemetryConfigProvider` is a small, self-contained parallel path instead, following the same precedent `licenseClientProvider`/`updateCheckerProvider` already set (Task 12): a `Riverpod(keepAlive: true)` leaf provider whose body touches platform storage/plugins directly and is exercised only via override in downstream widget tests, never unit-tested for its own body (see Step 10 below).
+
+- [ ] **Step 1: Write the failing test `test/telemetry/telemetry_config_test.dart`**
+
+```dart
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gazer/telemetry/telemetry_config.dart';
+
+void main() {
+  group('TelemetryConfig.resolve', () {
+    test('a non-empty settings endpoint wins over the --dart-define default', () {
+      final config = TelemetryConfig.resolve(
+        settingsEndpoint: 'http://collector.example.com:4318',
+        settingsHeadersJson: '',
+        serviceVersion: '1.2.3',
+      );
+      expect(config.endpoint, 'http://collector.example.com:4318');
+      expect(config.serviceVersion, '1.2.3');
+      expect(config.serviceName, 'gazer');
+      expect(config.deploymentEnvironment, 'dev');
+      expect(config.protocol, 'http/json');
+    });
+
+    test('an empty settings endpoint falls back to the --dart-define value (empty when unset)', () {
+      final config = TelemetryConfig.resolve(
+        settingsEndpoint: '',
+        settingsHeadersJson: '',
+        serviceVersion: '1.2.3',
+      );
+      expect(config.endpoint, isEmpty);
+    });
+
+    test('settings headers parse as comma-separated key=value pairs and win over the define', () {
+      final config = TelemetryConfig.resolve(
+        settingsEndpoint: '',
+        settingsHeadersJson: 'authorization=Bearer abc,x-tenant=demo',
+        serviceVersion: '1.2.3',
+      );
+      expect(config.headers, {'authorization': 'Bearer abc', 'x-tenant': 'demo'});
+    });
+
+    test('a malformed header pair (no "=") is skipped, not thrown', () {
+      final config = TelemetryConfig.resolve(
+        settingsEndpoint: '',
+        settingsHeadersJson: 'not-a-pair,authorization=ok',
+        serviceVersion: '1.2.3',
+      );
+      expect(config.headers, {'authorization': 'ok'});
+    });
+  });
+}
+```
+
+- [ ] **Step 2: Run and confirm FAIL**
+
+  `make mobile-run CMD="flutter test test/telemetry/telemetry_config_test.dart"`
+  Expected FAIL: `Error: Error when reading 'lib/telemetry/telemetry_config.dart': No such file or directory`.
+
+- [ ] **Step 3: Implement `lib/telemetry/telemetry_config.dart`**
+
+```dart
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// shared_preferences key for the user-configurable OTLP endpoint override
+/// (Settings > Developer > Telemetry endpoint). Non-secret: an endpoint URL
+/// alone carries no credentials.
+const String kTelemetryEndpointKey = 'gazer.telemetry.endpoint';
+
+/// flutter_secure_storage key for the user-configurable OTLP headers
+/// override -- secure storage because a header commonly carries an auth
+/// token (e.g. `authorization: Bearer ...`).
+const String kTelemetryHeadersKey = 'gazer.telemetry.headers';
+
+/// Resolved OpenTelemetry export configuration.
+///
+/// Resolution order, independently per field: a non-empty Settings >
+/// Developer value wins; otherwise the matching `--dart-define`
+/// (`OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_HEADERS`) is used;
+/// otherwise the field is empty. An empty [endpoint] after resolution means
+/// telemetry export is disabled -- every signal still records to
+/// `GazerTelemetry`'s in-memory ring buffer, it just never leaves the
+/// device.
+class TelemetryConfig {
+  const TelemetryConfig({
+    required this.endpoint,
+    required this.protocol,
+    required this.headers,
+    required this.serviceName,
+    required this.serviceVersion,
+    required this.deploymentEnvironment,
+  });
+
+  /// OTLP receiver base URL, e.g. `'https://otel.example.com:4318'`; empty
+  /// disables export.
+  final String endpoint;
+
+  /// Always `'http/json'` in M1 regardless of what
+  /// `OTEL_EXPORTER_OTLP_PROTOCOL` requests -- `grpc`/`http/protobuf` are
+  /// standard values but this app has no gRPC/protobuf codegen (see the
+  /// design spec's Observability section for why). Recorded so a future
+  /// milestone can honour it once a gRPC/protobuf path exists.
+  final String protocol;
+
+  /// Extra headers sent with every export POST, e.g. an auth bearer token.
+  final Map<String, String> headers;
+
+  /// `OTEL_SERVICE_NAME`; defaults to `'gazer'`.
+  final String serviceName;
+
+  /// `service.version` resource attribute -- this app's own version via
+  /// `package_info_plus`, never a define.
+  final String serviceVersion;
+
+  /// `deployment.environment` resource attribute; `--dart-define=GAZER_ENV`,
+  /// defaults to `'dev'`.
+  final String deploymentEnvironment;
+
+  static const String _defineEndpoint = String.fromEnvironment('OTEL_EXPORTER_OTLP_ENDPOINT');
+  static const String _defineHeaders = String.fromEnvironment('OTEL_EXPORTER_OTLP_HEADERS');
+  static const String _defineServiceName = String.fromEnvironment('OTEL_SERVICE_NAME', defaultValue: 'gazer');
+  static const String _defineEnv = String.fromEnvironment('GAZER_ENV', defaultValue: 'dev');
+
+  /// Resolves a [TelemetryConfig] from the persisted Settings overrides
+  /// (pass `''` for whichever was never saved) and this app's own version.
+  factory TelemetryConfig.resolve({
+    required String settingsEndpoint,
+    required String settingsHeadersJson,
+    required String serviceVersion,
+  }) {
+    return TelemetryConfig(
+      endpoint: settingsEndpoint.isNotEmpty ? settingsEndpoint : _defineEndpoint,
+      protocol: 'http/json',
+      headers: _parseHeaders(settingsHeadersJson.isNotEmpty ? settingsHeadersJson : _defineHeaders),
+      serviceName: _defineServiceName,
+      serviceVersion: serviceVersion,
+      deploymentEnvironment: _defineEnv,
+    );
+  }
+
+  /// Reads the persisted Settings > Developer overrides (a missing key
+  /// means "not set") and resolves the effective config -- the one call
+  /// site both `main.dart` and `telemetryConfigProvider` use.
+  static Future<TelemetryConfig> load({
+    required SharedPreferencesAsync prefs,
+    required FlutterSecureStorage secure,
+    required String serviceVersion,
+  }) async {
+    final String settingsEndpoint = await prefs.getString(kTelemetryEndpointKey) ?? '';
+    final String settingsHeaders = await secure.read(key: kTelemetryHeadersKey) ?? '';
+    return TelemetryConfig.resolve(
+      settingsEndpoint: settingsEndpoint,
+      settingsHeadersJson: settingsHeaders,
+      serviceVersion: serviceVersion,
+    );
+  }
+
+  /// Persists a new endpoint override; `''` clears it back to the
+  /// `--dart-define` default. Called from `SettingsScreen`'s Save button.
+  static Future<void> saveEndpointOverride(SharedPreferencesAsync prefs, String endpoint) =>
+      prefs.setString(kTelemetryEndpointKey, endpoint);
+
+  /// `OTEL_EXPORTER_OTLP_HEADERS` format: comma-separated `key=value` pairs.
+  /// A pair missing `=` is skipped, never thrown -- a malformed override
+  /// degrades to "that one header is missing", not a crash.
+  static Map<String, String> _parseHeaders(String raw) {
+    if (raw.isEmpty) return const <String, String>{};
+    final result = <String, String>{};
+    for (final String pair in raw.split(',')) {
+      final int idx = pair.indexOf('=');
+      if (idx <= 0) continue;
+      result[pair.substring(0, idx).trim()] = pair.substring(idx + 1).trim();
+    }
+    return result;
+  }
+}
+```
+
+- [ ] **Step 4: Run and confirm PASS**
+
+  `make mobile-run CMD="flutter test test/telemetry/telemetry_config_test.dart"`
+  Expected PASS: `00:0X +4: All tests passed!`
+
+  Optionally re-run with a define to confirm the fallback path actually reads it (not required for
+  the gate above, since the "empty" test already proves the no-define case):
+  `make mobile-run CMD="flutter test test/telemetry/telemetry_config_test.dart --dart-define=OTEL_EXPORTER_OTLP_ENDPOINT=http://example.com:4318"`
+  Expected: same `+4` pass count (none of the four tests assert on a non-empty define, so this run
+  is a smoke check that the define doesn't break compilation, not a new assertion).
+
+- [ ] **Step 5: Implement `lib/telemetry/otlp_http_exporter.dart`**
+
+  No dedicated unit test for this file: its JSON encoding is exercised end-to-end by Step 7's
+  `otlp_sink_test.dart` (a local `HttpServer` decodes exactly this shape), which is a stronger
+  guarantee than asserting against a hand-written expected `Map` here would be.
+
+```dart
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+
+/// One OTLP log record awaiting export.
+typedef OtlpLogRecord = ({DateTime time, String level, String event, Map<String, Object?> attributes});
+
+/// One OTLP metric data point awaiting export. [OtlpMetricPoint.kind] is
+/// `'histogram'`, `'counter'`, or `'gauge'`.
+typedef OtlpMetricPoint = ({DateTime time, String name, String kind, double value, Map<String, Object?> attributes});
+
+/// One completed OTLP span awaiting export.
+typedef OtlpSpanRecord = ({String name, DateTime start, DateTime end, Map<String, Object?> attributes});
+
+/// Minimal OTLP/HTTP JSON exporter: encodes batched log/metric/span records
+/// per the OTLP spec's JSON Protobuf Encoding mapping
+/// (https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding --
+/// camelCase field names, 64-bit integers as decimal strings) and POSTs to
+/// a collector's `/v1/logs`, `/v1/metrics`, `/v1/traces` endpoints.
+///
+/// Exists because pub.dev has no OTLP logs+metrics exporter this app can
+/// depend on today without either an incomplete/alpha implementation or an
+/// unproven, days-old package -- see the design spec's Observability
+/// section for the packages considered. Deliberately tiny: no
+/// protobuf/gRPC codegen, reuses the already-pinned `dio` dependency, adds
+/// zero new pub.dev packages.
+class OtlpHttpExporter {
+  OtlpHttpExporter({required Dio dio, required String endpoint, required Map<String, String> headers})
+      : _dio = dio,
+        _endpoint = endpoint,
+        _headers = headers;
+
+  final Dio _dio;
+  final String _endpoint;
+  final Map<String, String> _headers;
+
+  /// POSTs [body] (already OTLP-JSON-shaped) to `'$_endpoint$path'`.
+  /// Returns `true` on any 2xx response; `false` on any other status or
+  /// exception -- never throws, so a dead collector never propagates to
+  /// the caller.
+  Future<bool> post(String path, Map<String, Object?> body) async {
+    try {
+      final Response<dynamic> response = await _dio.post<dynamic>(
+        '$_endpoint$path',
+        data: jsonEncode(body),
+        options: Options(
+          headers: <String, String>{'Content-Type': 'application/json', ..._headers},
+          sendTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 5),
+        ),
+      );
+      final int status = response.statusCode ?? 0;
+      return status >= 200 && status < 300;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Encodes the `resource` block shared by every OTLP payload type.
+  static Map<String, Object?> resource({
+    required String serviceName,
+    required String serviceVersion,
+    required String deploymentEnvironment,
+    String? deviceModel,
+  }) {
+    return <String, Object?>{
+      'attributes': <Map<String, Object?>>[
+        attribute('service.name', serviceName),
+        attribute('service.version', serviceVersion),
+        attribute('deployment.environment', deploymentEnvironment),
+        if (deviceModel != null && deviceModel.isNotEmpty) attribute('device.model', deviceModel),
+      ],
+    };
+  }
+
+  /// One OTLP `KeyValue` attribute, string-valued (the only value type this
+  /// app's telemetry attributes ever need -- never pass PII, secrets, or a
+  /// raw device identifier as [value]).
+  static Map<String, Object?> attribute(String key, Object? value) =>
+      <String, Object?>{'key': key, 'value': <String, Object?>{'stringValue': value.toString()}};
+
+  /// Encodes a `resourceLogs` OTLP/HTTP JSON body for one batch of log
+  /// records.
+  static Map<String, Object?> encodeLogs({
+    required Map<String, Object?> resourceAttrs,
+    required List<OtlpLogRecord> records,
+  }) {
+    return <String, Object?>{
+      'resourceLogs': <Map<String, Object?>>[
+        <String, Object?>{
+          'resource': resourceAttrs,
+          'scopeLogs': <Map<String, Object?>>[
+            <String, Object?>{
+              'logRecords': <Map<String, Object?>>[
+                for (final OtlpLogRecord r in records)
+                  <String, Object?>{
+                    'timeUnixNano': _nanos(r.time),
+                    'severityText': r.level,
+                    'body': <String, Object?>{'stringValue': r.event},
+                    'attributes': <Map<String, Object?>>[for (final e in r.attributes.entries) attribute(e.key, e.value)],
+                  },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  /// Encodes a `resourceMetrics` OTLP/HTTP JSON body. Points sharing a
+  /// `name`+`kind` are grouped into one `Metric` entry with multiple data
+  /// points.
+  static Map<String, Object?> encodeMetrics({
+    required Map<String, Object?> resourceAttrs,
+    required List<OtlpMetricPoint> points,
+  }) {
+    final Map<String, List<OtlpMetricPoint>> byNameAndKind = <String, List<OtlpMetricPoint>>{};
+    for (final OtlpMetricPoint p in points) {
+      byNameAndKind.putIfAbsent('${p.name} ${p.kind}', () => <OtlpMetricPoint>[]).add(p);
+    }
+    return <String, Object?>{
+      'resourceMetrics': <Map<String, Object?>>[
+        <String, Object?>{
+          'resource': resourceAttrs,
+          'scopeMetrics': <Map<String, Object?>>[
+            <String, Object?>{
+              'metrics': <Map<String, Object?>>[for (final group in byNameAndKind.values) _encodeMetricGroup(group)],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  static Map<String, Object?> _encodeMetricGroup(List<OtlpMetricPoint> group) {
+    final String name = group.first.name;
+    final String kind = group.first.kind;
+    switch (kind) {
+      case 'histogram':
+        return <String, Object?>{
+          'name': name,
+          'histogram': <String, Object?>{
+            'aggregationTemporality': 1, // DELTA -- see class doc: each observation is its own bucket
+            'dataPoints': <Map<String, Object?>>[
+              for (final OtlpMetricPoint p in group)
+                <String, Object?>{
+                  'timeUnixNano': _nanos(p.time),
+                  'count': '1',
+                  'sum': p.value,
+                  'min': p.value,
+                  'max': p.value,
+                  'explicitBounds': <double>[],
+                  'bucketCounts': <String>['1'],
+                  'attributes': <Map<String, Object?>>[for (final e in p.attributes.entries) attribute(e.key, e.value)],
+                },
+            ],
+          },
+        };
+      case 'counter':
+        return <String, Object?>{
+          'name': name,
+          'sum': <String, Object?>{
+            'isMonotonic': true,
+            'aggregationTemporality': 1, // DELTA -- each counter() call is one +1 delta, not a running total
+            'dataPoints': _plainDataPoints(group),
+          },
+        };
+      default: // gauge
+        return <String, Object?>{'name': name, 'gauge': <String, Object?>{'dataPoints': _plainDataPoints(group)}};
+    }
+  }
+
+  static List<Map<String, Object?>> _plainDataPoints(List<OtlpMetricPoint> group) {
+    return <Map<String, Object?>>[
+      for (final OtlpMetricPoint p in group)
+        <String, Object?>{
+          'timeUnixNano': _nanos(p.time),
+          'asDouble': p.value,
+          'attributes': <Map<String, Object?>>[for (final e in p.attributes.entries) attribute(e.key, e.value)],
+        },
+    ];
+  }
+
+  /// Encodes a `resourceSpans` OTLP/HTTP JSON body for one batch of
+  /// completed spans.
+  static Map<String, Object?> encodeSpans({
+    required Map<String, Object?> resourceAttrs,
+    required List<OtlpSpanRecord> spans,
+  }) {
+    return <String, Object?>{
+      'resourceSpans': <Map<String, Object?>>[
+        <String, Object?>{
+          'resource': resourceAttrs,
+          'scopeSpans': <Map<String, Object?>>[
+            <String, Object?>{
+              'spans': <Map<String, Object?>>[
+                for (final OtlpSpanRecord s in spans)
+                  <String, Object?>{
+                    'name': s.name,
+                    'startTimeUnixNano': _nanos(s.start),
+                    'endTimeUnixNano': _nanos(s.end),
+                    'attributes': <Map<String, Object?>>[for (final e in s.attributes.entries) attribute(e.key, e.value)],
+                  },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  /// OTLP JSON encodes 64-bit integers (including nanosecond timestamps) as
+  /// decimal strings -- see the OTLP spec's JSON Protobuf Encoding section.
+  static String _nanos(DateTime t) => (t.microsecondsSinceEpoch * 1000).toString();
+}
+```
+
+- [ ] **Step 6: Write the failing test `test/telemetry/otlp_sink_test.dart`**
+
+```dart
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:dio/dio.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gazer/telemetry/gazer_telemetry.dart';
+import 'package:gazer/telemetry/telemetry_config.dart';
+
+void main() {
+  tearDown(GazerTelemetry.resetForTest);
+
+  test('one log, one counter, one histogram, one span all reach a local OTLP/HTTP JSON sink', () async {
+    int logRecords = 0;
+    int metricDataPoints = 0;
+    int histogramDataPoints = 0;
+    int spans = 0;
+
+    final HttpServer server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final subscription = server.listen((HttpRequest request) async {
+      final String body = await utf8.decoder.bind(request).join();
+      final Map<String, dynamic> decoded = jsonDecode(body) as Map<String, dynamic>;
+      if (request.uri.path == '/v1/logs') {
+        for (final rl in decoded['resourceLogs'] as List) {
+          for (final sl in (rl as Map<String, dynamic>)['scopeLogs'] as List) {
+            logRecords += ((sl as Map<String, dynamic>)['logRecords'] as List).length;
+          }
+        }
+      } else if (request.uri.path == '/v1/metrics') {
+        for (final rm in decoded['resourceMetrics'] as List) {
+          for (final sm in (rm as Map<String, dynamic>)['scopeMetrics'] as List) {
+            for (final metric in (sm as Map<String, dynamic>)['metrics'] as List) {
+              final Map<String, dynamic> m = metric as Map<String, dynamic>;
+              final Map<String, dynamic> shape =
+                  (m['histogram'] ?? m['sum'] ?? m['gauge']) as Map<String, dynamic>;
+              final int count = (shape['dataPoints'] as List).length;
+              metricDataPoints += count;
+              if (m.containsKey('histogram')) histogramDataPoints += count;
+            }
+          }
+        }
+      } else if (request.uri.path == '/v1/traces') {
+        for (final rs in decoded['resourceSpans'] as List) {
+          for (final ss in (rs as Map<String, dynamic>)['scopeSpans'] as List) {
+            spans += ((ss as Map<String, dynamic>)['spans'] as List).length;
+          }
+        }
+      }
+      request.response.statusCode = 200;
+      await request.response.close();
+    });
+    addTearDown(() async {
+      await server.close(force: true);
+      await subscription.cancel();
+    });
+
+    GazerTelemetry.init(
+      TelemetryConfig(
+        endpoint: 'http://127.0.0.1:${server.port}',
+        protocol: 'http/json',
+        headers: const <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    GazerTelemetry.recordLog('info', 'test.log', const <String, Object?>{'k': 'v'});
+    GazerTelemetry.counter('test.counter');
+    GazerTelemetry.histogram('test.histogram', 42);
+    GazerTelemetry.startSpan('test.span').end();
+
+    await GazerTelemetry.flush();
+    // Give the server's async request handler a moment to finish decoding
+    // before asserting -- flush()'s POST resolving does not guarantee the
+    // server-side listener callback above has run yet.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    // ignore: avoid_print -- required by the house telemetry test gate
+    // (critical-rules.md Verification Integrity: report the count examined,
+    // not just "no findings"). `make mobile-telemetry-check` greps this
+    // exact line and fails if any count is zero or the line is absent.
+    print('telemetry sink received: logs=$logRecords metrics=$metricDataPoints '
+        'histograms=$histogramDataPoints spans=$spans');
+
+    expect(logRecords, greaterThanOrEqualTo(1));
+    expect(metricDataPoints, greaterThanOrEqualTo(1));
+    expect(histogramDataPoints, greaterThanOrEqualTo(1));
+    expect(spans, greaterThanOrEqualTo(1));
+  });
+
+  test('a dead endpoint (connection refused) never throws and increments exportFailures', () async {
+    // Bind then immediately close a server to obtain a port nothing is
+    // listening on -- guarantees a real connection-refused, not a flaky
+    // guessed-unused-port.
+    final HttpServer probe = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final int deadPort = probe.port;
+    await probe.close(force: true);
+
+    GazerTelemetry.init(
+      TelemetryConfig(
+        endpoint: 'http://127.0.0.1:$deadPort',
+        protocol: 'http/json',
+        headers: const <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    GazerTelemetry.recordLog('info', 'test.log', const <String, Object?>{});
+    await expectLater(GazerTelemetry.flush(), completes);
+
+    expect(GazerTelemetry.exportFailures, greaterThanOrEqualTo(1));
+  });
+
+  test('an empty endpoint makes zero HTTP calls', () async {
+    int requestsReceived = 0;
+    final HttpServer server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final subscription = server.listen((HttpRequest request) async {
+      requestsReceived += 1;
+      request.response.statusCode = 200;
+      await request.response.close();
+    });
+    addTearDown(() async {
+      await server.close(force: true);
+      await subscription.cancel();
+    });
+
+    GazerTelemetry.init(
+      const TelemetryConfig(
+        endpoint: '',
+        protocol: 'http/json',
+        headers: <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    GazerTelemetry.recordLog('info', 'test.log', const <String, Object?>{});
+    GazerTelemetry.counter('test.counter');
+    await GazerTelemetry.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(requestsReceived, 0);
+  });
+}
+```
+
+- [ ] **Step 7: Run and confirm FAIL**
+
+  `make mobile-run CMD="flutter test test/telemetry/otlp_sink_test.dart"`
+  Expected FAIL: `Error: Error when reading 'lib/telemetry/gazer_telemetry.dart': No such file or directory`.
+
+- [ ] **Step 8: Implement `lib/telemetry/gazer_telemetry.dart`**
+
+```dart
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
+import 'otlp_http_exporter.dart';
+import 'telemetry_config.dart';
+
+/// One completed or in-flight trace span. Obtained via
+/// `GazerTelemetry.startSpan`; call [end] exactly once when the work it
+/// covers finishes.
+class Span {
+  Span._(this._name) : _start = DateTime.now();
+
+  final String _name;
+  final DateTime _start;
+  final Map<String, Object?> _attributes = <String, Object?>{};
+  bool _ended = false;
+
+  /// Attaches [value] under [key]; call before [end]. Never pass PII,
+  /// secrets, or a raw device identifier -- see `GazerLog.sanitize` for the
+  /// equivalent log-side rule.
+  void setAttribute(String key, Object? value) => _attributes[key] = value;
+
+  /// Records the span's end time and hands it to [GazerTelemetry] for
+  /// export. A second call is a no-op (idempotent, so a defensive
+  /// double-call from cleanup code never double-counts).
+  void end() {
+    if (_ended) return;
+    _ended = true;
+    GazerTelemetry._completeSpan(this, DateTime.now());
+  }
+}
+
+/// Facade over the app's OpenTelemetry emission: structured logs, metrics
+/// (histograms/counters/gauges), and traces, buffered in-memory and
+/// exported every 10s as OTLP/HTTP JSON via [OtlpHttpExporter].
+///
+/// Every recording method is synchronous and never throws: signals always
+/// land in the ring buffer (cap [ringBufferCap] per signal type,
+/// drop-oldest) even when `TelemetryConfig.endpoint` is empty (export
+/// disabled) or the collector is unreachable (export fails,
+/// [exportFailures] increments) -- a dead or unconfigured endpoint never
+/// breaks app functionality, per the house OpenTelemetry rule.
+class GazerTelemetry {
+  GazerTelemetry._();
+
+  static const int ringBufferCap = 1000;
+  static const Duration flushInterval = Duration(seconds: 10);
+
+  static TelemetryConfig _config = const TelemetryConfig(
+    endpoint: '',
+    protocol: 'http/json',
+    headers: <String, String>{},
+    serviceName: 'gazer',
+    serviceVersion: '0.0.0',
+    deploymentEnvironment: 'dev',
+  );
+
+  static OtlpHttpExporter _exporter =
+      OtlpHttpExporter(dio: Dio(), endpoint: '', headers: const <String, String>{});
+  static Timer? _timer;
+
+  static final List<OtlpLogRecord> _logs = <OtlpLogRecord>[];
+  static final List<OtlpMetricPoint> _metrics = <OtlpMetricPoint>[];
+  static final List<OtlpSpanRecord> _spans = <OtlpSpanRecord>[];
+
+  /// Count of export POST attempts that did not succeed (timeout,
+  /// connection refused, non-2xx) -- surfaced by the status panel.
+  static int exportFailures = 0;
+
+  /// Count of export POST attempts that succeeded (2xx).
+  static int exportSuccesses = 0;
+
+  /// Applies [config] and rebuilds the exporter; starts the periodic flush
+  /// scheduler on first call. Safe to call repeatedly -- e.g. every time
+  /// Settings > Developer > Telemetry endpoint is saved, so a change takes
+  /// effect without an app restart.
+  static void init(TelemetryConfig config, {Dio? dio}) {
+    _config = config;
+    _exporter = OtlpHttpExporter(dio: dio ?? Dio(), endpoint: config.endpoint, headers: config.headers);
+    _timer ??= Timer.periodic(flushInterval, (_) => flush());
+  }
+
+  /// Whether the current config would actually send data over the network
+  /// (a non-empty endpoint). Used by the status panel's
+  /// disabled/exporting/last-export-failed line.
+  static bool get isExporting => _config.endpoint.isNotEmpty;
+
+  /// Records one structured log line. Fed automatically from `GazerLog`'s
+  /// existing sanitize-then-emit path -- see this task's `gazer_log.dart`
+  /// modification -- so callers normally never call this directly.
+  static void recordLog(String level, String event, [Map<String, Object?> attributes = const <String, Object?>{}]) {
+    _push(_logs, (time: DateTime.now(), level: level, event: event, attributes: attributes));
+  }
+
+  /// Records one histogram observation, e.g. `gazer.rtmp.connect_latency_ms`.
+  static void histogram(String name, num value, [Map<String, Object?> attributes = const <String, Object?>{}]) {
+    _push(_metrics, (time: DateTime.now(), name: name, kind: 'histogram', value: value.toDouble(), attributes: attributes));
+  }
+
+  /// Increments a monotonic counter by 1, e.g. `gazer.pipeline.state_change`.
+  static void counter(String name, [Map<String, Object?> attributes = const <String, Object?>{}]) {
+    _push(_metrics, (time: DateTime.now(), name: name, kind: 'counter', value: 1, attributes: attributes));
+  }
+
+  /// Records the current value of a gauge (e.g. a queue depth) -- provided
+  /// for the house metrics guidance ("gauges for state"); no M1 caller
+  /// uses this yet.
+  static void gauge(String name, num value, [Map<String, Object?> attributes = const <String, Object?>{}]) {
+    _push(_metrics, (time: DateTime.now(), name: name, kind: 'gauge', value: value.toDouble(), attributes: attributes));
+  }
+
+  /// Starts a new span named [name]; the caller must call `Span.end`
+  /// exactly once when the covered work finishes.
+  static Span startSpan(String name) => Span._(name);
+
+  static void _completeSpan(Span span, DateTime end) {
+    _push(_spans, (name: span._name, start: span._start, end: end, attributes: Map<String, Object?>.from(span._attributes)));
+  }
+
+  static void _push<T>(List<T> buffer, T item) {
+    buffer.add(item);
+    if (buffer.length > ringBufferCap) buffer.removeAt(0);
+  }
+
+  /// Batches whatever is currently buffered per signal type and POSTs each
+  /// non-empty batch as OTLP/HTTP JSON. A no-op (no HTTP calls at all)
+  /// when [isExporting] is false. Each signal type's batch is removed from
+  /// the buffer only on a successful (2xx) POST; a failed POST leaves the
+  /// records buffered for the next scheduled flush (still subject to the
+  /// ring buffer's drop-oldest cap).
+  static Future<void> flush() async {
+    if (!isExporting) return;
+    final Map<String, Object?> resourceAttrs = OtlpHttpExporter.resource(
+      serviceName: _config.serviceName,
+      serviceVersion: _config.serviceVersion,
+      deploymentEnvironment: _config.deploymentEnvironment,
+    );
+    await Future.wait<void>(<Future<void>>[
+      _flushLogs(resourceAttrs),
+      _flushMetrics(resourceAttrs),
+      _flushSpans(resourceAttrs),
+    ]);
+  }
+
+  static Future<void> _flushLogs(Map<String, Object?> resourceAttrs) async {
+    if (_logs.isEmpty) return;
+    final List<OtlpLogRecord> batch = List<OtlpLogRecord>.of(_logs);
+    final bool ok = await _exporter.post(
+      '/v1/logs',
+      OtlpHttpExporter.encodeLogs(resourceAttrs: resourceAttrs, records: batch),
+    );
+    if (ok) {
+      exportSuccesses++;
+      _logs.removeRange(0, batch.length);
+    } else {
+      exportFailures++;
+    }
+  }
+
+  static Future<void> _flushMetrics(Map<String, Object?> resourceAttrs) async {
+    if (_metrics.isEmpty) return;
+    final List<OtlpMetricPoint> batch = List<OtlpMetricPoint>.of(_metrics);
+    final bool ok = await _exporter.post(
+      '/v1/metrics',
+      OtlpHttpExporter.encodeMetrics(resourceAttrs: resourceAttrs, points: batch),
+    );
+    if (ok) {
+      exportSuccesses++;
+      _metrics.removeRange(0, batch.length);
+    } else {
+      exportFailures++;
+    }
+  }
+
+  static Future<void> _flushSpans(Map<String, Object?> resourceAttrs) async {
+    if (_spans.isEmpty) return;
+    final List<OtlpSpanRecord> batch = List<OtlpSpanRecord>.of(_spans);
+    final bool ok = await _exporter.post(
+      '/v1/traces',
+      OtlpHttpExporter.encodeSpans(resourceAttrs: resourceAttrs, spans: batch),
+    );
+    if (ok) {
+      exportSuccesses++;
+      _spans.removeRange(0, batch.length);
+    } else {
+      exportFailures++;
+    }
+  }
+
+  /// Test/teardown hook: cancels the flush scheduler and clears every
+  /// buffer, counter, and config back to the inert default. Not used by
+  /// production code -- call in `tearDown` of any test that calls [init].
+  static void resetForTest() {
+    _timer?.cancel();
+    _timer = null;
+    _logs.clear();
+    _metrics.clear();
+    _spans.clear();
+    exportFailures = 0;
+    exportSuccesses = 0;
+    _config = const TelemetryConfig(
+      endpoint: '',
+      protocol: 'http/json',
+      headers: <String, String>{},
+      serviceName: 'gazer',
+      serviceVersion: '0.0.0',
+      deploymentEnvironment: 'dev',
+    );
+    _exporter = OtlpHttpExporter(dio: Dio(), endpoint: '', headers: const <String, String>{});
+  }
+}
+```
+
+  Note: `GazerTelemetry`'s default config has an empty endpoint and no scheduler until `.init()`
+  is called, so wiring `GazerLog._emit` to call `GazerTelemetry.recordLog` (Step 11 below) is
+  inert -- buffer-only, capped at 1000, no network, no `Timer` -- in every existing test file that
+  never calls `.init()`. No other suite in Tasks 4-26 is expected to change behavior or count.
+
+- [ ] **Step 9: Run and confirm PASS**
+
+  `make mobile-run CMD="flutter test test/telemetry/otlp_sink_test.dart"`
+  Expected PASS: `00:0X +3: All tests passed!` — the first test's stdout includes a line matching
+  `telemetry sink received: logs=1 metrics=2 histograms=1 spans=1` (2 metric data points: one
+  counter + one histogram).
+
+- [ ] **Step 10: Lint**
+
+  `make mobile-lint` → PASS.
+
+  No dedicated `test/providers/telemetry_provider_test.dart` is added in Step 13 below, for the
+  same reason `licenseClientProvider`/`gazerHostApiProvider`/`updateCheckerProvider` (Task 12)
+  have none: `telemetryConfig(Ref ref)`'s body calls `PackageInfo.fromPlatform()` and touches real
+  `shared_preferences`/`flutter_secure_storage` plugins, so it is exercised only via
+  `.overrideWith(...)` in downstream widget tests (Steps 14/16 below), never invoked for real in a
+  unit test — matching the plan's established leaf-provider testing boundary.
+
+- [ ] **Step 11: Wire `GazerLog._emit` to feed `GazerTelemetry.recordLog` — modify `lib/services/gazer_log.dart`**
+
+  Quote the exact existing import block (Task 24 Step 3):
+  ```dart
+  import 'dart:convert';
+  import 'dart:developer' as developer;
+  ```
+  Replace with:
+  ```dart
+  import 'dart:convert';
+  import 'dart:developer' as developer;
+
+  import '../telemetry/gazer_telemetry.dart';
+  ```
+
+  Quote the exact existing `_emit` (Task 24 Step 3):
+  ```dart
+    static void _emit(String level, String event, Map<String, Object?> fields) {
+      final record = <String, Object?>{
+        'ts': DateTime.now().toIso8601String(),
+        'level': level,
+        'event': event,
+        ...sanitize(fields),
+      };
+      sink(jsonEncode(record));
+    }
+  ```
+  Replace with:
+  ```dart
+    static void _emit(String level, String event, Map<String, Object?> fields) {
+      final sanitized = sanitize(fields);
+      final record = <String, Object?>{
+        'ts': DateTime.now().toIso8601String(),
+        'level': level,
+        'event': event,
+        ...sanitized,
+      };
+      sink(jsonEncode(record));
+      // Already-sanitized fields only -- GazerTelemetry never re-sanitizes,
+      // so this is the one funnel point that guarantees no secret/PII ever
+      // reaches an attribute. debug() only calls _emit when GazerLog.verbose
+      // is true, so telemetry's debug-level logs stay off by default too.
+      GazerTelemetry.recordLog(level, event, sanitized);
+    }
+  ```
+
+  Run `make mobile-run CMD="flutter test test/services/gazer_log_test.dart"` → PASS (`00:0X +7:
+  All tests passed!` — unchanged count; existing assertions only inspect `GazerLog.sink`'s
+  captured lines, not `GazerTelemetry`'s state).
+
+- [ ] **Step 12: Add spans, connect-latency histogram, state-change counter, bitrate histogram — modify `lib/services/pipeline_controller.dart`**
+
+  Quote the exact existing import block (as left by Task 24 Step 16):
+  ```dart
+    import 'dart:async';
+
+    import '../config/flag_keys.dart';
+    import '../models/gazer_settings.dart';
+    import '../models/pipeline_state.dart';
+    import '../models/stream_stats.dart';
+    import '../models/validation_issue.dart';
+    import '../pigeon/pipeline.g.dart';
+    import 'feature_flags.dart';
+    import 'gazer_log.dart';
+    import 'native_event_bridge.dart';
+    import 'reconnect_policy.dart';
+    import 'target_validator.dart';
+  ```
+  Replace with:
+  ```dart
+    import 'dart:async';
+
+    import '../config/flag_keys.dart';
+    import '../models/gazer_settings.dart';
+    import '../models/pipeline_state.dart';
+    import '../models/stream_stats.dart';
+    import '../models/validation_issue.dart';
+    import '../pigeon/pipeline.g.dart';
+    import '../telemetry/gazer_telemetry.dart';
+    import 'feature_flags.dart';
+    import 'gazer_log.dart';
+    import 'native_event_bridge.dart';
+    import 'reconnect_policy.dart';
+    import 'target_validator.dart';
+  ```
+
+  Quote the exact existing field block (Task 11):
+  ```dart
+    StreamTarget? _pendingTarget;
+    int _reconnectAttempt = 0;
+    bool _cancelled = false;
+    DateTime? _streamStartedAt;
+    final List<int> _bitrateSamples = [];
+  ```
+  Replace with:
+  ```dart
+    StreamTarget? _pendingTarget;
+    int _reconnectAttempt = 0;
+    bool _cancelled = false;
+    DateTime? _streamStartedAt;
+    DateTime? _connectingStartedAt;
+    final List<int> _bitrateSamples = [];
+  ```
+
+  Quote the exact existing tail of `goLive` (as left by Task 24 Step 16):
+  ```dart
+        final sendCredentials = flags.isEnabled(FlagKeys.rtmpAuth);
+        _pendingTarget = StreamTarget()
+          ..url = TargetValidator.effectiveUrl(settings.target)
+          ..username = sendCredentials ? settings.target.username : null
+          ..password = sendCredentials ? settings.target.password : null;
+
+        GazerLog.info('pipeline.goLive', <String, Object?>{
+          'host': Uri.tryParse(_pendingTarget!.url)?.host ?? '',
+        });
+
+        _emit(const PreparingState());
+        await _host.prepare(config);
+        _emit(const ReadyState());
+        _emit(const ConnectingState());
+        await _host.start(_pendingTarget!);
+      }
+  ```
+  Replace with:
+  ```dart
+        final sendCredentials = flags.isEnabled(FlagKeys.rtmpAuth);
+        _pendingTarget = StreamTarget()
+          ..url = TargetValidator.effectiveUrl(settings.target)
+          ..username = sendCredentials ? settings.target.username : null
+          ..password = sendCredentials ? settings.target.password : null;
+
+        GazerLog.info('pipeline.goLive', <String, Object?>{
+          'host': Uri.tryParse(_pendingTarget!.url)?.host ?? '',
+        });
+
+        _emit(const PreparingState());
+        final prepareSpan = GazerTelemetry.startSpan('gazer.pipeline.prepare');
+        await _host.prepare(config);
+        prepareSpan.end();
+        _emit(const ReadyState());
+        _emit(const ConnectingState());
+        _connectingStartedAt = DateTime.now();
+        final startSpan = GazerTelemetry.startSpan('gazer.pipeline.start');
+        await _host.start(_pendingTarget!);
+        startSpan.end();
+      }
+  ```
+
+  Quote the exact existing `_retryAfter` (Task 11, unmodified since):
+  ```dart
+    Future<void> _retryAfter(Duration delay) async {
+      await _sleeper(delay);
+      if (_cancelled || _pendingTarget == null) return;
+      _emit(const ConnectingState());
+      await _host.start(_pendingTarget!);
+    }
+  ```
+  Replace with:
+  ```dart
+    Future<void> _retryAfter(Duration delay) async {
+      await _sleeper(delay);
+      if (_cancelled || _pendingTarget == null) return;
+      _connectingStartedAt = DateTime.now();
+      _emit(const ConnectingState());
+      final retrySpan = GazerTelemetry.startSpan('gazer.pipeline.start');
+      await _host.start(_pendingTarget!);
+      retrySpan.end();
+    }
+  ```
+
+  Quote the exact existing `stop()` (Task 11, unmodified since):
+  ```dart
+    Future<void> stop() async {
+      _cancelled = true;
+      _emit(const StoppingState());
+      await _host.stop();
+      _emit(const IdleState());
+    }
+  ```
+  Replace with:
+  ```dart
+    Future<void> stop() async {
+      _cancelled = true;
+      _emit(const StoppingState());
+      final stopSpan = GazerTelemetry.startSpan('gazer.pipeline.stop');
+      await _host.stop();
+      stopSpan.end();
+      _emit(const IdleState());
+    }
+  ```
+
+  Quote the exact existing `_emit` (as left by Task 24 Step 16):
+  ```dart
+    void _emit(PipelineState next) {
+      GazerLog.debug('pipeline.state', <String, Object?>{
+        'from': _current.runtimeType.toString(),
+        'to': next.runtimeType.toString(),
+        if (next is ErrorState) 'errorCode': next.error.code.name,
+      });
+      _current = next;
+      _stateController.add(next);
+    }
+  ```
+  Replace with:
+  ```dart
+    void _emit(PipelineState next) {
+      GazerLog.debug('pipeline.state', <String, Object?>{
+        'from': _current.runtimeType.toString(),
+        'to': next.runtimeType.toString(),
+        if (next is ErrorState) 'errorCode': next.error.code.name,
+      });
+      GazerTelemetry.counter('gazer.pipeline.state_change', <String, Object?>{
+        'from': _current.runtimeType.toString(),
+        'to': next.runtimeType.toString(),
+      });
+      if (next is StreamingState && _connectingStartedAt != null) {
+        final latencyMs = DateTime.now().difference(_connectingStartedAt!).inMilliseconds;
+        GazerTelemetry.histogram('gazer.rtmp.connect_latency_ms', latencyMs.toDouble());
+        _connectingStartedAt = null;
+      }
+      _current = next;
+      _stateController.add(next);
+    }
+  ```
+
+  Quote the exact existing `_onNativeStats` (Task 11, unmodified since):
+  ```dart
+    void _onNativeStats(StatsSample sample) {
+      _bitrateSamples.add(sample.bitrateKbps);
+      final average = _bitrateSamples.reduce((a, b) => a + b) / _bitrateSamples.length;
+      final uptime = _streamStartedAt == null ? Duration.zero : DateTime.now().difference(_streamStartedAt!);
+      _statsSnapshot = _statsSnapshot.copyWith(
+        currentBitrateKbps: sample.bitrateKbps,
+        averageBitrateKbps: average.round(),
+        fps: sample.fps,
+        droppedFrames: sample.droppedVideoFrames,
+        sentBytes: sample.sentBytes,
+        uptime: uptime,
+        congestionPercent: sample.congestionPercent,
+      );
+      _statsController.add(_statsSnapshot);
+    }
+  ```
+  Replace with:
+  ```dart
+    void _onNativeStats(StatsSample sample) {
+      _bitrateSamples.add(sample.bitrateKbps);
+      final average = _bitrateSamples.reduce((a, b) => a + b) / _bitrateSamples.length;
+      final uptime = _streamStartedAt == null ? Duration.zero : DateTime.now().difference(_streamStartedAt!);
+      _statsSnapshot = _statsSnapshot.copyWith(
+        currentBitrateKbps: sample.bitrateKbps,
+        averageBitrateKbps: average.round(),
+        fps: sample.fps,
+        droppedFrames: sample.droppedVideoFrames,
+        sentBytes: sample.sentBytes,
+        uptime: uptime,
+        congestionPercent: sample.congestionPercent,
+      );
+      GazerTelemetry.histogram('gazer.stream.bitrate_kbps', sample.bitrateKbps.toDouble());
+      _statsController.add(_statsSnapshot);
+    }
+  ```
+
+  Run `make mobile-run CMD="flutter test test/services/pipeline_controller_test.dart"` → PASS
+  (`00:0X +10: All tests passed!` — same count as Task 24 Step 16; every existing assertion is on
+  emitted `PipelineState`/`StreamStats`, none on `GazerTelemetry`, which stays inert by default
+  per Step 8's note).
+
+- [ ] **Step 13: Apply telemetry config and record app startup latency — modify `lib/main.dart`**
+
+  Quote the exact existing file (Task 26 Step 5):
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+  import 'package:shared_preferences/shared_preferences.dart';
+
+  import 'app.dart';
+  import 'config/seed.dart';
+  import 'services/settings_repository.dart';
+
+  Future<void> main() async {
+    WidgetsFlutterBinding.ensureInitialized();
+
+    final SecureSettingsRepository settingsRepo = SecureSettingsRepository(
+      secure: const FlutterSecureStorage(),
+      prefs: SharedPreferencesAsync(),
+    );
+    await applySeedIfRequested(settingsRepo);
+
+    runApp(const ProviderScope(child: GazerApp()));
+  }
+  ```
+  Replace with:
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+  import 'package:package_info_plus/package_info_plus.dart';
+  import 'package:shared_preferences/shared_preferences.dart';
+
+  import 'app.dart';
+  import 'config/seed.dart';
+  import 'services/settings_repository.dart';
+  import 'telemetry/gazer_telemetry.dart';
+  import 'telemetry/telemetry_config.dart';
+
+  Future<void> main() async {
+    final Stopwatch startupTimer = Stopwatch()..start();
+    WidgetsFlutterBinding.ensureInitialized();
+
+    final SecureSettingsRepository settingsRepo = SecureSettingsRepository(
+      secure: const FlutterSecureStorage(),
+      prefs: SharedPreferencesAsync(),
+    );
+    await applySeedIfRequested(settingsRepo);
+
+    final PackageInfo packageInfo = await PackageInfo.fromPlatform();
+    final TelemetryConfig telemetryConfig = await TelemetryConfig.load(
+      prefs: SharedPreferencesAsync(),
+      secure: const FlutterSecureStorage(),
+      serviceVersion: packageInfo.version,
+    );
+    GazerTelemetry.init(telemetryConfig);
+
+    startupTimer.stop();
+    GazerTelemetry.histogram('gazer.app.startup_ms', startupTimer.elapsedMilliseconds.toDouble());
+
+    runApp(const ProviderScope(child: GazerApp()));
+  }
+  ```
+
+  Run `make mobile-test` — must still pass (widget tests construct `GazerApp` directly, bypassing
+  `main()` entirely, so this change is invisible to them; `telemetryConfigProvider`, not this
+  `main()` call, is what those tests override).
+
+  Manually verify `main.dart` still compiles for a real run:
+  ```
+  make mobile-run CMD="flutter build apk --debug --dart-define=GAZER_SEED=true"
+  ```
+  Expected: `✓ Built build/app/outputs/flutter-apk/app-debug.apk`.
+
+- [ ] **Step 14: Create `lib/providers/telemetry_provider.dart`**
+
+```dart
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../telemetry/gazer_telemetry.dart';
+import '../telemetry/telemetry_config.dart';
+
+part 'telemetry_provider.g.dart';
+
+/// Loads the resolved [TelemetryConfig] (Settings override > --dart-define
+/// > default) and applies it via `GazerTelemetry.init` as a side effect --
+/// so simply reading this provider once is what turns telemetry on for the
+/// widget tree. `keepAlive: true`: telemetry must stay configured across
+/// every screen for the app's lifetime, same rationale as
+/// `licenseProvider`/`settingsNotifierProvider` (Task 12).
+///
+/// Not directly unit-tested -- see Step 10's note; exercised only via
+/// `.overrideWith(...)` in `SettingsScreen`/`StatusPanel` widget tests.
+@Riverpod(keepAlive: true)
+Future<TelemetryConfig> telemetryConfig(Ref ref) async {
+  final PackageInfo packageInfo = await PackageInfo.fromPlatform();
+  final TelemetryConfig config = await TelemetryConfig.load(
+    prefs: SharedPreferencesAsync(),
+    secure: const FlutterSecureStorage(),
+    serviceVersion: packageInfo.version,
+  );
+  GazerTelemetry.init(config);
+  return config;
+}
+```
+
+  Run `make mobile-codegen` → succeeds (generates `telemetry_provider.g.dart`).
+
+- [ ] **Step 15: Add 6 l10n keys — modify `lib/l10n/app_en.arb`**
+
+  Quote the exact existing tail (as left by Task 24 Step 12):
+  ```json
+    "permissionPermanentlyDeniedMessage": "Camera or microphone permission was permanently denied.",
+    "permissionOpenSettingsLabel": "Open settings",
+    "settingsDebugLogsLabel": "Debug logs"
+  }
+  ```
+  Replace with:
+  ```json
+    "permissionPermanentlyDeniedMessage": "Camera or microphone permission was permanently denied.",
+    "permissionOpenSettingsLabel": "Open settings",
+    "settingsDebugLogsLabel": "Debug logs",
+    "telemetryEndpointFieldLabel": "Telemetry endpoint",
+    "telemetryEndpointFieldHint": "https://otel-collector.example.com:4318",
+    "statusPanelTelemetryLabel": "Telemetry",
+    "statusPanelTelemetryDisabledLabel": "Disabled (no endpoint configured)",
+    "statusPanelTelemetryExportingLabel": "Exporting",
+    "statusPanelTelemetryFailedLabel": "Last export failed"
+  }
+  ```
+  Run `make mobile-codegen` → succeeds.
+
+- [ ] **Step 16: Add the Developer "Telemetry endpoint" field — modify `lib/screens/settings_screen.dart`**
+
+  Quote the exact existing import block (Task 24 Step 13/Task 15 Step 7):
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:package_info_plus/package_info_plus.dart';
+  import 'package:flutter_libs/flutter_libs.dart';
+
+  import '../l10n/app_localizations.dart';
+  import '../models/gazer_settings.dart';
+  import '../models/quality.dart';
+  import '../models/stream_target_settings.dart';
+  import '../models/validation_issue.dart';
+  import '../providers/license_provider.dart';
+  import '../providers/settings_provider.dart';
+  import '../services/feature_flags.dart';
+  import '../services/settings_validation.dart';
+  import '../services/target_validator.dart';
+  ```
+  Replace with:
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:package_info_plus/package_info_plus.dart';
+  import 'package:shared_preferences/shared_preferences.dart';
+  import 'package:flutter_libs/flutter_libs.dart';
+
+  import '../l10n/app_localizations.dart';
+  import '../models/gazer_settings.dart';
+  import '../models/quality.dart';
+  import '../models/stream_target_settings.dart';
+  import '../models/validation_issue.dart';
+  import '../providers/license_provider.dart';
+  import '../providers/settings_provider.dart';
+  import '../providers/telemetry_provider.dart';
+  import '../services/feature_flags.dart';
+  import '../services/settings_validation.dart';
+  import '../services/target_validator.dart';
+  import '../telemetry/telemetry_config.dart';
+  ```
+
+  Quote the exact existing field block (as left by Task 24's Developer section — controllers
+  unchanged since Task 15 Step 7):
+  ```dart
+  class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+    final TextEditingController _url = TextEditingController();
+    final TextEditingController _streamKey = TextEditingController();
+    final TextEditingController _username = TextEditingController();
+    final TextEditingController _password = TextEditingController();
+    GazerSettings? _draft;
+    bool _initialized = false;
+    bool _devUnlocked = false;
+    bool _streamKeyObscured = true;
+    bool _passwordObscured = true;
+  ```
+  Replace with:
+  ```dart
+  class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+    final TextEditingController _url = TextEditingController();
+    final TextEditingController _streamKey = TextEditingController();
+    final TextEditingController _username = TextEditingController();
+    final TextEditingController _password = TextEditingController();
+    final TextEditingController _telemetryEndpoint = TextEditingController();
+    GazerSettings? _draft;
+    bool _initialized = false;
+    bool _telemetryInitialized = false;
+    bool _devUnlocked = false;
+    bool _streamKeyObscured = true;
+    bool _passwordObscured = true;
+  ```
+
+  Quote the exact existing `dispose()` (Task 15 Step 7):
+  ```dart
+    @override
+    void dispose() {
+      _url.dispose();
+      _streamKey.dispose();
+      _username.dispose();
+      _password.dispose();
+      super.dispose();
+    }
+  ```
+  Replace with:
+  ```dart
+    @override
+    void dispose() {
+      _url.dispose();
+      _streamKey.dispose();
+      _username.dispose();
+      _password.dispose();
+      _telemetryEndpoint.dispose();
+      super.dispose();
+    }
+  ```
+
+  Quote the exact existing settings-seed block in `build()` (Task 15 Step 7):
+  ```dart
+      if (!_initialized && settingsAsync.hasValue) {
+        _seed(settingsAsync.requireValue);
+        _initialized = true;
+      }
+  ```
+  Replace with:
+  ```dart
+      if (!_initialized && settingsAsync.hasValue) {
+        _seed(settingsAsync.requireValue);
+        _initialized = true;
+      }
+
+      final AsyncValue<TelemetryConfig> telemetryConfigAsync = ref.watch(telemetryConfigProvider);
+      if (!_telemetryInitialized && telemetryConfigAsync.hasValue) {
+        _telemetryEndpoint.text = telemetryConfigAsync.requireValue.endpoint;
+        _telemetryInitialized = true;
+      }
+  ```
+
+  Quote the exact existing Developer section (as left by Task 24 Step 11):
+  ```dart
+              if (_devUnlocked) ...<Widget>[
+                Text(l10n.developerSectionTitle, style: Theme.of(context).textTheme.titleMedium),
+                SwitchListTile(
+                  title: Text(l10n.forceLibuvcLabel),
+                  value: draft.forceLibuvc,
+                  onChanged: (bool v) => _update((GazerSettings s) => s.copyWith(forceLibuvc: v)),
+                ),
+                SwitchListTile(
+                  key: const Key('debugLogsSwitch'),
+                  title: Text(l10n.settingsDebugLogsLabel),
+                  value: draft.debugLogs,
+                  onChanged: (bool v) => _update((GazerSettings s) => s.copyWith(debugLogs: v)),
+                ),
+              ],
+  ```
+  Replace with:
+  ```dart
+              if (_devUnlocked) ...<Widget>[
+                Text(l10n.developerSectionTitle, style: Theme.of(context).textTheme.titleMedium),
+                SwitchListTile(
+                  title: Text(l10n.forceLibuvcLabel),
+                  value: draft.forceLibuvc,
+                  onChanged: (bool v) => _update((GazerSettings s) => s.copyWith(forceLibuvc: v)),
+                ),
+                SwitchListTile(
+                  key: const Key('debugLogsSwitch'),
+                  title: Text(l10n.settingsDebugLogsLabel),
+                  value: draft.debugLogs,
+                  onChanged: (bool v) => _update((GazerSettings s) => s.copyWith(debugLogs: v)),
+                ),
+                TextFormField(
+                  key: const Key('telemetryEndpointField'),
+                  controller: _telemetryEndpoint,
+                  decoration: InputDecoration(
+                    labelText: l10n.telemetryEndpointFieldLabel,
+                    hintText: l10n.telemetryEndpointFieldHint,
+                  ),
+                ),
+              ],
+  ```
+
+  Quote the exact existing Save button `onPressed` (Task 15 Step 7):
+  ```dart
+                  onPressed: canSave
+                      ? () async {
+                          await ref.read(settingsNotifierProvider.notifier).update(draft);
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(l10n.settingsSavedMessage)));
+                        }
+                      : null,
+  ```
+  Replace with:
+  ```dart
+                  onPressed: canSave
+                      ? () async {
+                          await ref.read(settingsNotifierProvider.notifier).update(draft);
+                          await TelemetryConfig.saveEndpointOverride(
+                            SharedPreferencesAsync(),
+                            _telemetryEndpoint.text.trim(),
+                          );
+                          ref.invalidate(telemetryConfigProvider);
+                          await ref.read(telemetryConfigProvider.future);
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(l10n.settingsSavedMessage)));
+                        }
+                      : null,
+  ```
+
+- [ ] **Step 17: Add the provider override and a new test — modify `test/screens/settings_screen_test.dart`**
+
+  Quote the exact existing `overrides()` (Task 15 Step 5):
+  ```dart
+    List<Override> overrides() => <Override>[
+          settingsRepositoryProvider.overrideWithValue(settingsRepo),
+          gazerHostApiProvider.overrideWithValue(FakeGazerHostApi()),
+          licenseClientProvider.overrideWith(
+            (Ref ref) async => FakeLicenseClient(
+              LicenseState(
+                status: LicenseStatus.valid,
+                flags: const <String, bool>{
+                  'waddlebot.gazer.camera-stream': true,
+                  'waddlebot.gazer.uvc-capture': true,
+                  'waddlebot.gazer.adaptive-bitrate': true,
+                  'waddlebot.gazer.rtmp-auth': true,
+                },
+                lastFetched: DateTime.utc(2026, 9, 7),
+                deviceId: 'test-device',
+              ),
+            ),
+          ),
+          isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
+          updateCheckerProvider.overrideWith((Ref ref) async => FakeUpdateChecker(null)),
+        ];
+  ```
+  Replace with:
+  ```dart
+    List<Override> overrides() => <Override>[
+          settingsRepositoryProvider.overrideWithValue(settingsRepo),
+          gazerHostApiProvider.overrideWithValue(FakeGazerHostApi()),
+          licenseClientProvider.overrideWith(
+            (Ref ref) async => FakeLicenseClient(
+              LicenseState(
+                status: LicenseStatus.valid,
+                flags: const <String, bool>{
+                  'waddlebot.gazer.camera-stream': true,
+                  'waddlebot.gazer.uvc-capture': true,
+                  'waddlebot.gazer.adaptive-bitrate': true,
+                  'waddlebot.gazer.rtmp-auth': true,
+                },
+                lastFetched: DateTime.utc(2026, 9, 7),
+                deviceId: 'test-device',
+              ),
+            ),
+          ),
+          isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
+          updateCheckerProvider.overrideWith((Ref ref) async => FakeUpdateChecker(null)),
+          telemetryConfigProvider.overrideWith(
+            (Ref ref) async => const TelemetryConfig(
+              endpoint: '',
+              protocol: 'http/json',
+              headers: <String, String>{},
+              serviceName: 'gazer',
+              serviceVersion: '0.0.0',
+              deploymentEnvironment: 'test',
+            ),
+          ),
+        ];
+  ```
+
+  Add the two new imports (`telemetry_provider.dart`, `telemetry_config.dart`) — quote the exact
+  existing import block (as left by Task 24 Step 13):
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_test/flutter_test.dart';
+  import 'package:gazer/models/gazer_settings.dart';
+  import 'package:gazer/models/license_state.dart';
+  import 'package:gazer/models/stream_target_settings.dart';
+  import 'package:gazer/providers/connectivity_provider.dart';
+  import 'package:gazer/providers/devices_provider.dart';
+  import 'package:gazer/providers/license_provider.dart';
+  import 'package:gazer/providers/pipeline_provider.dart';
+  import 'package:gazer/providers/settings_provider.dart';
+  import 'package:gazer/providers/update_provider.dart';
+  import 'package:package_info_plus/package_info_plus.dart';
+
+  import '../helpers/fake_host_api.dart';
+  import '../helpers/fakes.dart';
+  import '../helpers/pump_app.dart';
+  ```
+  Replace with:
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_test/flutter_test.dart';
+  import 'package:gazer/models/gazer_settings.dart';
+  import 'package:gazer/models/license_state.dart';
+  import 'package:gazer/models/stream_target_settings.dart';
+  import 'package:gazer/providers/connectivity_provider.dart';
+  import 'package:gazer/providers/devices_provider.dart';
+  import 'package:gazer/providers/license_provider.dart';
+  import 'package:gazer/providers/pipeline_provider.dart';
+  import 'package:gazer/providers/settings_provider.dart';
+  import 'package:gazer/providers/telemetry_provider.dart';
+  import 'package:gazer/providers/update_provider.dart';
+  import 'package:gazer/telemetry/telemetry_config.dart';
+  import 'package:package_info_plus/package_info_plus.dart';
+
+  import '../helpers/fake_host_api.dart';
+  import '../helpers/fakes.dart';
+  import '../helpers/pump_app.dart';
+  ```
+
+  Quote the exact existing last test (Task 24 Step 13) to anchor the insertion:
+  ```dart
+    testWidgets('debug logs switch is hidden until the version footer is long-pressed, then saves',
+        (WidgetTester tester) async {
+      await pumpSettings(tester);
+      expect(find.byKey(const Key('debugLogsSwitch')), findsNothing);
+
+      await tester.longPress(find.byType(FutureBuilder<PackageInfo>));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('debugLogsSwitch')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('debugLogsSwitch')));
+      await tester.enterText(find.widgetWithText(TextFormField, 'RTMP URL'), 'rtmp://example.com/live/mystream');
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(settingsRepo.saved, isNotEmpty);
+      expect(settingsRepo.saved.last.debugLogs, isTrue);
+    });
+  }
+  ```
+  Replace with:
+  ```dart
+    testWidgets('debug logs switch is hidden until the version footer is long-pressed, then saves',
+        (WidgetTester tester) async {
+      await pumpSettings(tester);
+      expect(find.byKey(const Key('debugLogsSwitch')), findsNothing);
+
+      await tester.longPress(find.byType(FutureBuilder<PackageInfo>));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('debugLogsSwitch')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('debugLogsSwitch')));
+      await tester.enterText(find.widgetWithText(TextFormField, 'RTMP URL'), 'rtmp://example.com/live/mystream');
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(settingsRepo.saved, isNotEmpty);
+      expect(settingsRepo.saved.last.debugLogs, isTrue);
+    });
+
+    testWidgets('telemetry endpoint field is hidden until unlocked, then persists on save',
+        (WidgetTester tester) async {
+      await pumpSettings(tester);
+      expect(find.byKey(const Key('telemetryEndpointField')), findsNothing);
+
+      await tester.longPress(find.byType(FutureBuilder<PackageInfo>));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('telemetryEndpointField')), findsOneWidget);
+
+      await tester.enterText(find.widgetWithText(TextFormField, 'RTMP URL'), 'rtmp://example.com/live/mystream');
+      await tester.enterText(
+        find.byKey(const Key('telemetryEndpointField')),
+        'http://collector.example.com:4318',
+      );
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(settingsRepo.saved, isNotEmpty);
+    });
+  }
+  ```
+
+  Run `make mobile-run CMD="flutter test test/screens/settings_screen_test.dart"` → PASS
+  (`00:0X +7: All tests passed!` — 6 pre-existing + 1 new).
+
+- [ ] **Step 18: Add the status row — modify `lib/screens/status_panel.dart`**
+
+  Quote the exact existing import block (Task 16 Step 3):
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:url_launcher/url_launcher.dart';
+
+  import '../l10n/app_localizations.dart';
+  import '../models/gazer_settings.dart';
+  import '../models/license_state.dart';
+  import '../models/pipeline_state.dart';
+  import '../models/stream_stats.dart';
+  import '../models/update_info.dart';
+  import '../pigeon/pipeline.g.dart';
+  import '../providers/connectivity_provider.dart';
+  import '../providers/devices_provider.dart';
+  import '../providers/license_provider.dart';
+  import '../providers/pipeline_provider.dart';
+  import '../providers/settings_provider.dart';
+  import '../providers/update_provider.dart';
+  import '../services/feature_flags.dart';
+  import '../widgets/masked_text.dart';
+  ```
+  Replace with:
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:url_launcher/url_launcher.dart';
+
+  import '../l10n/app_localizations.dart';
+  import '../models/gazer_settings.dart';
+  import '../models/license_state.dart';
+  import '../models/pipeline_state.dart';
+  import '../models/stream_stats.dart';
+  import '../models/update_info.dart';
+  import '../pigeon/pipeline.g.dart';
+  import '../providers/connectivity_provider.dart';
+  import '../providers/devices_provider.dart';
+  import '../providers/license_provider.dart';
+  import '../providers/pipeline_provider.dart';
+  import '../providers/settings_provider.dart';
+  import '../providers/telemetry_provider.dart';
+  import '../providers/update_provider.dart';
+  import '../services/feature_flags.dart';
+  import '../telemetry/gazer_telemetry.dart';
+  import '../telemetry/telemetry_config.dart';
+  import '../widgets/masked_text.dart';
+  ```
+
+  Quote the exact existing last `ref.watch` line in `build()` (Task 16 Step 3):
+  ```dart
+      final GazerSettings? settings = ref.watch(settingsNotifierProvider).valueOrNull;
+  ```
+  Replace with:
+  ```dart
+      final GazerSettings? settings = ref.watch(settingsNotifierProvider).valueOrNull;
+      final AsyncValue<TelemetryConfig> telemetryConfig = ref.watch(telemetryConfigProvider);
+  ```
+
+  Quote the exact existing tail of `build()` (Task 16 Step 3):
+  ```dart
+            const Divider(),
+            _row(
+              context,
+              l10n.statusPanelForegroundServiceLabel,
+              state is! IdleState ? l10n.statusPanelForegroundServiceActiveLabel : l10n.statusPanelForegroundServiceInactiveLabel,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  ```
+  Replace with:
+  ```dart
+            const Divider(),
+            _row(
+              context,
+              l10n.statusPanelForegroundServiceLabel,
+              state is! IdleState ? l10n.statusPanelForegroundServiceActiveLabel : l10n.statusPanelForegroundServiceInactiveLabel,
+            ),
+            const Divider(),
+            _row(
+              context,
+              l10n.statusPanelTelemetryLabel,
+              (telemetryConfig.valueOrNull?.endpoint.isNotEmpty ?? false)
+                  ? (GazerTelemetry.exportFailures > 0 && GazerTelemetry.exportSuccesses == 0
+                      ? l10n.statusPanelTelemetryFailedLabel
+                      : l10n.statusPanelTelemetryExportingLabel)
+                  : l10n.statusPanelTelemetryDisabledLabel,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  ```
+
+- [ ] **Step 19: Add the provider override and a new test — modify `test/screens/status_panel_test.dart`**
+
+  Quote the exact existing `overrides()` (Task 16 Step 1):
+  ```dart
+    List<Override> overrides() => <Override>[
+          settingsRepositoryProvider.overrideWithValue(settingsRepo),
+          gazerHostApiProvider.overrideWithValue(hostApi),
+          // Wires hostApi.bridge into the controller under test so
+          // hostApi.emitStats(...) below actually reaches streamStatsProvider
+          // — see Task 11's FakeGazerHostApi doc.
+          pipelineControllerProvider.overrideWithValue(
+            PipelineController(host: hostApi, events: hostApi.bridge, policy: ReconnectPolicy()),
+          ),
+          licenseClientProvider.overrideWith(
+            (Ref ref) async => FakeLicenseClient(
+              LicenseState(
+                status: LicenseStatus.valid,
+                flags: const <String, bool>{
+                  'waddlebot.gazer.camera-stream': true,
+                  'waddlebot.gazer.uvc-capture': true,
+                  'waddlebot.gazer.adaptive-bitrate': true,
+                  'waddlebot.gazer.rtmp-auth': true,
+                },
+                lastFetched: DateTime.utc(2026, 9, 7),
+                deviceId: 'test-device',
+              ),
+            ),
+          ),
+          isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
+          updateCheckerProvider.overrideWith((Ref ref) async => FakeUpdateChecker(null)),
+        ];
+  ```
+  Replace with:
+  ```dart
+    List<Override> overrides() => <Override>[
+          settingsRepositoryProvider.overrideWithValue(settingsRepo),
+          gazerHostApiProvider.overrideWithValue(hostApi),
+          // Wires hostApi.bridge into the controller under test so
+          // hostApi.emitStats(...) below actually reaches streamStatsProvider
+          // — see Task 11's FakeGazerHostApi doc.
+          pipelineControllerProvider.overrideWithValue(
+            PipelineController(host: hostApi, events: hostApi.bridge, policy: ReconnectPolicy()),
+          ),
+          licenseClientProvider.overrideWith(
+            (Ref ref) async => FakeLicenseClient(
+              LicenseState(
+                status: LicenseStatus.valid,
+                flags: const <String, bool>{
+                  'waddlebot.gazer.camera-stream': true,
+                  'waddlebot.gazer.uvc-capture': true,
+                  'waddlebot.gazer.adaptive-bitrate': true,
+                  'waddlebot.gazer.rtmp-auth': true,
+                },
+                lastFetched: DateTime.utc(2026, 9, 7),
+                deviceId: 'test-device',
+              ),
+            ),
+          ),
+          isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
+          updateCheckerProvider.overrideWith((Ref ref) async => FakeUpdateChecker(null)),
+          telemetryConfigProvider.overrideWith(
+            (Ref ref) async => const TelemetryConfig(
+              endpoint: '',
+              protocol: 'http/json',
+              headers: <String, String>{},
+              serviceName: 'gazer',
+              serviceVersion: '0.0.0',
+              deploymentEnvironment: 'test',
+            ),
+          ),
+        ];
+  ```
+
+  Add the two new imports — quote the exact existing import block (Task 16 Step 1):
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_test/flutter_test.dart';
+  import 'package:gazer/models/gazer_settings.dart';
+  import 'package:gazer/models/license_state.dart';
+  import 'package:gazer/models/stream_target_settings.dart';
+  import 'package:gazer/providers/connectivity_provider.dart';
+  import 'package:gazer/providers/devices_provider.dart';
+  import 'package:gazer/providers/license_provider.dart';
+  import 'package:gazer/providers/pipeline_provider.dart';
+  import 'package:gazer/providers/settings_provider.dart';
+  import 'package:gazer/providers/update_provider.dart';
+  import 'package:gazer/screens/status_panel.dart';
+  import 'package:gazer/services/pipeline_controller.dart';
+  import 'package:gazer/services/reconnect_policy.dart';
+
+  import '../helpers/fake_host_api.dart';
+  import '../helpers/fakes.dart';
+  import '../helpers/pump_app.dart';
+  ```
+  Replace with:
+  ```dart
+  import 'package:flutter/material.dart';
+  import 'package:flutter_riverpod/flutter_riverpod.dart';
+  import 'package:flutter_test/flutter_test.dart';
+  import 'package:gazer/models/gazer_settings.dart';
+  import 'package:gazer/models/license_state.dart';
+  import 'package:gazer/models/stream_target_settings.dart';
+  import 'package:gazer/providers/connectivity_provider.dart';
+  import 'package:gazer/providers/devices_provider.dart';
+  import 'package:gazer/providers/license_provider.dart';
+  import 'package:gazer/providers/pipeline_provider.dart';
+  import 'package:gazer/providers/settings_provider.dart';
+  import 'package:gazer/providers/telemetry_provider.dart';
+  import 'package:gazer/providers/update_provider.dart';
+  import 'package:gazer/screens/status_panel.dart';
+  import 'package:gazer/services/pipeline_controller.dart';
+  import 'package:gazer/services/reconnect_policy.dart';
+  import 'package:gazer/telemetry/telemetry_config.dart';
+
+  import '../helpers/fake_host_api.dart';
+  import '../helpers/fakes.dart';
+  import '../helpers/pump_app.dart';
+  ```
+
+  Quote the exact existing last test (Task 16 Step 1) to anchor the insertion:
+  ```dart
+    testWidgets('masked stream key shows only the last 4 characters', (WidgetTester tester) async {
+      await pumpGazerApp(tester, overrides: overrides(), size: const Size(1280, 800));
+      expect(find.text('•••••••••0001'), findsOneWidget);
+      expect(find.text('demo-key-0001'), findsNothing);
+    });
+  }
+  ```
+  Replace with:
+  ```dart
+    testWidgets('masked stream key shows only the last 4 characters', (WidgetTester tester) async {
+      await pumpGazerApp(tester, overrides: overrides(), size: const Size(1280, 800));
+      expect(find.text('•••••••••0001'), findsOneWidget);
+      expect(find.text('demo-key-0001'), findsNothing);
+    });
+
+    testWidgets('telemetry row shows disabled when no endpoint is configured', (WidgetTester tester) async {
+      await pumpGazerApp(tester, overrides: overrides(), size: const Size(1280, 800));
+      expect(find.text('Disabled (no endpoint configured)'), findsOneWidget);
+    });
+  }
+  ```
+
+  Run `make mobile-run CMD="flutter test test/screens/status_panel_test.dart"` → PASS (`00:0X +5:
+  All tests passed!` — 4 pre-existing + 1 new).
+
+- [ ] **Step 20: Add `make mobile-telemetry-check` — modify `Makefile` (repo root)**
+
+  Quote the exact existing `.PHONY` line (Task 1 Step 8):
+  ```makefile
+  .PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
+  ```
+  Replace with:
+  ```makefile
+  .PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile mobile-telemetry-check
+  ```
+
+  Quote the exact existing `mobile-clean` target (Task 1 Step 8, the last target in the block):
+  ```makefile
+  mobile-clean:
+  	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter clean; if [ -d android ]; then cd android && ./gradlew clean; fi"
+  ```
+  Replace with:
+  ```makefile
+  mobile-clean:
+  	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter clean; if [ -d android ]; then cd android && ./gradlew clean; fi"
+
+  # OpenTelemetry emission gate (Task 27): runs ONLY the local-OTLP-sink test
+  # and greps its printed "telemetry sink received: ..." line for four
+  # non-zero counts. set -euo pipefail means a test failure already aborts
+  # before the grep runs; the grep is the second, independent check the
+  # house Verification Integrity rule requires -- it fails the build if the
+  # counts line is somehow missing or shows a zero, not just if the test
+  # framework's own exit code says pass.
+  mobile-telemetry-check:
+  	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test test/telemetry/otlp_sink_test.dart 2>&1 | tee /tmp/gazer-telemetry-check.log; grep -E 'telemetry sink received: logs=[1-9][0-9]* metrics=[1-9][0-9]* histograms=[1-9][0-9]* spans=[1-9][0-9]*' /tmp/gazer-telemetry-check.log"
+  ```
+
+  Run: `make mobile-telemetry-check`
+  Expected: PASS, and the command's own stdout shows the matched
+  `telemetry sink received: logs=1 metrics=2 histograms=1 spans=1` line.
+
+- [ ] **Step 21: Full regression**
+
+  `make mobile-test` → PASS: every suite from Tasks 4-27 green together, coverage gate ≥90% (the
+  `scripts/coverage_gate.sh` from Task 1 asserts a non-zero denominator of files examined).
+
+  `make mobile-lint` → PASS.
+
+- [ ] **Step 22: Add the telemetry gate to Task 26's verification checklist — modify this plan file**
+
+  Modify `docs/superpowers/plans/2026-09-07-gazer-mobile-v2-m1.md` — Task 26 Step 13. Quote the
+  exact existing text (unaffected by Task 25's separate insertion after "Each must be < 100 MB.",
+  which is a different location in the same checklist):
+  ```
+    ```
+    make mobile-test
+    ```
+    Record: Dart lcov coverage % from `coverage/lcov.info` (`lcov --summary coverage/lcov.info` or the `scripts/coverage_gate.sh` output) — must be >=90%, and record the file count the gate examined (non-zero denominator).
+    ```
+    make mobile-test-android
+    ```
+  ```
+  Replace with:
+  ```
+    ```
+    make mobile-test
+    ```
+    Record: Dart lcov coverage % from `coverage/lcov.info` (`lcov --summary coverage/lcov.info` or the `scripts/coverage_gate.sh` output) — must be >=90%, and record the file count the gate examined (non-zero denominator).
+    ```
+    make mobile-telemetry-check
+    ```
+    Record: the printed `telemetry sink received: logs=.. metrics=.. histograms=.. spans=..` line — every count must be >=1; zero on any of the four is a FAIL per the house OpenTelemetry emission gate (Task 27), not a pass.
+    ```
+    make mobile-test-android
+    ```
+  ```
+
+  Also quote the exact existing "Merge gate" line:
+  ```
+    **Merge gate:** Merge to `release/v3.0.X` happens via PR per the `merging-to-release` skill, and only once every gate above — `make mobile-lint`, `make mobile-test` (>=90%), `make mobile-test-android` (>=90%), `make mobile-security` (0 findings, non-zero denominator recorded), `make mobile-build` (all ABIs < 100MB), `make mobile-test-integration` (non-zero test count), CI green on every job, and the manual physical-device recovery test — is green. No direct merge, no `--admin`, no exceptions.
+  ```
+  Replace with:
+  ```
+    **Merge gate:** Merge to `release/v3.0.X` happens via PR per the `merging-to-release` skill, and only once every gate above — `make mobile-lint`, `make mobile-test` (>=90%), `make mobile-telemetry-check` (all four OTLP counts >=1), `make mobile-test-android` (>=90%), `make mobile-security` (0 findings, non-zero denominator recorded), `make mobile-build` (all ABIs < 100MB), `make mobile-test-integration` (non-zero test count), CI green on every job, and the manual physical-device recovery test — is green. No direct merge, no `--admin`, no exceptions.
+  ```
+
+  Run: `grep -c 'mobile-telemetry-check' docs/superpowers/plans/2026-09-07-gazer-mobile-v2-m1.md`
+  Expected: `>= 2` (the new gate block plus the merge-gate mention).
+
+- [ ] **Step 23: Commit**
+
+```bash
+git add mobile/gazer/lib/telemetry/ mobile/gazer/test/telemetry/ \
+  mobile/gazer/lib/providers/telemetry_provider.dart \
+  mobile/gazer/lib/services/gazer_log.dart mobile/gazer/lib/services/pipeline_controller.dart \
+  mobile/gazer/lib/main.dart mobile/gazer/lib/screens/settings_screen.dart \
+  mobile/gazer/test/screens/settings_screen_test.dart mobile/gazer/lib/screens/status_panel.dart \
+  mobile/gazer/test/screens/status_panel_test.dart mobile/gazer/lib/l10n/app_en.arb \
+  mobile/gazer/lib/l10n/app_localizations.dart mobile/gazer/lib/l10n/app_localizations_en.dart \
+  Makefile docs/superpowers/plans/2026-09-07-gazer-mobile-v2-m1.md
+git commit -m "$(cat <<'EOF'
+feat(gazer): emit OpenTelemetry logs, metrics, and traces via OTLP/HTTP JSON
+
+GazerTelemetry buffers structured logs (fed from GazerLog), histograms
+(gazer.app.startup_ms, gazer.rtmp.connect_latency_ms,
+gazer.stream.bitrate_kbps), the gazer.pipeline.state_change counter,
+and prepare/start/stop spans in a capped drop-oldest ring buffer,
+flushing every 10s via a minimal in-app OtlpHttpExporter -- no
+maintained pub.dev package covers logs+metrics+traces OTLP export
+today at an acceptable maturity bar (opentelemetry: logs
+unimplemented, metrics alpha; dartastic_opentelemetry: 12 days old,
+unproven), so this reuses the already-pinned dio dependency instead.
+Endpoint/headers resolve from --dart-define, overridable via a new
+Settings > Developer "Telemetry endpoint" field; empty endpoint
+disables the network path but never stops buffering. A dead collector
+increments exportFailures and never throws. make mobile-telemetry-check
+runs test/telemetry/otlp_sink_test.dart against a local HttpServer OTLP
+sink and greps its printed per-signal counts -- zero is a FAIL, added
+to Task 26's merge-gate checklist.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N2rQgkHY872RubwXoBZxtE
+EOF
+)"
+```

@@ -349,6 +349,19 @@ If Camera2Source's rotation/mirroring assumption breaks for external cameras on 
 - Logging: structured, sanitized; debug logs only when developer toggle ON
 - Secrets never logged; mask username/password (show last 4 chars)
 
+## Observability (OpenTelemetry)
+
+- Every app emits logs, metrics (histograms/counters/gauges), and traces; OTLP is the wire format — `GazerTelemetry` facade (`lib/telemetry/`)
+- **Packages evaluated (2026-09-09):** `opentelemetry` (Workiva, US, Apache-2.0, 0.18.11) — traces Beta, metrics Alpha, logs unimplemented; `dartastic_opentelemetry` (Dartastic.io/MindfulSoftwareLLC, 0.11.0, 12 days old, 13 likes) claims full traces+metrics+logs OTLP but is too new/unproven to depend on for M1. Neither adopted.
+- **Decision:** hand-rolled `OtlpHttpExporter` — OTLP/HTTP JSON per the OTLP spec's JSON Protobuf Encoding mapping (opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding), built on the already-pinned `dio` — zero new pub.dev dependencies
+- No process env on mobile: `--dart-define` (`OTEL_EXPORTER_OTLP_ENDPOINT`/`_PROTOCOL`/`_HEADERS`, `OTEL_SERVICE_NAME`, `GAZER_ENV`) is the build-time default, overridden by Settings > Developer "Telemetry endpoint" (`shared_preferences` key `gazer.telemetry.endpoint`; headers in `flutter_secure_storage` key `gazer.telemetry.headers`, since they may carry auth)
+- Empty endpoint = export disabled, zero network calls; every signal still records to a capped (1000), drop-oldest in-memory ring buffer — status panel shows disabled/exporting/last-export-failed
+- Export scheduler: every 10s, batched per signal type to `/v1/logs`, `/v1/metrics`, `/v1/traces`; a dead collector increments `exportFailures` and never throws — a bad endpoint never breaks streaming
+- Metrics: histograms first (`gazer.app.startup_ms`, `gazer.rtmp.connect_latency_ms`, `gazer.stream.bitrate_kbps`), counter (`gazer.pipeline.state_change`); traces span pipeline prepare/start/stop
+- Resource attrs: `service.name` (default `gazer`), `service.version` (`package_info_plus`), `deployment.environment` (`GAZER_ENV`, default `dev`), `device.model`; never ANDROID_ID or a masked secret
+- Logs funnel through the existing sanitized `GazerLog` path — no attribute is ever telemetry-only unsanitized; DEBUG-level telemetry logs stay gated by the same `debugLogs` toggle, off by default
+- **Test gate (blocking):** `test/telemetry/otlp_sink_test.dart` runs a local `HttpServer` as an OTLP sink, drives one log/counter/histogram/span, asserts ≥1 received of each, and prints the counts; `make mobile-telemetry-check` greps them — zero or a missing sink is a FAIL, not a pass
+
 ## Flutter App
 
 ### Screens
