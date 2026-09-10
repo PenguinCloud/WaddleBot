@@ -57,12 +57,16 @@ final class GazerHostApiProvider
 
 String _$gazerHostApiHash() => r'5979de3860a9464220eb38b8bbd81cb50840fbfa';
 
-/// Enumerable video sources (M1: back/front camera only).
+/// Enumerable video sources (M1: back/front camera only). M1 has no
+/// hot-plug refresh — the list is read once per provider build; USB/UVC
+/// device attach-and-refresh arrives in M2.
 
 @ProviderFor(videoDevices)
 final videoDevicesProvider = VideoDevicesProvider._();
 
-/// Enumerable video sources (M1: back/front camera only).
+/// Enumerable video sources (M1: back/front camera only). M1 has no
+/// hot-plug refresh — the list is read once per provider build; USB/UVC
+/// device attach-and-refresh arrives in M2.
 
 final class VideoDevicesProvider
     extends
@@ -74,7 +78,9 @@ final class VideoDevicesProvider
     with
         $FutureModifier<List<VideoDevice>>,
         $FutureProvider<List<VideoDevice>> {
-  /// Enumerable video sources (M1: back/front camera only).
+  /// Enumerable video sources (M1: back/front camera only). M1 has no
+  /// hot-plug refresh — the list is read once per provider build; USB/UVC
+  /// device attach-and-refresh arrives in M2.
   VideoDevicesProvider._()
     : super(
         from: null,
@@ -103,12 +109,16 @@ final class VideoDevicesProvider
 
 String _$videoDevicesHash() => r'dad06377622782436f20a2bf72d82ba4193779d4';
 
-/// Enumerable audio sources (M1: mic + silence only).
+/// Enumerable audio sources (M1: mic + silence only). M1 has no hot-plug
+/// refresh — the list is read once per provider build; USB/UVC audio
+/// attach-and-refresh arrives in M2.
 
 @ProviderFor(audioDevices)
 final audioDevicesProvider = AudioDevicesProvider._();
 
-/// Enumerable audio sources (M1: mic + silence only).
+/// Enumerable audio sources (M1: mic + silence only). M1 has no hot-plug
+/// refresh — the list is read once per provider build; USB/UVC audio
+/// attach-and-refresh arrives in M2.
 
 final class AudioDevicesProvider
     extends
@@ -120,7 +130,9 @@ final class AudioDevicesProvider
     with
         $FutureModifier<List<AudioDevice>>,
         $FutureProvider<List<AudioDevice>> {
-  /// Enumerable audio sources (M1: mic + silence only).
+  /// Enumerable audio sources (M1: mic + silence only). M1 has no hot-plug
+  /// refresh — the list is read once per provider build; USB/UVC audio
+  /// attach-and-refresh arrives in M2.
   AudioDevicesProvider._()
     : super(
         from: null,

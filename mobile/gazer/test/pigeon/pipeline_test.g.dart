@@ -4,12 +4,12 @@
 // ignore_for_file: avoid_relative_lib_imports
 import 'dart:async';
 import 'dart:typed_data' show Float64List, Int32List, Int64List, Uint8List;
-
 import 'package:flutter/foundation.dart' show ReadBuffer, WriteBuffer;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:gazer/pigeon/pipeline.g.dart';
+
 
 class _PigeonCodec extends StandardMessageCodec {
   const _PigeonCodec();
@@ -18,40 +18,40 @@ class _PigeonCodec extends StandardMessageCodec {
     if (value is int) {
       buffer.putUint8(4);
       buffer.putInt64(value);
-    } else if (value is VideoDeviceKind) {
+    }    else if (value is VideoDeviceKind) {
       buffer.putUint8(129);
       writeValue(buffer, value.index);
-    } else if (value is AudioDeviceKind) {
+    }    else if (value is AudioDeviceKind) {
       buffer.putUint8(130);
       writeValue(buffer, value.index);
-    } else if (value is NativePipelineState) {
+    }    else if (value is NativePipelineState) {
       buffer.putUint8(131);
       writeValue(buffer, value.index);
-    } else if (value is GazerErrorCode) {
+    }    else if (value is GazerErrorCode) {
       buffer.putUint8(132);
       writeValue(buffer, value.index);
-    } else if (value is OutputOrientation) {
+    }    else if (value is OutputOrientation) {
       buffer.putUint8(133);
       writeValue(buffer, value.index);
-    } else if (value is VideoDevice) {
+    }    else if (value is VideoDevice) {
       buffer.putUint8(134);
       writeValue(buffer, value.encode());
-    } else if (value is AudioDevice) {
+    }    else if (value is AudioDevice) {
       buffer.putUint8(135);
       writeValue(buffer, value.encode());
-    } else if (value is StreamConfig) {
+    }    else if (value is StreamConfig) {
       buffer.putUint8(136);
       writeValue(buffer, value.encode());
-    } else if (value is StreamTarget) {
+    }    else if (value is StreamTarget) {
       buffer.putUint8(137);
       writeValue(buffer, value.encode());
-    } else if (value is PrepareResult) {
+    }    else if (value is PrepareResult) {
       buffer.putUint8(138);
       writeValue(buffer, value.encode());
-    } else if (value is StatsSample) {
+    }    else if (value is StatsSample) {
       buffer.putUint8(139);
       writeValue(buffer, value.encode());
-    } else if (value is StateEvent) {
+    }    else if (value is StateEvent) {
       buffer.putUint8(140);
       writeValue(buffer, value.encode());
     } else {

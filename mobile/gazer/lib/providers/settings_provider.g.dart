@@ -68,6 +68,16 @@ String _$settingsRepositoryHash() =>
 ///
 /// `keepAlive: true` because settings must survive navigation between
 /// HomeScreen and SettingsScreen without re-reading storage on every visit.
+///
+/// Generates `settingsProvider`, not `settingsNotifierProvider`:
+/// riverpod_generator's default `provider_name_strip_pattern` (`Notifier$`)
+/// strips a trailing "Notifier" from an annotated class name before
+/// appending "Provider", specifically to avoid "NotifierNotifierProvider"
+/// stuttering — this is the generator's stable, documented default across
+/// versions, not a quirk of this pin. Every other provider in this file set
+/// is function-based (`license`, `featureFlags`, `videoDevices`, ...), so
+/// this stripping only ever applies here. Consumers (Task 13+ UI) import
+/// `settingsProvider`.
 
 @ProviderFor(SettingsNotifier)
 final settingsProvider = SettingsNotifierProvider._();
@@ -76,12 +86,32 @@ final settingsProvider = SettingsNotifierProvider._();
 ///
 /// `keepAlive: true` because settings must survive navigation between
 /// HomeScreen and SettingsScreen without re-reading storage on every visit.
+///
+/// Generates `settingsProvider`, not `settingsNotifierProvider`:
+/// riverpod_generator's default `provider_name_strip_pattern` (`Notifier$`)
+/// strips a trailing "Notifier" from an annotated class name before
+/// appending "Provider", specifically to avoid "NotifierNotifierProvider"
+/// stuttering — this is the generator's stable, documented default across
+/// versions, not a quirk of this pin. Every other provider in this file set
+/// is function-based (`license`, `featureFlags`, `videoDevices`, ...), so
+/// this stripping only ever applies here. Consumers (Task 13+ UI) import
+/// `settingsProvider`.
 final class SettingsNotifierProvider
     extends $AsyncNotifierProvider<SettingsNotifier, GazerSettings> {
   /// Loads, holds, and persists the user's [GazerSettings].
   ///
   /// `keepAlive: true` because settings must survive navigation between
   /// HomeScreen and SettingsScreen without re-reading storage on every visit.
+  ///
+  /// Generates `settingsProvider`, not `settingsNotifierProvider`:
+  /// riverpod_generator's default `provider_name_strip_pattern` (`Notifier$`)
+  /// strips a trailing "Notifier" from an annotated class name before
+  /// appending "Provider", specifically to avoid "NotifierNotifierProvider"
+  /// stuttering — this is the generator's stable, documented default across
+  /// versions, not a quirk of this pin. Every other provider in this file set
+  /// is function-based (`license`, `featureFlags`, `videoDevices`, ...), so
+  /// this stripping only ever applies here. Consumers (Task 13+ UI) import
+  /// `settingsProvider`.
   SettingsNotifierProvider._()
     : super(
         from: null,
@@ -107,6 +137,16 @@ String _$settingsNotifierHash() => r'd63ff50da5bd374dbb07829293d8c9d9bd56baa6';
 ///
 /// `keepAlive: true` because settings must survive navigation between
 /// HomeScreen and SettingsScreen without re-reading storage on every visit.
+///
+/// Generates `settingsProvider`, not `settingsNotifierProvider`:
+/// riverpod_generator's default `provider_name_strip_pattern` (`Notifier$`)
+/// strips a trailing "Notifier" from an annotated class name before
+/// appending "Provider", specifically to avoid "NotifierNotifierProvider"
+/// stuttering — this is the generator's stable, documented default across
+/// versions, not a quirk of this pin. Every other provider in this file set
+/// is function-based (`license`, `featureFlags`, `videoDevices`, ...), so
+/// this stripping only ever applies here. Consumers (Task 13+ UI) import
+/// `settingsProvider`.
 
 abstract class _$SettingsNotifier extends $AsyncNotifier<GazerSettings> {
   FutureOr<GazerSettings> build();
