@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gazer/models/gazer_settings.dart';
+import 'package:gazer/models/quality.dart';
 import 'package:gazer/models/stream_target_settings.dart';
 
 void main() {
@@ -53,6 +55,57 @@ void main() {
       const a = StreamTargetSettings(url: 'rtmp://a.example.com/live');
       const b = StreamTargetSettings(url: 'rtmp://b.example.com/live');
       expect(a == b, isFalse);
+    });
+  });
+
+  group('StreamTargetSettings toString redaction (R22)', () {
+    const secretPassword = 'hunter2-secret';
+    const secretStreamKey = 'demo-key-0001';
+
+    test('does not contain the raw password or streamKey', () {
+      const settings = StreamTargetSettings(
+        url: 'rtmps://ingest-a.example.com/app/path?token=abc',
+        streamKey: secretStreamKey,
+        username: 'demo-user',
+        password: secretPassword,
+      );
+      final rendered = settings.toString();
+      expect(rendered, isNot(contains(secretPassword)));
+      expect(rendered, isNot(contains(secretStreamKey)));
+      expect(rendered, isNot(contains('demo-user')));
+      // The last-4 mask is intentionally still visible.
+      expect(rendered, contains('****0001'));
+      expect(rendered, contains('<redacted>'));
+      // Host survives; query string (which carried a token) does not.
+      expect(rendered, contains('ingest-a.example.com'));
+      expect(rendered, isNot(contains('token=abc')));
+    });
+
+    test('null username/password/streamKey print as null, not redacted', () {
+      const settings = StreamTargetSettings(url: 'rtmp://a.example.com/live');
+      final rendered = settings.toString();
+      expect(rendered, contains('streamKey: null'));
+      expect(rendered, contains('username: null'));
+      expect(rendered, contains('password: null'));
+    });
+
+    test('GazerSettings.toString() does not leak the nested credentials', () {
+      final settings = GazerSettings(
+        target: const StreamTargetSettings(
+          url: 'rtmp://ingest-a.example.com/live',
+          streamKey: secretStreamKey,
+          username: 'demo-user',
+          password: secretPassword,
+        ),
+        quality: QualitySettings.defaults(),
+        audio: AudioSourceChoice.auto,
+        forceLibuvc: false,
+      );
+      final rendered = settings.toString();
+      expect(rendered, isNot(contains(secretPassword)));
+      expect(rendered, isNot(contains(secretStreamKey)));
+      expect(rendered, isNot(contains('demo-user')));
+      expect(rendered, contains('****0001'));
     });
   });
 }

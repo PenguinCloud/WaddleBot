@@ -40,11 +40,6 @@ int get hashCode {
   return Object.hash(runtimeType,_this.url,_this.streamKey,_this.username,_this.password);
 }
 
-@override
-String toString() {
-  final _this = this as StreamTargetSettings;
-  return 'StreamTargetSettings(url: ${_this.url}, streamKey: ${_this.streamKey}, username: ${_this.username}, password: ${_this.password})';
-}
 
 
 }
@@ -217,8 +212,8 @@ return $default(_that.url,_that.streamKey,_that.username,_that.password);case _:
 /// @nodoc
 @JsonSerializable()
 
-class _StreamTargetSettings implements StreamTargetSettings {
-  const _StreamTargetSettings({required this.url, this.streamKey, this.username, this.password});
+class _StreamTargetSettings extends StreamTargetSettings {
+  const _StreamTargetSettings({required this.url, this.streamKey, this.username, this.password}): super._();
   factory _StreamTargetSettings.fromJson(Map<String, dynamic> json) => _$StreamTargetSettingsFromJson(json);
 
 @override final  String url;
@@ -248,10 +243,6 @@ int get hashCode {
     return Object.hash(runtimeType,url,streamKey,username,password);
 }
 
-@override
-String toString() {
-    return 'StreamTargetSettings(url: $url, streamKey: $streamKey, username: $username, password: $password)';
-}
 
 
 }
