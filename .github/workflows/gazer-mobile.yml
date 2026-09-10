@@ -106,23 +106,45 @@ jobs:
       contents: read
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's checkout/cache/artifact steps (GitHub cannot run job
+      # containers as non-root: runner file commands live in a runner-owned dir); all
+      # toolchain commands run as appuser below -- see rootless rule.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           persist-credentials: false
 
+      - name: Hand workspace to appuser
+        run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
       - name: flutter pub get
-        working-directory: mobile/gazer
-        run: flutter pub get
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter pub get
+          '
 
       - name: flutter analyze
-        working-directory: mobile/gazer
-        run: flutter analyze
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter analyze
+          '
 
       - name: dart format check
-        working-directory: mobile/gazer
-        run: dart format --set-exit-if-changed .
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            dart format --set-exit-if-changed .
+          '
 
   test:
     name: Dart unit tests + coverage gate
@@ -132,23 +154,45 @@ jobs:
       contents: read
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's checkout/cache/artifact steps (GitHub cannot run job
+      # containers as non-root: runner file commands live in a runner-owned dir); all
+      # toolchain commands run as appuser below -- see rootless rule.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           persist-credentials: false
 
+      - name: Hand workspace to appuser
+        run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
       - name: flutter pub get
-        working-directory: mobile/gazer
-        run: flutter pub get
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter pub get
+          '
 
       - name: flutter test --coverage
-        working-directory: mobile/gazer
-        run: flutter test --coverage
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter test --coverage
+          '
 
       - name: Coverage gate (>=90%)
-        working-directory: mobile/gazer
-        run: bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov
+          '
 
       - name: Upload coverage artifact
         if: always()
@@ -165,23 +209,45 @@ jobs:
       contents: read
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's checkout/cache/artifact steps (GitHub cannot run job
+      # containers as non-root: runner file commands live in a runner-owned dir); all
+      # toolchain commands run as appuser below -- see rootless rule.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           persist-credentials: false
 
+      - name: Hand workspace to appuser
+        run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
       - name: flutter pub get
-        working-directory: mobile/gazer
-        run: flutter pub get
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter pub get
+          '
 
       - name: gradlew testDebugUnitTest jacocoTestReport
-        working-directory: mobile/gazer/android
-        run: ./gradlew testDebugUnitTest jacocoTestReport
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer/android"
+            ./gradlew testDebugUnitTest jacocoTestReport
+          '
 
       - name: Coverage gate (>=90%)
-        working-directory: mobile/gazer
-        run: bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco
+          '
 
       - name: Upload JaCoCo artifact
         if: always()
@@ -198,23 +264,45 @@ jobs:
       contents: read
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's checkout/cache/artifact steps (GitHub cannot run job
+      # containers as non-root: runner file commands live in a runner-owned dir); all
+      # toolchain commands run as appuser below -- see rootless rule.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           persist-credentials: false
 
+      - name: Hand workspace to appuser
+        run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
       - name: flutter pub get
-        working-directory: mobile/gazer
-        run: flutter pub get
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter pub get
+          '
 
       - name: flutter build apk --split-per-abi
-        working-directory: mobile/gazer
-        run: flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols
+          '
 
       - name: flutter build appbundle
-        working-directory: mobile/gazer
-        run: flutter build appbundle --obfuscate --split-debug-info=build/symbols
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter build appbundle --obfuscate --split-debug-info=build/symbols
+          '
 
       - name: Upload APKs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -238,37 +326,69 @@ jobs:
       contents: read
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's checkout/cache/artifact steps (GitHub cannot run job
+      # containers as non-root: runner file commands live in a runner-owned dir); all
+      # toolchain commands run as appuser below -- see rootless rule.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           persist-credentials: false
 
+      - name: Hand workspace to appuser
+        run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
       - name: flutter pub get
-        working-directory: mobile/gazer
-        run: flutter pub get
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            flutter pub get
+          '
 
       - name: osv-scanner (pubspec.lock)
-        working-directory: mobile/gazer
-        run: osv-scanner --lockfile=pubspec.lock
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            osv-scanner --lockfile=pubspec.lock
+          '
 
       - name: osv-scanner (gradle project)
-        working-directory: mobile/gazer/android
         # No Gradle dependency-locking lockfile exists yet (the Android project does not enable
         # `dependencyLocking`), so a plain `-r .` finds zero package sources and osv-scanner 2.5.1
         # exits non-zero ("No package sources found"). --allow-no-lockfiles tells the scanner that
         # a legitimate absence of lockfiles is not a scan failure; it still fully scans any Gradle
         # lockfile that does exist. Matches the equivalent fix in the Makefile's mobile-security
         # target (Task 3 osv-scanner path/flag fix).
-        run: osv-scanner -r . --allow-no-lockfiles
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer/android"
+            osv-scanner -r . --allow-no-lockfiles
+          '
 
       - name: semgrep
-        working-directory: mobile/gazer
-        run: semgrep --config auto --error .
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            semgrep --config auto --error .
+          '
 
       - name: gitleaks
-        working-directory: mobile/gazer
-        run: gitleaks detect --source . --no-git -v
+        run: |
+          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+            id -u
+            test "$(id -u)" = 1000
+            cd "$GITHUB_WORKSPACE/mobile/gazer"
+            gitleaks detect --source . --no-git -v
+          '
 
   # NOTE for writer E's Task 21: once the `integration` job exists (added after `security`, per
   # Task 21 Step 15), this job's `needs:` list below MUST be extended to
