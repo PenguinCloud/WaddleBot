@@ -34,6 +34,7 @@ class GazerPipeline(
         const val AUDIO_SAMPLE_RATE = 48000
     }
 
+    @Volatile
     var state: NativePipelineState = NativePipelineState.IDLE
         private set
 
@@ -45,7 +46,14 @@ class GazerPipeline(
      * Validates [config], builds the video/audio sources and a fresh StreamEngine, and
      * prepares both the video and audio pipelines. Returns a failed PrepareResult (never
      * throws) if the config is out of range or RootEncoder rejects it.
+     *
+     * `@Synchronized` (here and on every other method/ConnectChecker callback below) guards
+     * `state`/`engine`/`bitrateAdapter`/`adaptiveBitrate`, which are otherwise mutated from both
+     * the caller thread (prepare/start/stop/setVideoBitrate) and RootEncoder's own callback
+     * thread (the ConnectChecker overrides) - `state` also carries `@Volatile` so a read from
+     * either thread outside a synchronized method still sees the latest value.
      */
+    @Synchronized
     fun prepare(config: StreamConfig): PrepareResult {
         val validationError = validate(config)
         if (validationError != null) {
@@ -72,7 +80,7 @@ class GazerPipeline(
                 )
             }.getOrElse { false }
         if (!videoOk) {
-            newEngine.release()
+            runCatching { newEngine.release() }
             val detail = "prepareVideo failed for ${config.width}x${config.height}@${config.fps}"
             transitionToError(GazerErrorCode.ENCODER_FAILED, detail)
             return PrepareResult(ok = false, error = GazerErrorCode.ENCODER_FAILED, detail = detail)
@@ -87,7 +95,7 @@ class GazerPipeline(
                 )
             }.getOrElse { false }
         if (!audioOk) {
-            newEngine.release()
+            runCatching { newEngine.release() }
             val detail = "prepareAudio failed for ${config.audioBitrateKbps}kbps"
             transitionToError(GazerErrorCode.AUDIO_SOURCE_FAILED, detail)
             return PrepareResult(ok = false, error = GazerErrorCode.AUDIO_SOURCE_FAILED, detail = detail)
@@ -120,6 +128,7 @@ class GazerPipeline(
     }
 
     /** Starts streaming to [target]; only valid from state=READY, otherwise reports GazerErrorCode.UNKNOWN. */
+    @Synchronized
     fun start(target: StreamTarget) {
         val currentEngine = engine
         if (state != NativePipelineState.READY || currentEngine == null) {
@@ -134,6 +143,7 @@ class GazerPipeline(
     }
 
     /** Stops streaming from any state, releasing the engine and returning to idle. */
+    @Synchronized
     fun stop() {
         state = NativePipelineState.STOPPING
         listener.onState(NativePipelineState.STOPPING)
@@ -150,6 +160,7 @@ class GazerPipeline(
     }
 
     /** Sets the live video bitrate, clamped to the supported 500..5000 kbps range. */
+    @Synchronized
     fun setVideoBitrate(kbps: Int) {
         val clamped = kbps.coerceIn(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
         engine?.setVideoBitrateOnFly(clamped * 1000)
@@ -172,26 +183,46 @@ class GazerPipeline(
         listener.onState(NativePipelineState.ERROR, error, detail)
     }
 
-    // ConnectChecker (RootEncoder callbacks) - see ErrorMapper for reason-string classification.
+    /**
+     * Releases and clears the current engine after a terminal RootEncoder failure
+     * (onConnectionFailed, onDisconnect-while-streaming, onAuthError) so a subsequent prepare()
+     * never overwrites a still-referenced, un-released engine. Release is best-effort
+     * (runCatching) since the engine may already be in a broken state when the failure fired.
+     */
+    private fun releaseEngineOnError() {
+        runCatching { engine?.release() }
+        engine = null
+        bitrateAdapter = null
+    }
 
+    // ConnectChecker (RootEncoder callbacks) - see ErrorMapper for reason-string classification.
+    // Each override is @Synchronized: RootEncoder invokes these from its own internal thread(s),
+    // concurrently with caller-thread prepare/start/stop/setVideoBitrate calls.
+
+    @Synchronized
     override fun onConnectionStarted(url: String) {
         state = NativePipelineState.CONNECTING
         listener.onState(NativePipelineState.CONNECTING)
     }
 
+    @Synchronized
     override fun onConnectionSuccess() {
         state = NativePipelineState.STREAMING
         listener.onState(NativePipelineState.STREAMING)
     }
 
+    @Synchronized
     override fun onConnectionFailed(reason: String) {
         statsSampler.stop()
+        releaseEngineOnError()
         transitionToError(ErrorMapper.fromReason(reason), reason)
     }
 
+    @Synchronized
     override fun onDisconnect() {
         statsSampler.stop()
         if (state == NativePipelineState.STREAMING) {
+            releaseEngineOnError()
             transitionToError(GazerErrorCode.RTMP_DISCONNECTED, "RootEncoder onDisconnect while streaming")
         } else {
             state = NativePipelineState.IDLE
@@ -199,15 +230,20 @@ class GazerPipeline(
         }
     }
 
+    @Synchronized
     override fun onAuthError() {
+        statsSampler.stop()
         listener.onAuthResult(false)
+        releaseEngineOnError()
         transitionToError(GazerErrorCode.RTMP_AUTH_FAILED, "RootEncoder onAuthError")
     }
 
+    @Synchronized
     override fun onAuthSuccess() {
         listener.onAuthResult(true)
     }
 
+    @Synchronized
     override fun onNewBitrate(bitrate: Long) {
         statsSampler.onBitrate(bitrate)
         if (adaptiveBitrate) {

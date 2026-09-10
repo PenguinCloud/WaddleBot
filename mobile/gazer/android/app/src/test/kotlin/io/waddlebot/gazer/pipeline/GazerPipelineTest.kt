@@ -14,9 +14,13 @@ import io.waddlebot.gazer.pipeline.sources.AudioSourceFactory
 import io.waddlebot.gazer.pipeline.sources.VideoSourceFactory
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class GazerPipelineTest {
     private lateinit var engine: StreamEngine
@@ -76,7 +80,7 @@ class GazerPipelineTest {
     }
 
     @Test
-    fun `connect failed maps the reason to a GazerErrorCode and reports it`() {
+    fun `connect failed maps the reason to a GazerErrorCode, reports it, and releases the engine`() {
         pipeline.prepare(validConfig)
         pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
 
@@ -84,10 +88,11 @@ class GazerPipelineTest {
 
         assertEquals(NativePipelineState.ERROR, pipeline.state)
         verify { listener.onState(NativePipelineState.ERROR, GazerErrorCode.RTMP_CONNECT_FAILED, "Connection timeout") }
+        verify(exactly = 1) { engine.release() }
     }
 
     @Test
-    fun `disconnect while streaming reports rtmpDisconnected`() {
+    fun `disconnect while streaming reports rtmpDisconnected and releases the engine`() {
         pipeline.prepare(validConfig)
         pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
         pipeline.onConnectionSuccess()
@@ -96,6 +101,7 @@ class GazerPipelineTest {
 
         assertEquals(NativePipelineState.ERROR, pipeline.state)
         verify { listener.onState(NativePipelineState.ERROR, GazerErrorCode.RTMP_DISCONNECTED, any()) }
+        verify(exactly = 1) { engine.release() }
     }
 
     @Test
@@ -110,7 +116,7 @@ class GazerPipelineTest {
     }
 
     @Test
-    fun `auth error reports rtmpAuthFailed and onAuthResult false`() {
+    fun `auth error reports rtmpAuthFailed, onAuthResult false, stops sampling, and releases the engine`() {
         pipeline.prepare(validConfig)
         pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
 
@@ -118,6 +124,8 @@ class GazerPipelineTest {
 
         verify { listener.onAuthResult(false) }
         verify { listener.onState(NativePipelineState.ERROR, GazerErrorCode.RTMP_AUTH_FAILED, any()) }
+        verify { statsSampler.stop() }
+        verify(exactly = 1) { engine.release() }
     }
 
     @Test
@@ -168,6 +176,101 @@ class GazerPipelineTest {
 
         assertFalse(result.ok)
         assertEquals(GazerErrorCode.ENCODER_FAILED, result.error)
+    }
+
+    @Test
+    fun `prepareAudio failure returns audioSourceFailed and releases the engine`() {
+        every { engine.prepareVideo(any(), any(), any(), any(), any()) } returns true
+        every { engine.prepareAudio(any(), any(), any()) } returns false
+
+        val result = pipeline.prepare(validConfig)
+
+        assertFalse(result.ok)
+        assertEquals(GazerErrorCode.AUDIO_SOURCE_FAILED, result.error)
+        verify(exactly = 1) { engine.release() }
+    }
+
+    @Test
+    fun `prepare still returns a failed result even if release throws during video-failure cleanup`() {
+        every { engine.prepareVideo(any(), any(), any(), any(), any()) } returns false
+        every { engine.release() } throws RuntimeException("boom")
+
+        val result = pipeline.prepare(validConfig)
+
+        assertFalse(result.ok)
+        assertEquals(GazerErrorCode.ENCODER_FAILED, result.error)
+    }
+
+    @Test
+    fun `prepare after an error path releases the previous engine and builds a fresh one`() {
+        val engine2 = mockk<StreamEngine>(relaxed = true)
+        every { engine2.prepareVideo(any(), any(), any(), any(), any()) } returns true
+        every { engine2.prepareAudio(any(), any(), any()) } returns true
+        every { engine2.hasCongestion(20f) } returns false
+        val engines = listOf(engine, engine2).iterator()
+        pipeline =
+            GazerPipeline(
+                engineFactory = { _, _, _ -> engines.next() },
+                videoSources = videoSources,
+                audioSources = audioSources,
+                listener = listener,
+                statsSampler = statsSampler,
+            )
+
+        pipeline.prepare(validConfig)
+        pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
+        pipeline.onConnectionFailed("Connection timeout")
+
+        verify(exactly = 1) { engine.release() }
+
+        val result = pipeline.prepare(validConfig)
+
+        assertTrue(result.ok)
+        verify(exactly = 0) { engine2.release() }
+    }
+
+    @Test
+    fun `concurrent stop and a connection-failed callback do not throw and end in a terminal idle state`() {
+        val releaseEnteredLatch = CountDownLatch(1)
+        val proceedLatch = CountDownLatch(1)
+        every { engine.release() } answers {
+            releaseEnteredLatch.countDown()
+            proceedLatch.await(5, TimeUnit.SECONDS)
+        }
+        pipeline.prepare(validConfig)
+        pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
+        pipeline.onConnectionSuccess()
+
+        val callbackError = AtomicReference<Throwable?>()
+        val stopError = AtomicReference<Throwable?>()
+        val callbackThread =
+            Thread {
+                try {
+                    pipeline.onConnectionFailed("Connection timeout")
+                } catch (t: Throwable) {
+                    callbackError.set(t)
+                }
+            }
+        callbackThread.start()
+        assertTrue(releaseEnteredLatch.await(5, TimeUnit.SECONDS))
+
+        val stopThread =
+            Thread {
+                try {
+                    pipeline.stop()
+                } catch (t: Throwable) {
+                    stopError.set(t)
+                }
+            }
+        stopThread.start()
+        proceedLatch.countDown()
+
+        callbackThread.join(5_000)
+        stopThread.join(5_000)
+
+        assertNull(callbackError.get())
+        assertNull(stopError.get())
+        assertEquals(NativePipelineState.IDLE, pipeline.state)
     }
 
     @Test
