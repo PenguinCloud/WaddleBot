@@ -139,11 +139,28 @@ ENV PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platf
 # far as sdkmanager is concerned -- asking sdkmanager to install it again is redundant.
 RUN yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses > /dev/null
 
+# cmake;3.22.1, platforms;android-34, platforms;android-35 added by Task 2 (2026-09-09):
+# transitive Flutter plugins pulled in by the spec-pinned pubspec.yaml dependency graph each
+# compile against a DIFFERENT platform than this app's own compileSdk=36, and Gradle cannot
+# substitute a different platform for what a subproject's own build.gradle declares:
+#   - cmake;3.22.1: the :jni native module (transitively via device_info_plus, part of the
+#     package:jni/jnigen ecosystem) runs `configureCMakeDebug`, which needs this exact CMake
+#     version -- without it: "Failed to install the following SDK components: cmake;3.22.1".
+#   - platforms;android-34: file_picker 8.3.7 (transitively via flutter_libs) declares
+#     compileSdk 34 in its own plugin build.gradle -- without it, its `extractDebugAnnotations`
+#     task fails the same way ("Failed to install ... platforms;android-34").
+#   - platforms;android-35: permission_handler_android 13.0.1 (pinned directly in
+#     pubspec.yaml -- see its comment there for why 14.x/13.0.2+ are unusable: they need
+#     platforms;android-37, which does not exist yet in the Android SDK repository)
+#     declares compileSdkVersion 35 in its own plugin build.gradle.
 RUN sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" \
+      "platforms;android-34" \
+      "platforms;android-35" \
       "platforms;android-36" \
       "build-tools;36.0.0" \
       "ndk;28.2.13676358" \
-      "platform-tools"
+      "platform-tools" \
+      "cmake;3.22.1"
 
 # --- Switch to appuser before any flutter invocation ------------------------
 # /opt/flutter is chown'd to appuser (above); git refuses to operate inside a
