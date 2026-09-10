@@ -1,0 +1,21 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  exclude:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - "lib/pigeon/pipeline.g.dart"
+    - "test/pigeon/pipeline_test.g.dart"
+    - build/**
+    - android/**
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    avoid_print: true
+    prefer_single_quotes: true
+    use_build_context_synchronously: true

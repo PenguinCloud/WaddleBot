@@ -1,0 +1,87 @@
+name: gazer
+description: "Gazer -- live-streaming client for phones and tablets: phone camera or USB UVC capture card to any RTMP/RTMPS endpoint."
+publish_to: 'none'
+# X.Y.Z stays pre-1.0 through M1-M3; M4 cuts the first gazer-v1.0.0 tag
+# (see spec Milestones M4). B is the epoch build number per the house
+# versioning skill -- resolved by this step, not hand-edited later.
+version: 0.1.0+1789002916
+
+environment:
+  sdk: '>=3.13.2 <3.14.0'
+  flutter: '3.47.2'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  flutter_riverpod: 3.4.3
+  riverpod_annotation: 4.0.7
+  go_router: 18.0.1
+  freezed_annotation: 3.1.0
+  json_annotation: 4.12.0
+  # Pinned to 9.2.4 (not the spec's 11.0.0): flutter_libs (external, penguin-libs
+  # repo) hard-pins flutter_secure_storage 9.2.4 in its own pubspec.yaml, and
+  # `flutter pub get` rejects 11.0.0 as incompatible. Resolved 2026-09-09 per
+  # Task 2 brief Step 3 contingency -- pin what pub actually resolves, never ^/~.
+  flutter_secure_storage: 9.2.4
+  shared_preferences: 2.5.5
+  connectivity_plus: 7.3.1
+  intl: 0.20.3
+  # Pinned to 9.0.1 (not the spec's 10.2.1): package_info_plus >=10.1.0 depends
+  # on win32 ^6.0.1, but flutter_libs (external, penguin-libs repo) transitively
+  # pins file_picker 8.3.7 -> win32 ^5.9.0. `flutter pub get` rejects 10.2.1 as
+  # incompatible. Resolved 2026-09-09 per Task 2 brief Step 3 contingency --
+  # pin what pub actually resolves, never ^/~.
+  package_info_plus: 9.0.1
+  dio: 5.11.1
+  url_launcher: 6.3.2
+  # Pinned to 12.0.3 (not the spec's 13.0.2): permission_handler 13.0.2 forces
+  # permission_handler_android ^14.1.0, whose only satisfying release (14.1.0)
+  # references Android-17-only API symbols (Manifest.permission.ACCESS_LOCAL_NETWORK,
+  # Build.VERSION_CODES.CINNAMON_BUN) and declares compileSdkVersion 37, which does
+  # not exist yet in the Android SDK repository ("Failed to find package
+  # 'platforms;android-37'"). permission_handler 12.0.3 allows
+  # permission_handler_android ^13.0.0, letting the explicit pin below resolve.
+  # Resolved 2026-09-09 per Task 2 brief Step 3 contingency -- pin what actually
+  # builds, never ^/~.
+  permission_handler: 12.0.3
+  # Direct pin (not a spec dependency) forcing permission_handler 12.0.3's transitive
+  # permission_handler_android down to 13.0.1 specifically -- verified by source
+  # inspection to contain neither ACCESS_LOCAL_NETWORK nor CINNAMON_BUN (both added in
+  # permission_handler_android 13.0.2) and to declare compileSdkVersion 35 (installed
+  # in mobile/gazer/Dockerfile), avoiding the non-existent android-37 platform that
+  # 14.x requires. Resolved 2026-09-09 per Task 2 brief Step 3 contingency.
+  permission_handler_android: 13.0.1
+  # Pinned to 12.4.0 (not the spec's 13.2.0): device_info_plus >=13.1.0 depends
+  # on win32 ^6.0.1, incompatible with package_info_plus 9.0.1's win32 ^5.5.3
+  # (itself forced down by flutter_libs's transitive file_picker 8.3.7 ->
+  # win32 ^5.9.0). `flutter pub get` rejected 13.2.0 and suggested
+  # `device_info_plus:^12.4.0`. Resolved 2026-09-09 per Task 2 brief Step 3
+  # contingency -- pin what pub actually resolves, never ^/~.
+  device_info_plus: 12.4.0
+  crypto: 3.0.7
+  flutter_libs:
+    git:
+      url: https://github.com/penguintechinc/penguin-libs.git
+      path: packages/flutter_libs
+      ref: 029f921b551a01e23ff83504c7b8719002d50a09
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+  pigeon: 28.0.0
+  riverpod_generator: 4.0.9
+  freezed: 4.0.1
+  json_serializable: 6.14.1
+  build_runner: 2.16.1
+  mocktail: 1.0.5
+  flutter_lints: 6.0.0
+
+flutter:
+  uses-material-design: true
+  generate: true

@@ -1,0 +1,40 @@
+# Gradle version catalog for mobile/gazer/android.
+# Every [versions] entry not fixed by the spec (AGP/Kotlin/RootEncoder) was
+# looked up via WebFetch/curl against Maven Central, the Gradle Plugin
+# Portal, or Google's Maven, and is dated. Re-check dated entries before
+# bumping them -- see docs/superpowers/specs/2026-09-07-gazer-mobile-v2-design.md
+# Dependencies & Pins.
+[versions]
+agp = "9.1.0"                     # spec pin: Dependencies & Pins > Android/Gradle
+kotlin = "2.4.0"                  # spec pin
+ktlintGradle = "14.2.0"           # checked 2026-09-07: https://plugins.gradle.org/plugin/org.jlleitschuh.gradle.ktlint (latest published)
+jacoco = "0.8.13"                 # checked 2026-09-07: https://search.maven.org/solrsearch/select?q=g:%22org.jacoco%22+AND+a:%22org.jacoco.core%22&rows=1&wt=json (latestVersion)
+junitJupiter = "5.12.2"           # checked 2026-09-07: Maven Central core=gav listing for org.junit.jupiter:junit-jupiter -- latest true GA; 5.13.0-M1/M2/M3 are pre-release milestones and are never pinned here
+junitPlatformLauncher = "1.12.2"  # JUnit Platform version paired to Jupiter 5.12.2 (Platform 1.x tracks Jupiter 5.x on matching minor.patch)
+mockk = "1.14.3"                  # checked 2026-09-07: https://search.maven.org/solrsearch/select?q=g:%22io.mockk%22+AND+a:%22mockk%22&rows=1&wt=json (latestVersion)
+androidxTestRunner = "1.7.0"      # checked 2026-09-07: https://dl.google.com/dl/android/maven2/androidx/test/runner/maven-metadata.xml (release)
+androidxTestExtJunit = "1.3.0"    # checked 2026-09-07: https://dl.google.com/dl/android/maven2/androidx/test/ext/junit/maven-metadata.xml (release)
+androidxTestRules = "1.7.0"       # checked 2026-09-07: https://dl.google.com/dl/android/maven2/androidx/test/rules/maven-metadata.xml (release)
+junit4 = "4.13.2"                 # checked 2026-09-07: search.maven.org g:junit a:junit (latestVersion) -- JUnit4 is required alongside JUnit5 because
+                                   # androidx.test's AndroidJUnitRunner (androidTest, Task 20) is JUnit4-based; JUnit5/Jupiter above is for JVM unit tests only
+rootEncoder = "2.8.1"             # spec pin (JitPack, `library` module ONLY -- never `extra-sources`, see Global Constraints)
+kotlinxCoroutines = "1.10.2"      # checked 2026-09-07: search.maven.org g:org.jetbrains.kotlinx a:kotlinx-coroutines-core (latestVersion) -- required
+                                   # because Pigeon 28.0.0 generates `suspend fun` (not callback-style) for @FlutterApi methods and @async @HostApi
+                                   # methods by default (see Task 6/Task 20); both the Pigeon-generated Pipeline.g.kt and PigeonHostApiImpl need it
+
+[libraries]
+rootencoder-library = { group = "com.github.pedroSG94.RootEncoder", name = "library", version.ref = "rootEncoder" }
+junit-jupiter = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junitJupiter" }
+junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform-launcher", version.ref = "junitPlatformLauncher" }
+mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
+androidx-test-rules = { group = "androidx.test", name = "rules", version.ref = "androidxTestRules" }
+junit4 = { group = "junit", name = "junit", version.ref = "junit4" }
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlintGradle" }

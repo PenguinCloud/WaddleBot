@@ -204,3 +204,9 @@ mobile/flutter_gazer/android/build/
 
 # Superpowers SDD scratch workspace (ledger, briefs, review packages)
 .superpowers/
+
+# Gazer Mobile 2.0 (mobile/gazer) -- build/ and **/.gradle/ above already
+# cover this app's build output and Gradle caches at any depth.
+mobile/gazer/.dart_tool/
+mobile/gazer/coverage/
+mobile/gazer/android/local.properties
