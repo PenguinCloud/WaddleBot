@@ -230,30 +230,19 @@ class GazerPipelineTest {
     }
 
     @Test
-    fun `concurrent stop and a connection-failed callback do not throw and end in a terminal idle state`() {
-        val releaseEnteredLatch = CountDownLatch(1)
+    fun `stop's blocked engine call does not hold the lock - a concurrent onDisconnect completes first`() {
+        val stopStreamEnteredLatch = CountDownLatch(1)
         val proceedLatch = CountDownLatch(1)
-        every { engine.release() } answers {
-            releaseEnteredLatch.countDown()
+        every { engine.stopStream() } answers {
+            stopStreamEnteredLatch.countDown()
             proceedLatch.await(5, TimeUnit.SECONDS)
+            true
         }
         pipeline.prepare(validConfig)
         pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
         pipeline.onConnectionSuccess()
 
-        val callbackError = AtomicReference<Throwable?>()
         val stopError = AtomicReference<Throwable?>()
-        val callbackThread =
-            Thread {
-                try {
-                    pipeline.onConnectionFailed("Connection timeout")
-                } catch (t: Throwable) {
-                    callbackError.set(t)
-                }
-            }
-        callbackThread.start()
-        assertTrue(releaseEnteredLatch.await(5, TimeUnit.SECONDS))
-
         val stopThread =
             Thread {
                 try {
@@ -263,13 +252,49 @@ class GazerPipelineTest {
                 }
             }
         stopThread.start()
+        // stop() has already snapshotted+cleared the engine field and released the lock by the
+        // time it calls the (now-blocked) engine.stopStream() - a concurrent onDisconnect() must
+        // therefore be able to acquire the lock and complete immediately, proving no monitor is
+        // held across the engine call.
+        assertTrue(stopStreamEnteredLatch.await(5, TimeUnit.SECONDS))
+
+        val disconnectCompleted = CountDownLatch(1)
+        val disconnectError = AtomicReference<Throwable?>()
+        val disconnectThread =
+            Thread {
+                try {
+                    pipeline.onDisconnect()
+                } catch (t: Throwable) {
+                    disconnectError.set(t)
+                } finally {
+                    disconnectCompleted.countDown()
+                }
+            }
+        disconnectThread.start()
+
+        assertTrue(
+            disconnectCompleted.await(2, TimeUnit.SECONDS),
+            "onDisconnect() blocked - the lock was held across engine.stopStream()",
+        )
+
         proceedLatch.countDown()
-
-        callbackThread.join(5_000)
         stopThread.join(5_000)
+        disconnectThread.join(5_000)
 
-        assertNull(callbackError.get())
         assertNull(stopError.get())
+        assertNull(disconnectError.get())
+    }
+
+    @Test
+    fun `a listener that re-enters the pipeline synchronously from onState does not deadlock`() {
+        pipeline.prepare(validConfig)
+        pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
+        every { listener.onState(NativePipelineState.ERROR, any(), any()) } answers {
+            pipeline.stop()
+        }
+
+        pipeline.onConnectionFailed("Connection timeout")
+
         assertEquals(NativePipelineState.IDLE, pipeline.state)
     }
 
