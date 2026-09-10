@@ -87,3 +87,48 @@ pre-commit:
 	@$(MAKE) test-security
 	@$(MAKE) test
 	@echo "=== Pre-commit complete ==="
+
+# --- Gazer Mobile 2.0 (mobile/gazer) -----------------------------------
+# Every target below runs inside the gazer-toolchain image -- never on the
+# host. Host Flutter (snap) is never invoked directly; see docs/superpowers/
+# specs/2026-09-07-gazer-mobile-v2-design.md Toolchain, CI, Versioning.
+.PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
+# mobile-test-integration is added later by Task 21; mobile-screenshots and
+# seed-mock-data-mobile are added later by Task 26 -- pre-declared phony here
+# (harmless before those targets exist) so the whole mobile-* target set is
+# uniformly a .PHONY gate from the very first commit.
+
+MOBILE_IMAGE := gazer-toolchain:3.47.2
+MOBILE_RUN := docker run --rm --user $(shell id -u):$(shell id -g) \
+	-v $(CURDIR)/mobile/gazer:/work \
+	-v gazer-pub-cache:/home/appuser/.pub-cache \
+	-v gazer-gradle:/home/appuser/.gradle \
+	-w /work $(MOBILE_IMAGE)
+
+mobile-toolchain:
+	docker build -t $(MOBILE_IMAGE) mobile/gazer
+
+mobile-run:
+	@test -n "$(CMD)" || { echo "usage: make mobile-run CMD=\"<command>\"" >&2; exit 1; }
+	$(MOBILE_RUN) bash -lc "$(CMD)"
+
+mobile-lint:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter analyze; dart format --set-exit-if-changed .; if [ -d android ]; then cd android && ./gradlew ktlintCheck lint; fi"
+
+mobile-test:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test --coverage; bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov"
+
+mobile-test-android:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; cd android && ./gradlew testDebugUnitTest jacocoTestReport && cd .. && bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco"
+
+mobile-build:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
+
+mobile-security:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; osv-scanner --lockfile=pubspec.lock; (cd android && osv-scanner -r .); semgrep --config auto --error .; gitleaks detect --source . --no-git -v"
+
+mobile-codegen:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; dart run pigeon --input pigeons/pipeline.dart; dart run build_runner build --delete-conflicting-outputs; flutter gen-l10n"
+
+mobile-clean:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter clean; if [ -d android ]; then cd android && ./gradlew clean; fi"
