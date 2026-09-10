@@ -81,7 +81,12 @@ dev_dependencies:
   build_runner: 2.16.1
   mocktail: 1.0.5
   flutter_lints: 6.0.0
-  # resolved by shared_preferences 2.5.5's dependency graph, verified via WebFetch 2026-09-07
+  # Already resolved transitively (via shared_preferences 2.5.5) at this exact
+  # version per pubspec.lock -- declared directly, not newly introduced,
+  # because license_client_test.dart imports InMemorySharedPreferencesAsync
+  # from it directly and `depend_on_referenced_packages` (analysis_options.yaml
+  # strict-inference) requires every directly-imported package to be a direct
+  # dependency. Pinned exact version, no ^/~, per Dependency Pinning.
   shared_preferences_platform_interface: 2.4.2
 
 flutter:
