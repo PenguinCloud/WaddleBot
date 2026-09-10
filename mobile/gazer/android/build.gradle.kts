@@ -59,15 +59,33 @@ subprojects {
     }
 }
 
-// Gradle dependency locking, :app only (controller ruling R16, Task 3 CI security gate).
-// osv-scanner's Gradle-side scan had nothing to examine (no gradle.lockfile existed anywhere in
-// the project), so the CI security job's Gradle vulnerability check passed vacuously -- zero
-// packages examined is a FAILURE, not a pass (critical-rules.md Verification Integrity). Scoped
-// to :app only, from this ROOT build file, so android/app/build.gradle.kts (owned by another
-// concurrent task) does not need to be touched. `android/app/gradle.lockfile` is generated via
-// `./gradlew :generateLockfiles` and committed; osv-scanner then scans that lockfile directly
-// instead of a directory walk that could legitimately find nothing.
+// Gradle dependency locking, :app only, SHIPPED classpaths only (controller rulings R16 + R23,
+// Task 3 CI security gate). osv-scanner's Gradle-side scan had nothing to examine (no
+// gradle.lockfile existed anywhere in the project), so the CI security job's Gradle vulnerability
+// check passed vacuously -- zero packages examined is a FAILURE, not a pass (critical-rules.md
+// Verification Integrity). R16 first locked EVERY :app configuration (`lockAllConfigurations()`),
+// but that made osv-scanner flag 92 CVEs across 18 packages, 17 of which live ONLY in
+// build-tooling classpaths this app never ships: `_internal-unified-test-platform-*` (AGP's own
+// bundled Unified Test Platform test-orchestration tooling), `ktlint*` (the ktlint Gradle
+// plugin's own tool classpath), and the various `*LintChecksClasspath`/`kotlinCompiler*`/
+// `kotlinBuildToolsApi*` compiler/lint-tool classpaths. None of those ship in the APK/AAB and none
+// are meaningfully "fixable" from this project (they're Google/JetBrains-pinned tool
+// dependencies, governed by this project's pinned AGP/Kotlin/ktlint toolchain versions, not by
+// application code) -- scanning them just produces noise a CI gate can never act on. R23 (this
+// block) narrows locking -- and therefore what osv-scanner's Gradle-side scan can even see -- to
+// exactly the classpaths that ship: {debug,profile,release}{Runtime,Compile}Classpath.
 project(":app") {
+    configurations {
+        listOf(
+            "debugRuntimeClasspath", "debugCompileClasspath",
+            "profileRuntimeClasspath", "profileCompileClasspath",
+            "releaseRuntimeClasspath", "releaseCompileClasspath",
+        ).forEach { configurationName ->
+            named(configurationName) {
+                resolutionStrategy.activateDependencyLocking()
+            }
+        }
+    }
     configurations.all {
         // org.jetbrains.kotlin:kotlin-stdlib-common is the Kotlin Multiplatform "common" metadata
         // artifact; this app has no Kotlin Multiplatform common source set, and everything it
@@ -85,10 +103,25 @@ project(":app") {
         // configuration's resolved graph is unstable, not just under- or over-locked). Excluding
         // it here removes the instability at its source rather than chasing an unstable lock.
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-common")
+
+        resolutionStrategy {
+            // com.google.guava:guava:28.1-android (pulled in transitively, resolved onto the real
+            // shipped debugRuntimeClasspath/debugUnitTestRuntimeClasspath/profileRuntimeClasspath
+            // configurations -- confirmed via osv-scanner against android/app/gradle.lockfile, CI
+            // run 34487728502) carries two known advisories: GHSA-5mg8-w23w-74h3 and
+            // GHSA-7g45-4rm6-3mm3 (both: temp-directory/temp-file creation with default
+            // permissions, insecure on multi-user systems). Both are fixed in 32.0.0-android --
+            // force that version everywhere in :app so the shipped classpaths resolve and lock a
+            // non-vulnerable guava instead of leaving it to whatever transitive declarer wins.
+            force("com.google.guava:guava:32.0.0-android")
+        }
     }
-    dependencyLocking {
-        lockAllConfigurations()
-    }
+    // NOTE: dependencyLocking { lockAllConfigurations() } is deliberately NOT used here (see the
+    // block comment above `configurations {` at the top of this project block) -- only the six
+    // configurations explicitly activated above via resolutionStrategy.activateDependencyLocking()
+    // are locked/written to android/app/gradle.lockfile. Every other :app configuration (lint,
+    // ktlint, unified test platform, kotlin compiler tooling, etc.) resolves normally and is
+    // simply never locked or scanned.
 }
 
 tasks.register<Delete>("clean") {

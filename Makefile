@@ -124,6 +124,18 @@ mobile-test-android:
 mobile-build:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
 
+# Gates on android/app/gradle.lockfile, which locks only the classpaths :app actually ships
+# (controller ruling R23) -- osv-scanner never sees build-tooling-only dependencies (AGP's
+# Unified Test Platform, ktlint, kotlin compiler tooling), which this project cannot meaningfully
+# remediate and which never reach a device. R23 Step 3 also asked for a non-gating advisory scan
+# of the FULL dependency graph (all configurations, tooling included) alongside this gate.
+# Omitted: Gradle's dependency-locking writer has no supported option to target a lockfile path
+# other than the project's own gradle.lockfile, so a second full-graph scan would require either
+# repeatedly toggling lockAllConfigurations() on and off across separate ./gradlew invocations (a
+# multi-minute round trip on every `make mobile-security`, and disruptive to the real,
+# shipped-classpath lockfile this target gates on) or a bespoke Gradle init script/plugin to
+# redirect the lock output -- both too invasive to add reliably within this task. Noted here per
+# R23's explicit escape hatch rather than left unexplained.
 mobile-security:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; bash scripts/osv_scan_assert.sh pubspec.lock; bash scripts/osv_scan_assert.sh android/app/gradle.lockfile; semgrep --config auto --error .; gitleaks detect --source . --no-git -v"
 
