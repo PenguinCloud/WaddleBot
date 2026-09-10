@@ -1,0 +1,316 @@
+name: Gazer Mobile CI
+
+on:
+  push:
+    paths:
+      - 'mobile/gazer/**'
+      - 'Makefile'
+      - '.github/workflows/gazer-mobile.yml'
+  pull_request:
+    paths:
+      - 'mobile/gazer/**'
+      - 'Makefile'
+      - '.github/workflows/gazer-mobile.yml'
+
+concurrency:
+  group: gazer-mobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: penguintechinc/waddlebot/gazer-toolchain
+
+jobs:
+  toolchain:
+    name: Build toolchain image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 90
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: Compute Dockerfile content tag
+        id: tag
+        run: |
+          set -euo pipefail
+          DIGEST=$(sha256sum mobile/gazer/Dockerfile | cut -c1-12)
+          echo "tag=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this image already exists
+        id: check
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+          if docker manifest inspect "${IMAGE}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push toolchain image
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: mobile/gazer
+          file: mobile/gazer/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve image ref for downstream jobs
+        id: resolve
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        # Downstream jobs consume `outputs.image` as a `container: image:` reference. zizmor's
+        # unpinned-images audit (correctly) flags a mutable `repo:tag` reference there, so this
+        # step re-resolves the tag to its immutable digest right after confirming the image is
+        # in the registry (whether just pushed or already present), and hands that digest form
+        # to every downstream job -- see critical-rules.md Dependency Pinning.
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .}}' | jq -r '.manifest.digest')
+          if [[ -z "${DIGEST}" || "${DIGEST}" == "null" ]]; then
+            echo "resolve: could not determine digest for ${IMAGE}" >&2
+            exit 1
+          fi
+          echo "image=${REGISTRY}/${IMAGE_NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: Dart analyze
+    needs: toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      options: --user 1000:1000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: flutter pub get
+        working-directory: mobile/gazer
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: mobile/gazer
+        run: flutter analyze
+
+      - name: dart format check
+        working-directory: mobile/gazer
+        run: dart format --set-exit-if-changed .
+
+  test:
+    name: Dart unit tests + coverage gate
+    needs: toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      options: --user 1000:1000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: flutter pub get
+        working-directory: mobile/gazer
+        run: flutter pub get
+
+      - name: flutter test --coverage
+        working-directory: mobile/gazer
+        run: flutter test --coverage
+
+      - name: Coverage gate (>=90%)
+        working-directory: mobile/gazer
+        run: bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: gazer-dart-coverage
+          path: mobile/gazer/coverage/
+
+  android-unit:
+    name: Kotlin unit tests + JaCoCo gate
+    needs: toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      options: --user 1000:1000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: flutter pub get
+        working-directory: mobile/gazer
+        run: flutter pub get
+
+      - name: gradlew testDebugUnitTest jacocoTestReport
+        working-directory: mobile/gazer/android
+        run: ./gradlew testDebugUnitTest jacocoTestReport
+
+      - name: Coverage gate (>=90%)
+        working-directory: mobile/gazer
+        run: bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco
+
+      - name: Upload JaCoCo artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: gazer-android-coverage
+          path: mobile/gazer/android/app/build/reports/jacoco/
+
+  build:
+    name: Build APK + AAB
+    needs: toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      options: --user 1000:1000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: flutter pub get
+        working-directory: mobile/gazer
+        run: flutter pub get
+
+      - name: flutter build apk --split-per-abi
+        working-directory: mobile/gazer
+        run: flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols
+
+      - name: flutter build appbundle
+        working-directory: mobile/gazer
+        run: flutter build appbundle --obfuscate --split-debug-info=build/symbols
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: gazer-apk
+          path: mobile/gazer/build/app/outputs/apk/**/*.apk
+          retention-days: 30
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: gazer-aab
+          path: mobile/gazer/build/app/outputs/bundle/**/*.aab
+          retention-days: 30
+
+  security:
+    name: Security scans
+    needs: toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      options: --user 1000:1000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: flutter pub get
+        working-directory: mobile/gazer
+        run: flutter pub get
+
+      - name: osv-scanner (pubspec.lock)
+        working-directory: mobile/gazer
+        run: osv-scanner --lockfile=pubspec.lock
+
+      - name: osv-scanner (gradle project)
+        working-directory: mobile/gazer/android
+        # No Gradle dependency-locking lockfile exists yet (the Android project does not enable
+        # `dependencyLocking`), so a plain `-r .` finds zero package sources and osv-scanner 2.5.1
+        # exits non-zero ("No package sources found"). --allow-no-lockfiles tells the scanner that
+        # a legitimate absence of lockfiles is not a scan failure; it still fully scans any Gradle
+        # lockfile that does exist. Matches the equivalent fix in the Makefile's mobile-security
+        # target (Task 3 osv-scanner path/flag fix).
+        run: osv-scanner -r . --allow-no-lockfiles
+
+      - name: semgrep
+        working-directory: mobile/gazer
+        run: semgrep --config auto --error .
+
+      - name: gitleaks
+        working-directory: mobile/gazer
+        run: gitleaks detect --source . --no-git -v
+
+  # NOTE for writer E's Task 21: once the `integration` job exists (added after `security`, per
+  # Task 21 Step 15), this job's `needs:` list below MUST be extended to
+  # `[build, test, android-unit, security, integration]` in that same task -- otherwise a tag
+  # push creates a GitHub release without ever waiting for the emulator integration test to pass.
+  # Not added here because `integration` does not exist yet at this point in the plan (Task 3
+  # predates Task 21) -- a `needs:` reference to a job that doesn't exist yet would be an invalid
+  # workflow.
+  release:
+    name: GitHub Release
+    needs: [build, test, android-unit, security]
+    if: startsWith(github.ref, 'refs/tags/gazer-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: gazer-apk
+          path: release-artifacts
+
+      - name: Download AAB artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: gazer-aab
+          path: release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3  # zizmor: ignore[superfluous-actions] -- action + SHA pinned verbatim per Task 3 brief; gh CLI needs separate token/auth wiring that is out of scope here
+        with:
+          files: release-artifacts/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

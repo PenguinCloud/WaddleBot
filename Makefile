@@ -125,7 +125,7 @@ mobile-build:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
 
 mobile-security:
-	$(MOBILE_RUN) bash -lc "set -euo pipefail; osv-scanner --lockfile=pubspec.lock; (cd android && osv-scanner -r .); semgrep --config auto --error .; gitleaks detect --source . --no-git -v"
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; osv-scanner --lockfile=pubspec.lock; (cd android && osv-scanner -r . --allow-no-lockfiles); semgrep --config auto --error .; gitleaks detect --source . --no-git -v"
 
 mobile-codegen:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; dart run pigeon --input pigeons/pipeline.dart; dart run build_runner build --delete-conflicting-outputs; flutter gen-l10n"
