@@ -56,6 +56,8 @@ IRC receivers use.
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
 import uuid
 from collections.abc import Mapping
 from typing import Any, cast
@@ -65,6 +67,7 @@ import redis.asyncio as redis
 from flask_core import create_health_blueprint, install_security_headers, setup_aaa_logging
 from flask_core.app_registry import AppRegistry
 from flask_core.auth import create_jwt_token
+from flask_core.logging_config import StructuredFormatter
 from flask_core.stage_runner import BundlePoller
 from quart import Blueprint, Quart, request
 
@@ -81,6 +84,49 @@ from receivers.twitch_irc import TwitchIrcReceiver
 from runner import IngestRunner
 from socket_lease import PLATFORM_COMMUNITY, LeasedReceiver
 from supervisor import ReceiverSupervisor
+
+
+def _configure_root_logging() -> None:
+    """Give every plain `logging.getLogger(__name__)` module a real, visible handler.
+
+    **2026-09-10 fix -- diagnosed a Discord receiver that appeared to exit
+    silently on startup.** `setup_aaa_logging()` below only wires handlers
+    onto its own isolated `"waddlebot.{module}"` logger (`propagate=False`
+    -- `flask_core.logging_config.AAALogger.__init__`); every OTHER module
+    in this container (`socket_lease.py`, `supervisor.py`, `receivers/
+    discord_gateway.py`, `receivers/twitch_irc.py`, `runner.py`,
+    `outbound_drain.py`, `eventsub.py`, `fanout.py`) logs via a plain
+    `logging.getLogger(__name__)`, which was NEVER attached to any
+    handler anywhere in this process. Reproduced directly: the Python
+    stdlib root logger's own untouched defaults (level=WARNING, zero
+    handlers) meant every `.info()`/`.debug()` call from those modules
+    (`socket_lease.claimed`, `gateway.discord_ready`, ...) was dropped
+    before it ever reached a handler, and every `.warning()`/`.error()`
+    call (`socket_lease.degraded_running_without_lease`, `socket_lease.
+    timeout`, `supervisor.receiver_failed`, ...) fell through to Python's
+    unstructured `logging.lastResort` handler on STDERR -- a different
+    stream, in a different format, than every other log line this
+    service emits on stdout. A receiver silently vanishing from the logs
+    is exactly the same shape as a receiver silently exiting; this must
+    be fixed before any lease/supervisor/receiver log line can be
+    trusted as evidence of what actually happened at runtime.
+
+    Attaching a handler directly to the ROOT logger (the same pattern
+    `video_proxy_module`/`engagement_module` already use) fixes every
+    plain-named child logger in this process at once, with zero changes
+    to which logger object each module holds -- and deliberately does
+    NOT touch `propagate` on the AAA `"waddlebot.{module}"` logger, so
+    its own dedicated console/file/syslog handlers keep working exactly
+    as before.
+    """
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(StructuredFormatter(Config.MODULE_NAME, Config.MODULE_VERSION))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(Config.LOG_LEVEL.upper())
+    root_logger.addHandler(console_handler)
+
+
+_configure_root_logging()
 
 app = Quart(__name__)
 # security.md A05 hardening -- JSON-only service, default deny-everything CSP.
@@ -164,6 +210,8 @@ def _register_discord_receiver(
         owner_id=replica_id,
         ttl_s=Config.SOCKET_LEASE_TTL_S,
         renew_interval_s=Config.SOCKET_LEASE_RENEW_INTERVAL_S,
+        claim_timeout_s=Config.SOCKET_LEASE_CLAIM_TIMEOUT_S,
+        run_without_lease_on_unavailable=Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE,
     )
     app.config["discord_leased_receiver"] = leased_discord
     supervisor.register("discord_gateway", leased_discord.run, transport=discord_receiver)
@@ -225,6 +273,8 @@ def _register_twitch_receivers(
             owner_id=replica_id,
             ttl_s=Config.SOCKET_LEASE_TTL_S,
             renew_interval_s=Config.SOCKET_LEASE_RENEW_INTERVAL_S,
+            claim_timeout_s=Config.SOCKET_LEASE_CLAIM_TIMEOUT_S,
+            run_without_lease_on_unavailable=Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE,
         )
         leased_receivers.append(leased)
         supervisor.register(f"twitch_irc:{channel}", leased.run, transport=twitch_receiver)
@@ -232,10 +282,12 @@ def _register_twitch_receivers(
     app.config["twitch_leased_receivers"] = leased_receivers
 
     # Dedicated Valkey connection for the drain's own blocking BRPOP --
-    # NOT the shared redis_client above, whose default socket_timeout
-    # (redis-py: 5s) equals the BRPOP block timeout and races it on every
-    # idle poll (see outbound_drain.py's own module docstring for the
-    # full root-cause). Closed in shutdown() below alongside redis_client.
+    # NOT the shared redis_client above, whose socket_timeout
+    # (Config.REDIS_SOCKET_TIMEOUT_S, explicit as of 2026-09-09 -- see
+    # this function's own redis_client construction) equals the BRPOP
+    # block timeout and would race it on every idle poll (see
+    # outbound_drain.py's own module docstring for the full root-cause).
+    # Closed in shutdown() below alongside redis_client.
     drain_redis_client = redis.from_url(
         Config.VALKEY_URL,
         encoding="utf-8",
@@ -296,7 +348,19 @@ def _register_twitch_eventsub(*, redis_client: Any, registry: AppRegistry) -> No
 async def startup() -> None:
     """Wire the httpx/Valkey clients, poller, and start the poll-drain loop + socket receivers."""
     http_client = httpx.AsyncClient()
-    redis_client = redis.from_url(Config.VALKEY_URL, encoding="utf-8", decode_responses=True)
+    # Explicit connect/read timeout (2026-09-09 fix) -- previously unset,
+    # relying entirely on redis-py's own version-dependent default. A
+    # second, independent bound underneath socket_lease.py's own
+    # asyncio-level `claim_timeout_s` guard (defense in depth, not a
+    # substitute for it -- see LeasedReceiver.run()'s docstring for why
+    # the asyncio-level guard is the one that actually matters).
+    redis_client = redis.from_url(
+        Config.VALKEY_URL,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=Config.REDIS_SOCKET_TIMEOUT_S,
+        socket_timeout=Config.REDIS_SOCKET_TIMEOUT_S,
+    )
 
     poller = BundlePoller(
         http_client,
@@ -333,11 +397,30 @@ async def startup() -> None:
     )
     app.config["supervisor"] = supervisor
 
-    _register_discord_receiver(supervisor, redis_client=redis_client, registry=registry)
-    _register_twitch_receivers(supervisor, redis_client=redis_client, registry=registry)
-    _register_twitch_eventsub(redis_client=redis_client, registry=registry)
+    # No silent startup exceptions (2026-09-10 fix, paired with
+    # `_configure_root_logging()` above): a raised exception here would
+    # otherwise propagate out of this `@app.before_serving` hook with
+    # only Hypercorn's own traceback formatting as evidence -- a
+    # different, unstructured path from every other log line this
+    # service emits, exactly the kind of easy-to-miss channel that hid
+    # the logging gap `_configure_root_logging()` fixes. Logged via the
+    # properly-wired AAA `logger` (not the plain per-module loggers) with
+    # exception type + message, then re-raised -- startup must still fail
+    # loud and fail closed, never continue serving with a receiver that
+    # never actually registered.
+    try:
+        _register_discord_receiver(supervisor, redis_client=redis_client, registry=registry)
+        _register_twitch_receivers(supervisor, redis_client=redis_client, registry=registry)
+        _register_twitch_eventsub(redis_client=redis_client, registry=registry)
+        await supervisor.start()
+    except Exception as exc:
+        logger.error(
+            f"svc-ingest receiver startup failed: {type(exc).__name__}: {exc}",
+            action="startup",
+            result="FAILED",
+        )
+        raise
 
-    await supervisor.start()
     logger.system("svc-ingest started", action="startup", result="SUCCESS")
 
 

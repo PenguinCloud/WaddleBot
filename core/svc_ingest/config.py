@@ -64,7 +64,26 @@ class Config:
     SECRET_KEY = require_secret_key()
     JWT_SCOPE = "distribution:read"
 
-    VALKEY_URL = os.getenv("VALKEY_URL", "redis://localhost:6379/0")
+    # Helm's `-secrets` Secret only ever defines `REDIS_URL` (in-cluster
+    # host + auth password -- k8s/helm/waddlebot/templates/secrets.yaml);
+    # `svc-ingest.yaml`'s own "KNOWN GAP" comment already flagged the
+    # symptom (falls back to a dev default in a real cluster) without
+    # naming the cause -- this env var name never matched what the chart
+    # actually injects, so the shared Valkey client silently pointed at
+    # `redis://localhost:6379/0` (no auth, wrong host) instead of the
+    # real `infra-redis`. `VALKEY_URL` stays checked first (an explicit
+    # override some other deploy path may still set); `REDIS_URL` is the
+    # real in-cluster value -- same fallback chain
+    # `flask_core.http_rate_limit` already uses for the identical reason.
+    VALKEY_URL = os.getenv("VALKEY_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379/0"
+
+    # Explicit connect/read timeout for the shared Valkey client (`app.py`'s
+    # `redis_client`) -- was previously unset, relying entirely on
+    # redis-py's own version-dependent default. Hardened here as a second,
+    # independent bound underneath `SOCKET_LEASE_CLAIM_TIMEOUT_S`'s
+    # asyncio-level guard (socket_lease.py) -- defense in depth, not a
+    # substitute for it.
+    REDIS_SOCKET_TIMEOUT_S = float(os.getenv("REDIS_SOCKET_TIMEOUT_S", "5.0"))
 
     # Discord gateway receiver. Empty string (never committed, never
     # logged) disables the receiver entirely -- `app.py`'s startup skips
@@ -114,6 +133,26 @@ class Config:
     # the lease).
     SOCKET_LEASE_TTL_S = float(os.getenv("SOCKET_LEASE_TTL_S", "30.0"))
     SOCKET_LEASE_RENEW_INTERVAL_S = float(os.getenv("SOCKET_LEASE_RENEW_INTERVAL_S", "10.0"))
+
+    # Bounds every claim/renew/release Redis round-trip
+    # (`socket_lease.LeasedReceiver`) -- was previously unbounded, letting
+    # a stalled/unresponsive Valkey connection hang a receiver (and this
+    # replica's entire inbound path for that provider) forever with no
+    # error or log line. See socket_lease.py's own LeasedReceiver.run()
+    # docstring for the pooled-connection-reuse hazard this also guards
+    # against.
+    SOCKET_LEASE_CLAIM_TIMEOUT_S = float(os.getenv("SOCKET_LEASE_CLAIM_TIMEOUT_S", "5.0"))
+
+    # Alpha runs `pipeline.svcIngest.replicas: 1` -- no contention over a
+    # socket lease is possible, so a lease backend that's unreachable/
+    # timing out must never permanently block ingest. Default True is
+    # safe for single-replica alpha (proceed without a confirmed lease,
+    # loudly logged); set False for any deployment actually running >1
+    # svc-ingest replica, where running without a confirmed lease risks
+    # duplicate gateway sockets on the same platform bot token.
+    SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE = os.getenv(
+        "SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # Twitch EventSub webhook (`eventsub.py`, mounted at
     # POST /eventsub/twitch/webhook). Empty secret disables the endpoint's

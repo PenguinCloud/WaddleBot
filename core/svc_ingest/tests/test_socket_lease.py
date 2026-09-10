@@ -13,6 +13,7 @@ replica_as_lease` green-for-the-wrong-reason into a false negative
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
@@ -290,3 +291,158 @@ class TestLeasedReceiver:
             redis_client=redis_client,
         )
         assert await other.try_claim() is True
+
+
+class _HangingRedis:
+    """`LeaseRedisLike` double whose `set`/`eval` never resolve.
+
+    Regression coverage for the silent-hang bug (2026-09-09): before
+    `LeasedReceiver._guarded()` existed, a Redis call that never returns
+    (a stalled/unresponsive connection -- confirmed via live trace as the
+    real production symptom) blocked `run()` forever with no error, no
+    log line, nothing for `ReceiverSupervisor` to restart on. Every test
+    below bounds its own `asyncio.wait_for(...)` well above
+    `claim_timeout_s` -- a regression back to the unguarded `await` would
+    make these tests hang instead of fail, which is deliberate: a hang
+    here is exactly the bug this suite exists to catch.
+    """
+
+    def __init__(self, *, hang_forever_s: float = 3600.0) -> None:
+        self._hang_forever_s = hang_forever_s
+        self.set_calls = 0
+        self.eval_calls = 0
+
+    async def set(  # noqa: D102 - matches LeaseRedisLike's own signature/docstring
+        self, name: str, value: str, /, *, nx: bool = False, px: int | None = None
+    ) -> Any:
+        self.set_calls += 1
+        await asyncio.sleep(self._hang_forever_s)
+
+    async def eval(self, script: str, numkeys: int, /, *keys_and_args: str) -> Any:  # noqa: D102
+        # Redis `EVAL` (server-side Lua) -- matches LeaseRedisLike.eval's
+        # own signature, NOT Python's builtin eval(); no untrusted input
+        # ever reaches this double, it never even inspects `script`.
+        self.eval_calls += 1
+        await asyncio.sleep(self._hang_forever_s)
+
+
+class TestClaimTimeoutAndDegradation:
+    """`claim_timeout_s`/`run_without_lease_on_unavailable` -- see `LeasedReceiver.run()`."""
+
+    async def test_claim_timeout_degrades_and_runs_without_lease_by_default(self) -> None:
+        """A backend that never answers SET NX must not block ingest on a single-replica deploy."""
+        transport = _FakeTransport()
+        received: list[Mapping[str, Any]] = []
+
+        async def _collect(item: Mapping[str, Any]) -> None:
+            received.append(item)
+
+        leased = LeasedReceiver(
+            transport=transport,
+            config={},
+            on_item=_collect,
+            redis_client=_HangingRedis(),
+            provider=PROVIDER,
+            community=PLATFORM_COMMUNITY,
+            owner_id="replica-a",
+            claim_timeout_s=0.05,
+            # run_without_lease_on_unavailable defaults to True.
+        )
+        task = asyncio.ensure_future(leased.run())
+        # If claim_timeout_s regresses back to an unbounded await, this
+        # wait_for is what turns a hang into a loud test failure instead
+        # of a stuck test run.
+        await asyncio.wait_for(asyncio.sleep(0.2), timeout=2.0)
+        assert transport.receive_calls == 1  # degraded, but still consuming
+
+        await transport.push({"content": "hi"})
+        await asyncio.sleep(0.05)
+        assert received == [{"content": "hi"}]
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert transport.closed is True
+
+    async def test_claim_timeout_does_not_run_when_degradation_disabled(self) -> None:
+        """Multi-replica safety: an operator can disable the single-replica fallback."""
+        transport = _FakeTransport()
+        redis_double = _HangingRedis()
+        leased = LeasedReceiver(
+            transport=transport,
+            config={},
+            on_item=_noop_on_item,
+            redis_client=redis_double,
+            provider=PROVIDER,
+            community=PLATFORM_COMMUNITY,
+            owner_id="replica-a",
+            claim_timeout_s=0.05,
+            run_without_lease_on_unavailable=False,
+        )
+        await asyncio.wait_for(leased.run(), timeout=2.0)  # returns, never hangs
+        assert transport.receive_calls == 0
+        assert redis_double.set_calls == 1
+
+    async def test_renew_timeout_is_treated_as_lease_lost(self, redis_client: Any) -> None:
+        """A renew that never answers must be treated the same as a renew that returned False."""
+
+        class _ClaimsThenHangsOnEval:
+            """Real fakeredis SET NX (so the initial claim succeeds), hanging EVAL after."""
+
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            async def set(
+                self, name: str, value: str, /, *, nx: bool = False, px: int | None = None
+            ) -> Any:
+                return await self._inner.set(name, value, nx=nx, px=px)
+
+            async def eval(self, script: str, numkeys: int, /, *keys_and_args: str) -> Any:
+                # Redis `EVAL` (server-side Lua), not Python's builtin
+                # eval() -- see _HangingRedis.eval's identical note above.
+                await asyncio.sleep(3600.0)
+
+        transport = _FakeTransport()
+        leased = LeasedReceiver(
+            transport=transport,
+            config={},
+            on_item=_noop_on_item,
+            redis_client=_ClaimsThenHangsOnEval(redis_client),
+            provider=PROVIDER,
+            community=PLATFORM_COMMUNITY,
+            owner_id="replica-a",
+            claim_timeout_s=0.05,
+            renew_interval_s=0.01,
+        )
+        task = asyncio.ensure_future(leased.run())
+        await asyncio.sleep(0.03)
+        assert transport.receive_calls == 1
+
+        # Renew fires ~0.01s in, times out at ~0.05s -- well under the
+        # generous outer bound below.
+        await asyncio.wait_for(task, timeout=2.0)
+        assert transport.closed is True
+
+    async def test_happy_path_claim_is_unaffected_by_the_new_timeout_guard(
+        self, redis_client: Any
+    ) -> None:
+        """A normal, fast fakeredis claim still succeeds -- the guard is a ceiling, not a floor."""
+        transport = _FakeTransport()
+        leased = LeasedReceiver(
+            transport=transport,
+            config={},
+            on_item=_noop_on_item,
+            redis_client=redis_client,
+            provider=PROVIDER,
+            community=PLATFORM_COMMUNITY,
+            owner_id="replica-a",
+            claim_timeout_s=5.0,
+        )
+        task = asyncio.ensure_future(leased.run())
+        await asyncio.sleep(0.05)
+        assert transport.receive_calls == 1
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert transport.closed is True

@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_LEASE_TTL_S = 30.0
 DEFAULT_RENEW_INTERVAL_S = 10.0
 
+#: Default bound for `LeasedReceiver._guarded()` -- every claim/renew/
+#: release Redis round-trip. See `LeasedReceiver.run()`'s own docstring.
+DEFAULT_CLAIM_TIMEOUT_S = 5.0
+
 #: Sentinel `community` for a provider with one platform-wide socket
 #: rather than a real per-community one (see module docstring).
 PLATFORM_COMMUNITY = "_platform"
@@ -160,6 +164,39 @@ class LeasedReceiver:
     fires, the generator is explicitly closed (`aclose()`, running its own
     `finally` cleanup, e.g. `DiscordGatewayReceiver.receive()`'s bot
     teardown) and `run()` returns normally rather than raising.
+
+    **No silent hang (2026-09-09 fix)**: every claim/renew/release Redis
+    round-trip used to be a bare, unbounded `await` -- a stalled or
+    unresponsive Valkey connection blocked `run()` forever with no error,
+    no log line, nothing for `supervisor.ReceiverSupervisor` to restart on
+    (a live trace is what actually caught this: parked inside
+    `lease.try_claim()`, no `socket_lease.claimed`/`not_claimed`, no
+    `supervisor.receiver_failed`, ever). `_guarded()` now bounds every
+    call to `claim_timeout_s` via `asyncio.wait_for`. It also
+    `asyncio.shield()`s the underlying call -- not just cosmetic: a
+    cancelled-while-in-flight SET/EVAL still returns its connection to
+    `redis-py`'s pool in `execute_command()`'s own `finally`, with the
+    server's reply still pending on it -- the exact pooled-connection-
+    reuse hazard `outbound_drain.py`'s own module docstring already
+    tracked down once (a cancelled in-flight BRPOP poisoning a later EVAL
+    drawn from the same pool, which then hangs on a stale/mismatched
+    reply). `run()`'s own `finally: renew_task.cancel()` cancels
+    `_renew_loop` while its `lease.renew()` EVAL may be mid-flight on
+    every single normal shutdown -- shielding lets that command finish in
+    the background instead of leaving the pool poisoned for the NEXT
+    `try_claim()` (this receiver's own supervisor-triggered restart, or
+    another provider's lease sharing the same client).
+
+    A claim that times out (backend unavailable/unresponsive) is NOT the
+    same as a claim that cleanly returned `False` (another replica
+    legitimately holds it) -- only the former is eligible to degrade.
+    `run_without_lease_on_unavailable` (default `True`, matching
+    `Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE`) exists because the
+    lease only guards against 2+ replicas racing for one platform socket;
+    alpha runs a single replica, so a broken lease backend has no
+    contention left to guard and must never permanently block ingest. Set
+    False for any deployment actually running >1 replica, where running
+    without a confirmed lease risks duplicate sockets.
     """
 
     transport: Transport
@@ -171,6 +208,8 @@ class LeasedReceiver:
     owner_id: str
     ttl_s: float = DEFAULT_LEASE_TTL_S
     renew_interval_s: float = DEFAULT_RENEW_INTERVAL_S
+    claim_timeout_s: float = DEFAULT_CLAIM_TIMEOUT_S
+    run_without_lease_on_unavailable: bool = True
     _sleep: Any = field(default=asyncio.sleep, repr=False)
 
     def _build_lease(self) -> SocketLease:
@@ -182,10 +221,58 @@ class LeasedReceiver:
             ttl_s=self.ttl_s,
         )
 
+    async def _guarded(self, awaitable: Awaitable[Any]) -> Any:  # noqa: ANN401 - mirrors the raw SET/EVAL reply shape SocketLease itself already returns Any for
+        """Bound one lease Redis call to `claim_timeout_s`; raises `TimeoutError` if it's exceeded.
+
+        `asyncio.shield()`-wrapped so a timeout here (or this coroutine's
+        own external cancellation) never aborts the underlying command
+        mid-flight -- see this class's own docstring for the pooled-
+        connection-reuse hazard that guards against.
+        """
+        return await asyncio.wait_for(asyncio.shield(awaitable), timeout=self.claim_timeout_s)
+
     async def run(self) -> None:
-        """Claim the lease; if claimed, consume `transport.receive()` until it ends/lease loss."""
+        """Claim the lease; if claimed (or degraded), consume `transport.receive()`.
+
+        Stops on stream end, lease loss, or external cancellation. See
+        this class's own docstring for the claim-timeout/degradation
+        contract.
+        """
         lease = self._build_lease()
-        if not await lease.try_claim():
+        degraded = False
+        try:
+            claimed = bool(await self._guarded(lease.try_claim()))
+        except TimeoutError:
+            logger.warning(
+                "socket_lease.timeout provider=%s community=%s owner=%s timeout_s=%s action=claim",
+                self.provider,
+                self.community,
+                self.owner_id,
+                self.claim_timeout_s,
+            )
+            if not self.run_without_lease_on_unavailable:
+                logger.error(
+                    "socket_lease.unavailable_not_running provider=%s community=%s owner=%s "
+                    "-- lease backend unreachable and run_without_lease_on_unavailable is "
+                    "disabled; refusing to run without a confirmed lease",
+                    self.provider,
+                    self.community,
+                    self.owner_id,
+                )
+                return
+            logger.warning(
+                "socket_lease.degraded_running_without_lease provider=%s community=%s owner=%s "
+                "-- lease backend unavailable, proceeding WITHOUT a claimed lease "
+                "(single-replica assumption; running >1 svc-ingest replica in this state "
+                "risks duplicate sockets)",
+                self.provider,
+                self.community,
+                self.owner_id,
+            )
+            claimed = False
+            degraded = True
+
+        if not claimed and not degraded:
             logger.info(
                 "socket_lease.not_claimed provider=%s community=%s owner=%s",
                 self.provider,
@@ -194,14 +281,21 @@ class LeasedReceiver:
             )
             return
 
-        logger.info(
-            "socket_lease.claimed provider=%s community=%s owner=%s",
-            self.provider,
-            self.community,
-            self.owner_id,
-        )
+        if not degraded:
+            logger.info(
+                "socket_lease.claimed provider=%s community=%s owner=%s",
+                self.provider,
+                self.community,
+                self.owner_id,
+            )
         lease_lost = asyncio.Event()
-        renew_task = asyncio.ensure_future(self._renew_loop(lease, lease_lost))
+        # Degraded: no lease to renew, so no renew loop -- `lease_lost`
+        # simply never fires, and `_consume` runs exactly as it would for
+        # an unleased receiver (until the transport's own stream ends or
+        # this task is externally cancelled).
+        renew_task = (
+            None if degraded else asyncio.ensure_future(self._renew_loop(lease, lease_lost))
+        )
         # `Transport.receive()` is typed `AsyncIterator` (the ABC's own
         # signature) but every real implementation is an async generator
         # function (`base.py`'s own default even ends in an unreachable
@@ -216,16 +310,28 @@ class LeasedReceiver:
             await generator.aclose()
             raise
         finally:
-            renew_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await renew_task
-            await lease.release()
-            logger.info(
-                "socket_lease.released provider=%s community=%s owner=%s",
-                self.provider,
-                self.community,
-                self.owner_id,
-            )
+            if renew_task is not None:
+                renew_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renew_task
+            if not degraded:
+                try:
+                    await self._guarded(lease.release())
+                except TimeoutError:
+                    logger.warning(
+                        "socket_lease.timeout provider=%s community=%s owner=%s timeout_s=%s "
+                        "action=release -- best-effort release abandoned, key expires via TTL",
+                        self.provider,
+                        self.community,
+                        self.owner_id,
+                        self.claim_timeout_s,
+                    )
+                logger.info(
+                    "socket_lease.released provider=%s community=%s owner=%s",
+                    self.provider,
+                    self.community,
+                    self.owner_id,
+                )
 
     async def _consume(
         self,
@@ -261,10 +367,32 @@ class LeasedReceiver:
             await self.on_item(item)
 
     async def _renew_loop(self, lease: SocketLease, lease_lost: asyncio.Event) -> None:
-        """Renew on `renew_interval_s`; signal `lease_lost` the moment we lose the lease."""
+        """Renew on `renew_interval_s`; signal `lease_lost` on an explicit loss or timeout.
+
+        A renew that can't complete within `claim_timeout_s` is treated
+        exactly like a renew that came back `False` (compare-and-expire
+        found we no longer hold the key) -- a stalled/never-returning
+        renew gives no positive confirmation either way, so the safe
+        default is "assume lost," not "assume we still have it and keep
+        consuming." `_guarded()`'s `asyncio.shield()` still lets that
+        stalled renew finish in the background rather than poisoning the
+        shared connection pool for a later `try_claim()`.
+        """
         while True:
             await self._sleep(self.renew_interval_s)
-            if not await lease.renew():
+            try:
+                renewed = bool(await self._guarded(lease.renew()))
+            except TimeoutError:
+                logger.warning(
+                    "socket_lease.timeout provider=%s community=%s owner=%s timeout_s=%s "
+                    "action=renew",
+                    self.provider,
+                    self.community,
+                    self.owner_id,
+                    self.claim_timeout_s,
+                )
+                renewed = False
+            if not renewed:
                 logger.warning(
                     "socket_lease.lost provider=%s community=%s owner=%s",
                     self.provider,

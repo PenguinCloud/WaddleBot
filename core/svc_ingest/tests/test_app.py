@@ -16,10 +16,14 @@ trip, by `test_runner.py`.
 
 from __future__ import annotations
 
+import logging
+import sys
 from typing import Any
 
 import pytest
+from quart.testing.app import LifespanError
 
+import app as app_module
 from app import app as quart_app
 from config import Config
 
@@ -106,3 +110,132 @@ class TestLifespan:
             assert "twitch_outbound_drain" in registered
             assert quart_app.config["discord_leased_receiver"] is not None
             assert len(quart_app.config["twitch_leased_receivers"]) == 1
+
+
+class TestLeaseClientSharesAuthenticatedRedisClient:
+    """Regression: every socket-lease Redis client must be THE SAME object as the shared client.
+
+    Must be `Config.VALKEY_URL`-authenticated -- never a separately constructed, unauthenticated
+    one.
+
+    2026-09-10 fix (paired with `test_config.py`'s `TestValkeyUrlAuthFallback`): an earlier
+    debugging pass observed `AuthenticationError: HELLO must be called with the client already
+    authenticated` on the Discord receiver's lease claim while the ordinary ingest->process
+    fan-out (same process) kept working -- the apparent divergence was traced to
+    `Config.VALKEY_URL` itself silently falling back to a bare, credential-free dev default in a
+    real cluster (`test_config.py`), not to `socket_lease.py`/`outbound_drain.py` building a
+    second, differently-authenticated client. `socket_lease.SocketLease` never constructs its own
+    client -- it only ever receives one from a caller (`LeaseRedisLike`/`socket_lease.py`'s own
+    docstring) -- so asserting object identity here is the strongest guarantee against that
+    divergence ever silently reappearing: a future edit that builds ANY new `redis.from_url(...)`
+    call for a lease client, instead of reusing `app.py`'s one shared `redis_client`, fails this
+    test immediately.
+    """
+
+    async def test_discord_and_twitch_leases_reuse_the_one_shared_redis_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Config, "DISCORD_BOT_TOKEN", "fake-discord-token")  # noqa: S105
+        monkeypatch.setattr(Config, "TWITCH_BOT_TOKEN_REF", "FAKE_TWITCH_TOKEN_REF")
+        monkeypatch.setattr(Config, "TWITCH_CHANNELS", ["somechannel"])
+
+        async with quart_app.test_app():
+            shared_redis_client = quart_app.config["redis_client"]
+
+            discord_leased = quart_app.config["discord_leased_receiver"]
+            assert discord_leased.redis_client is shared_redis_client
+
+            twitch_leased = quart_app.config["twitch_leased_receivers"][0]
+            assert twitch_leased.redis_client is shared_redis_client
+
+            outbound_drain = quart_app.config["twitch_outbound_drain"]
+            assert outbound_drain.lease_redis_client is shared_redis_client
+            # The drain's BLOCKING-BRPOP connection is deliberately a
+            # SEPARATE, dedicated client (outbound_drain.py's own "Two
+            # separate Valkey clients" docstring) -- but still built from
+            # the same authenticated `Config.VALKEY_URL`, never a bare one.
+            assert outbound_drain.redis_client is not shared_redis_client
+
+
+class TestConfigureRootLogging:
+    """Regression for the 2026-09-10 diagnosis (`app._configure_root_logging`'s own docstring).
+
+    A Discord receiver appeared to exit silently on startup; the real
+    cause was that `socket_lease.py`/`supervisor.py`/`receivers/
+    discord_gateway.py` (and siblings) log via a plain
+    `logging.getLogger(__name__)` that was never attached to any handler
+    -- reproduced directly: the untouched Python root logger defaults
+    (level=WARNING, zero handlers) silently dropped every `.info()` call
+    and routed every `.warning()`/`.error()` call to an unstructured
+    STDERR fallback, a different stream/format than every other log line
+    this service emits. `_configure_root_logging()` runs at `app.py`
+    import time (module-level call), so this test observes its
+    already-applied, process-wide effect.
+    """
+
+    def test_root_logger_has_a_stdout_handler_at_config_level(self) -> None:
+        root_logger = logging.getLogger()
+        assert any(
+            isinstance(h, logging.StreamHandler) and h.stream is sys.stdout
+            for h in root_logger.handlers
+        )
+        assert root_logger.getEffectiveLevel() <= logging.INFO
+
+    def test_plain_child_logger_would_have_been_dropped_before_the_fix(self) -> None:
+        """The exact shape `socket_lease.py`'s `logging.getLogger(__name__)` uses.
+
+        Asserts at the logging-API level (not `capsys`, which can't see
+        writes through a handler that captured `sys.stdout` at import
+        time, before pytest's own capture substitution) -- before this
+        fix, `isEnabledFor(INFO)` was False (root defaulted to WARNING),
+        which is the exact condition that silently dropped
+        `socket_lease.claimed`/`gateway.discord_ready` at the source,
+        before any handler was even consulted.
+        """
+        child_logger = logging.getLogger("socket_lease")
+        assert child_logger.isEnabledFor(logging.INFO)
+        assert child_logger.handlers == []  # relies entirely on the root's handler
+        assert len(logging.getLogger().handlers) >= 1
+
+
+class TestStartupFailureLogging:
+    """`startup()`'s receiver-registration guard -- see `app.py`'s own inline comment."""
+
+    async def test_registration_failure_is_logged_with_exception_info_and_reraised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A raised exception during receiver setup is never silent: logged, then re-raised.
+
+        Proves `startup()` fails loud and fails closed rather than ever
+        continuing to serve with a receiver that never actually
+        registered.
+        """
+        logged: list[tuple[str, dict[str, Any]]] = []
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(app_module, "_register_discord_receiver", _boom)
+        monkeypatch.setattr(
+            app_module.logger,
+            "error",
+            lambda message, **kwargs: logged.append((message, kwargs)),
+        )
+
+        # Quart's own lifespan protocol converts a `before_serving` hook's
+        # raised exception into a `lifespan.startup.failed` ASGI message
+        # before it ever reaches test/production code -- `test_app()`'s
+        # harness re-raises that as `LifespanError`, not the original
+        # `RuntimeError` directly. What this test actually proves is that
+        # `startup()` still fails (never silently continues) AND that our
+        # own `logger.error()` ran with the exception's type + message
+        # before Quart's own re-raise -- both asserted below.
+        with pytest.raises(LifespanError, match="boom"):
+            async with quart_app.test_app():
+                pass
+
+        assert len(logged) == 1
+        message, kwargs = logged[0]
+        assert "RuntimeError" in message
+        assert "boom" in message
+        assert kwargs["result"] == "FAILED"
