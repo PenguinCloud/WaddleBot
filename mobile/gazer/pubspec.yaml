@@ -81,6 +81,8 @@ dev_dependencies:
   build_runner: 2.16.1
   mocktail: 1.0.5
   flutter_lints: 6.0.0
+  # resolved by shared_preferences 2.5.5's dependency graph, verified via WebFetch 2026-09-07
+  shared_preferences_platform_interface: 2.4.2
 
 flutter:
   uses-material-design: true
