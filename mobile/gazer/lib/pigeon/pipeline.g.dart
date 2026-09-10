@@ -10,9 +10,9 @@ import 'package:flutter/services.dart';
 import 'package:meta/meta.dart' show immutable, protected, visibleForTesting;
 
 Object? _extractReplyValueOrThrow(
-    List<Object?>? replyList,
-    String channelName, {
-    required bool isNullValid,
+  List<Object?>? replyList,
+  String channelName, {
+  required bool isNullValid,
 }) {
   if (replyList == null) {
     throw PlatformException(
@@ -34,8 +34,11 @@ Object? _extractReplyValueOrThrow(
   return replyList.firstOrNull;
 }
 
-
-List<Object?> wrapResponse({Object? result, PlatformException? error, bool empty = false}) {
+List<Object?> wrapResponse({
+  Object? result,
+  PlatformException? error,
+  bool empty = false,
+}) {
   if (empty) {
     return <Object?>[];
   }
@@ -44,6 +47,7 @@ List<Object?> wrapResponse({Object? result, PlatformException? error, bool empty
   }
   return <Object?>[error.code, error.message, error.details];
 }
+
 bool _deepEquals(Object? a, Object? b) {
   if (identical(a, b)) {
     return true;
@@ -56,8 +60,9 @@ bool _deepEquals(Object? a, Object? b) {
   }
   if (a is List && b is List) {
     return a.length == b.length &&
-        a.indexed
-            .every(((int, dynamic) item) => _deepEquals(item.$2, b[item.$1]));
+        a.indexed.every(
+          ((int, dynamic) item) => _deepEquals(item.$2, b[item.$1]),
+        );
   }
   if (a is Map && b is Map) {
     if (a.length != b.length) {
@@ -106,21 +111,11 @@ int _deepHash(Object? value) {
   return value.hashCode;
 }
 
-
 /// Kind of video source a device entry represents.
-enum VideoDeviceKind {
-  backCamera,
-  frontCamera,
-  uvcCamera2,
-  uvcLibuvc,
-}
+enum VideoDeviceKind { backCamera, frontCamera, uvcCamera2, uvcLibuvc }
 
 /// Kind of audio source a device entry represents.
-enum AudioDeviceKind {
-  mic,
-  usbAudio,
-  silence,
-}
+enum AudioDeviceKind { mic, usbAudio, silence }
 
 /// Native pipeline state machine, as reported by the Kotlin side. Dart adds
 /// the `reconnecting` state on top of this (see the Dart `PipelineState`).
@@ -153,10 +148,7 @@ enum GazerErrorCode {
 
 /// Requested output orientation for the encoded video (camera path only;
 /// UVC is always landscape).
-enum OutputOrientation {
-  landscape,
-  portrait,
-}
+enum OutputOrientation { landscape, portrait }
 
 /// One enumerable video source (a camera or an attached UVC device).
 class VideoDevice {
@@ -179,17 +171,12 @@ class VideoDevice {
   int? productId;
 
   List<Object?> _toList() {
-    return <Object?>[
-      id,
-      kind,
-      name,
-      vendorId,
-      productId,
-    ];
+    return <Object?>[id, kind, name, vendorId, productId];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static VideoDevice decode(Object result) {
     result as List<Object?>;
@@ -211,7 +198,11 @@ class VideoDevice {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(id, other.id) && _deepEquals(kind, other.kind) && _deepEquals(name, other.name) && _deepEquals(vendorId, other.vendorId) && _deepEquals(productId, other.productId);
+    return _deepEquals(id, other.id) &&
+        _deepEquals(kind, other.kind) &&
+        _deepEquals(name, other.name) &&
+        _deepEquals(vendorId, other.vendorId) &&
+        _deepEquals(productId, other.productId);
   }
 
   @override
@@ -226,11 +217,7 @@ class VideoDevice {
 
 /// One enumerable audio source.
 class AudioDevice {
-  AudioDevice({
-    required this.id,
-    required this.kind,
-    required this.name,
-  });
+  AudioDevice({required this.id, required this.kind, required this.name});
 
   String id;
 
@@ -239,15 +226,12 @@ class AudioDevice {
   String name;
 
   List<Object?> _toList() {
-    return <Object?>[
-      id,
-      kind,
-      name,
-    ];
+    return <Object?>[id, kind, name];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static AudioDevice decode(Object result) {
     result as List<Object?>;
@@ -267,7 +251,9 @@ class AudioDevice {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(id, other.id) && _deepEquals(kind, other.kind) && _deepEquals(name, other.name);
+    return _deepEquals(id, other.id) &&
+        _deepEquals(kind, other.kind) &&
+        _deepEquals(name, other.name);
   }
 
   @override
@@ -327,7 +313,8 @@ class StreamConfig {
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static StreamConfig decode(Object result) {
     result as List<Object?>;
@@ -353,7 +340,15 @@ class StreamConfig {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(videoDeviceId, other.videoDeviceId) && _deepEquals(audioDeviceId, other.audioDeviceId) && _deepEquals(width, other.width) && _deepEquals(height, other.height) && _deepEquals(fps, other.fps) && _deepEquals(videoBitrateKbps, other.videoBitrateKbps) && _deepEquals(adaptiveBitrate, other.adaptiveBitrate) && _deepEquals(audioBitrateKbps, other.audioBitrateKbps) && _deepEquals(orientation, other.orientation);
+    return _deepEquals(videoDeviceId, other.videoDeviceId) &&
+        _deepEquals(audioDeviceId, other.audioDeviceId) &&
+        _deepEquals(width, other.width) &&
+        _deepEquals(height, other.height) &&
+        _deepEquals(fps, other.fps) &&
+        _deepEquals(videoBitrateKbps, other.videoBitrateKbps) &&
+        _deepEquals(adaptiveBitrate, other.adaptiveBitrate) &&
+        _deepEquals(audioBitrateKbps, other.audioBitrateKbps) &&
+        _deepEquals(orientation, other.orientation);
   }
 
   @override
@@ -370,11 +365,7 @@ class StreamConfig {
 /// the stream key folded in by `TargetValidator.effectiveUrl` on the Dart
 /// side — Kotlin never appends a key itself.
 class StreamTarget {
-  StreamTarget({
-    required this.url,
-    this.username,
-    this.password,
-  });
+  StreamTarget({required this.url, this.username, this.password});
 
   String url;
 
@@ -383,15 +374,12 @@ class StreamTarget {
   String? password;
 
   List<Object?> _toList() {
-    return <Object?>[
-      url,
-      username,
-      password,
-    ];
+    return <Object?>[url, username, password];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static StreamTarget decode(Object result) {
     result as List<Object?>;
@@ -411,7 +399,9 @@ class StreamTarget {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(url, other.url) && _deepEquals(username, other.username) && _deepEquals(password, other.password);
+    return _deepEquals(url, other.url) &&
+        _deepEquals(username, other.username) &&
+        _deepEquals(password, other.password);
   }
 
   @override
@@ -464,7 +454,8 @@ class PrepareResult {
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static PrepareResult decode(Object result) {
     result as List<Object?>;
@@ -488,7 +479,13 @@ class PrepareResult {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(ok, other.ok) && _deepEquals(error, other.error) && _deepEquals(detail, other.detail) && _deepEquals(negotiatedWidth, other.negotiatedWidth) && _deepEquals(negotiatedHeight, other.negotiatedHeight) && _deepEquals(negotiatedFps, other.negotiatedFps) && _deepEquals(negotiatedFormat, other.negotiatedFormat);
+    return _deepEquals(ok, other.ok) &&
+        _deepEquals(error, other.error) &&
+        _deepEquals(detail, other.detail) &&
+        _deepEquals(negotiatedWidth, other.negotiatedWidth) &&
+        _deepEquals(negotiatedHeight, other.negotiatedHeight) &&
+        _deepEquals(negotiatedFps, other.negotiatedFps) &&
+        _deepEquals(negotiatedFormat, other.negotiatedFormat);
   }
 
   @override
@@ -532,7 +529,8 @@ class StatsSample {
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static StatsSample decode(Object result) {
     result as List<Object?>;
@@ -554,7 +552,11 @@ class StatsSample {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(bitrateKbps, other.bitrateKbps) && _deepEquals(fps, other.fps) && _deepEquals(droppedVideoFrames, other.droppedVideoFrames) && _deepEquals(sentBytes, other.sentBytes) && _deepEquals(congestionPercent, other.congestionPercent);
+    return _deepEquals(bitrateKbps, other.bitrateKbps) &&
+        _deepEquals(fps, other.fps) &&
+        _deepEquals(droppedVideoFrames, other.droppedVideoFrames) &&
+        _deepEquals(sentBytes, other.sentBytes) &&
+        _deepEquals(congestionPercent, other.congestionPercent);
   }
 
   @override
@@ -569,11 +571,7 @@ class StatsSample {
 
 /// A native pipeline state transition, optionally carrying an error.
 class StateEvent {
-  StateEvent({
-    required this.state,
-    this.error,
-    this.detail,
-  });
+  StateEvent({required this.state, this.error, this.detail});
 
   NativePipelineState state;
 
@@ -582,15 +580,12 @@ class StateEvent {
   String? detail;
 
   List<Object?> _toList() {
-    return <Object?>[
-      state,
-      error,
-      detail,
-    ];
+    return <Object?>[state, error, detail];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static StateEvent decode(Object result) {
     result as List<Object?>;
@@ -610,7 +605,9 @@ class StateEvent {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(state, other.state) && _deepEquals(error, other.error) && _deepEquals(detail, other.detail);
+    return _deepEquals(state, other.state) &&
+        _deepEquals(error, other.error) &&
+        _deepEquals(detail, other.detail);
   }
 
   @override
@@ -623,7 +620,6 @@ class StateEvent {
   }
 }
 
-
 class _PigeonCodec extends StandardMessageCodec {
   const _PigeonCodec();
   @override
@@ -631,40 +627,40 @@ class _PigeonCodec extends StandardMessageCodec {
     if (value is int) {
       buffer.putUint8(4);
       buffer.putInt64(value);
-    }    else if (value is VideoDeviceKind) {
+    } else if (value is VideoDeviceKind) {
       buffer.putUint8(129);
       writeValue(buffer, value.index);
-    }    else if (value is AudioDeviceKind) {
+    } else if (value is AudioDeviceKind) {
       buffer.putUint8(130);
       writeValue(buffer, value.index);
-    }    else if (value is NativePipelineState) {
+    } else if (value is NativePipelineState) {
       buffer.putUint8(131);
       writeValue(buffer, value.index);
-    }    else if (value is GazerErrorCode) {
+    } else if (value is GazerErrorCode) {
       buffer.putUint8(132);
       writeValue(buffer, value.index);
-    }    else if (value is OutputOrientation) {
+    } else if (value is OutputOrientation) {
       buffer.putUint8(133);
       writeValue(buffer, value.index);
-    }    else if (value is VideoDevice) {
+    } else if (value is VideoDevice) {
       buffer.putUint8(134);
       writeValue(buffer, value.encode());
-    }    else if (value is AudioDevice) {
+    } else if (value is AudioDevice) {
       buffer.putUint8(135);
       writeValue(buffer, value.encode());
-    }    else if (value is StreamConfig) {
+    } else if (value is StreamConfig) {
       buffer.putUint8(136);
       writeValue(buffer, value.encode());
-    }    else if (value is StreamTarget) {
+    } else if (value is StreamTarget) {
       buffer.putUint8(137);
       writeValue(buffer, value.encode());
-    }    else if (value is PrepareResult) {
+    } else if (value is PrepareResult) {
       buffer.putUint8(138);
       writeValue(buffer, value.encode());
-    }    else if (value is StatsSample) {
+    } else if (value is StatsSample) {
       buffer.putUint8(139);
       writeValue(buffer, value.encode());
-    }    else if (value is StateEvent) {
+    } else if (value is StateEvent) {
       buffer.putUint8(140);
       writeValue(buffer, value.encode());
     } else {
@@ -715,9 +711,13 @@ class GazerHostApi {
   /// Constructor for [GazerHostApi]. The [binaryMessenger] named argument is
   /// available for dependency injection. If it is left null, the default
   /// BinaryMessenger will be used which routes to the host platform.
-  GazerHostApi({BinaryMessenger? binaryMessenger, String messageChannelSuffix = ''})
-      : pigeonVar_binaryMessenger = binaryMessenger,
-        pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+  GazerHostApi({
+    BinaryMessenger? binaryMessenger,
+    String messageChannelSuffix = '',
+  }) : pigeonVar_binaryMessenger = binaryMessenger,
+       pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty
+           ? '.$messageChannelSuffix'
+           : '';
   final BinaryMessenger? pigeonVar_binaryMessenger;
 
   static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
@@ -727,7 +727,8 @@ class GazerHostApi {
   /// Enumerates available video sources (back/front camera; UVC devices
   /// attached at call time).
   Future<List<VideoDevice>> listVideoDevices() async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.listVideoDevices$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.listVideoDevices$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
@@ -737,17 +738,17 @@ class GazerHostApi {
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: false,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
     return (pigeonVar_replyValue! as List<Object?>).cast<VideoDevice>();
   }
 
   /// Enumerates available audio sources.
   Future<List<AudioDevice>> listAudioDevices() async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.listAudioDevices$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.listAudioDevices$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
@@ -757,11 +758,10 @@ class GazerHostApi {
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: false,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
     return (pigeonVar_replyValue! as List<Object?>).cast<AudioDevice>();
   }
 
@@ -769,66 +769,73 @@ class GazerHostApi {
   /// false: no UVC devices are ever listed, so this is never actually
   /// invoked with a real device in this milestone.
   Future<bool> requestUsbPermission(String deviceId) async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.requestUsbPermission$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.requestUsbPermission$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[deviceId]);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[deviceId],
+    );
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: false,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
     return pigeonVar_replyValue! as bool;
   }
 
   /// Negotiates the source/encoder for [config]; must succeed before `start`.
   Future<PrepareResult> prepare(StreamConfig config) async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.prepare$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.prepare$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[config]);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[config],
+    );
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: false,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
     return pigeonVar_replyValue! as PrepareResult;
   }
 
   /// Begins publishing to [target]; only valid after a successful `prepare`.
   Future<void> start(StreamTarget target) async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.start$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.start$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[target]);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[target],
+    );
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: true,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: true,
+    );
   }
 
   /// Stops publishing and tears down the source/encoder.
   Future<void> stop() async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.stop$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.stop$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
@@ -838,36 +845,38 @@ class GazerHostApi {
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: true,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: true,
+    );
   }
 
   /// Adjusts the live video bitrate without a full restart (used by the
   /// native `BitrateAdapter` and by Dart-driven manual overrides).
   Future<void> setVideoBitrate(int kbps) async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.setVideoBitrate$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.setVideoBitrate$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[kbps]);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[kbps],
+    );
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: true,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: true,
+    );
   }
 
   /// Returns the native pipeline's current state synchronously.
   Future<NativePipelineState> getState() async {
-    final pigeonVar_channelName = 'dev.flutter.pigeon.gazer.GazerHostApi.getState$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.gazer.GazerHostApi.getState$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
@@ -877,11 +886,10 @@ class GazerHostApi {
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
-        pigeonVar_replyList,
-        pigeonVar_channelName,
-        isNullValid: false,
-    )
-    ;
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
     return pigeonVar_replyValue! as NativePipelineState;
   }
 }
@@ -905,12 +913,20 @@ abstract class GazerFlutterApi {
   /// Fired after an RTMP auth attempt resolves.
   void onAuthResult(bool ok);
 
-  static void setUp(GazerFlutterApi? api, {BinaryMessenger? binaryMessenger, String messageChannelSuffix = '',}) {
-    messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+  static void setUp(
+    GazerFlutterApi? api, {
+    BinaryMessenger? binaryMessenger,
+    String messageChannelSuffix = '',
+  }) {
+    messageChannelSuffix = messageChannelSuffix.isNotEmpty
+        ? '.$messageChannelSuffix'
+        : '';
     {
       final pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.gazer.GazerFlutterApi.onStateChanged$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.gazer.GazerFlutterApi.onStateChanged$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
@@ -922,16 +938,20 @@ abstract class GazerFlutterApi {
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
     }
     {
       final pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.gazer.GazerFlutterApi.onStats$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.gazer.GazerFlutterApi.onStats$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
@@ -943,16 +963,20 @@ abstract class GazerFlutterApi {
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
     }
     {
       final pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.gazer.GazerFlutterApi.onUsbAttached$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.gazer.GazerFlutterApi.onUsbAttached$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
@@ -964,16 +988,20 @@ abstract class GazerFlutterApi {
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
     }
     {
       final pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.gazer.GazerFlutterApi.onUsbDetached$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.gazer.GazerFlutterApi.onUsbDetached$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
@@ -985,16 +1013,20 @@ abstract class GazerFlutterApi {
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
     }
     {
       final pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.gazer.GazerFlutterApi.onAuthResult$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.gazer.GazerFlutterApi.onAuthResult$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
@@ -1006,8 +1038,10 @@ abstract class GazerFlutterApi {
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
