@@ -153,14 +153,17 @@ tasks.register<JacocoReport>("jacocoTestReport") {
             "**/Manifest*.*",
             "**/*Test*.*",
             "**/pigeon/**",
-            // MainActivity.kt is stock flutter-create boilerplate (Task 2 leaves it untouched --
-            // Tasks 17/20 own it, per the brief's file map) with no custom logic of this task's
-            // own to measure. Its default constructor is never invoked by a plain JVM unit test
-            // (Activities need Robolectric/instrumentation, out of scope here), so leaving it in
-            // this JaCoCo scan drags the LINE ratio down with a permanently-uncoverable phantom
-            // miss unrelated to anything Task 2 introduces. Excluded the same way R/BuildConfig/
-            // Manifest/generated code above already are; Task 17/20 can revisit this exclusion
-            // once MainActivity.kt gains real logic worth unit-testing.
+            // Why: MainActivity.kt is stock flutter-create boilerplate (Task 2 leaves it
+            // untouched) with no JVM-testable logic of its own -- its default constructor is
+            // never invoked by a plain JVM unit test (Activities need Robolectric/instrumentation,
+            // out of scope here), so leaving it in this JaCoCo scan drags the LINE ratio down with
+            // a permanently-uncoverable phantom miss unrelated to anything Task 2 introduces.
+            // Constraint (controller ruling R11): this exclusion may stay ONLY as long as
+            // MainActivity stays a flutter-create-boilerplate Activity with no testable logic.
+            // Task 20 MUST keep MainActivity.kt a <=3-line bridge that delegates all real logic to
+            // a separately unit-tested factory/class, and MUST revisit (narrow or remove) this
+            // exclusion when it touches MainActivity.kt -- do not let this scope grow to cover
+            // real logic added later.
             "**/MainActivity.class",
             "**/MainActivity\$*.class",
         )
