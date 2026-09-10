@@ -347,4 +347,200 @@ void main() {
       await sub.cancel();
     });
   });
+
+  group('dispose during reconnect', () {
+    test('resolving the sleeper after dispose does not throw and does not call start again', () async {
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+      final startCallsBefore = host.startCalls.length;
+
+      bridge.onStateChanged(
+        StateEvent(
+          state: NativePipelineState.error,
+          error: GazerErrorCode.rtmpConnectFailed,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.current, isA<ReconnectingState>());
+
+      controller.dispose();
+
+      expect(() => sleeper.resolveNext(), returnsNormally);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(host.startCalls.length, startCallsBefore);
+    });
+  });
+
+  group('reconnect attempt resets after recovery', () {
+    test('two recovered outages each retry at attempt 1; a later outage still gets 10 attempts', () async {
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+
+      Future<void> failAndRecoverOnce() async {
+        bridge.onStateChanged(
+          StateEvent(
+            state: NativePipelineState.error,
+            error: GazerErrorCode.rtmpConnectFailed,
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect((controller.current as ReconnectingState).attempt, 1);
+        sleeper.resolveNext();
+        await Future<void>.delayed(Duration.zero);
+        bridge.onStateChanged(StateEvent(state: NativePipelineState.streaming));
+        await Future<void>.delayed(Duration.zero);
+        expect(controller.current, const StreamingState());
+      }
+
+      // First outage: recovers after one retry at attempt 1.
+      await failAndRecoverOnce();
+      // Second outage: budget must have reset -- still attempt 1, not 2.
+      await failAndRecoverOnce();
+
+      // Third outage: exhausts the full 10-attempt budget from scratch.
+      for (var attempt = 1; attempt <= 10; attempt++) {
+        bridge.onStateChanged(
+          StateEvent(
+            state: NativePipelineState.error,
+            error: GazerErrorCode.rtmpConnectFailed,
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          (controller.current as ReconnectingState).attempt,
+          attempt,
+          reason: 'attempt $attempt',
+        );
+        sleeper.resolveNext();
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      bridge.onStateChanged(
+        StateEvent(
+          state: NativePipelineState.error,
+          error: GazerErrorCode.rtmpConnectFailed,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.current, isA<ErrorState>());
+    });
+  });
+
+  group('goLive re-entrancy guard', () {
+    test('an overlapping call throws StateError and only one prepare reaches the host', () async {
+      final first = controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+
+      expect(
+        () => controller.goLive(
+          settingsWith(),
+          devices: [backCamera],
+          videoDeviceId: 'camera:back',
+          flags: flagsWith(),
+        ),
+        throwsStateError,
+      );
+
+      await first;
+      expect(host.prepareCalls.length, 1);
+    });
+
+    test('calling goLive while Streaming throws StateError', () async {
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+      bridge.onStateChanged(StateEvent(state: NativePipelineState.streaming));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+        () => controller.goLive(
+          settingsWith(),
+          devices: [backCamera],
+          videoDeviceId: 'camera:back',
+          flags: flagsWith(),
+        ),
+        throwsStateError,
+      );
+    });
+  });
+
+  group('prepare failure', () {
+    test('PrepareResult(ok: false) emits ErrorState with the reported code/detail and never calls start', () async {
+      host.prepareResult = PrepareResult(
+        ok: false,
+        error: GazerErrorCode.cameraUnavailable,
+        detail: 'x',
+      );
+
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+
+      expect(controller.current, isA<ErrorState>());
+      expect(
+        (controller.current as ErrorState).error.code,
+        GazerErrorCode.cameraUnavailable,
+      );
+      expect((controller.current as ErrorState).error.detail, 'x');
+      expect(host.startCalls, isEmpty);
+    });
+  });
+
+  group('stats aggregation at scale', () {
+    test(
+      'averages 200 samples via a running sum, without unbounded memory growth',
+      () async {
+        final seen = <StreamStats>[];
+        final sub = controller.stats.listen(seen.add);
+
+        await controller.goLive(
+          settingsWith(),
+          devices: [backCamera],
+          videoDeviceId: 'camera:back',
+          flags: flagsWith(),
+        );
+        bridge.onStateChanged(StateEvent(state: NativePipelineState.streaming));
+        await Future<void>.delayed(Duration.zero);
+
+        for (var i = 1; i <= 200; i++) {
+          bridge.onStats(
+            StatsSample(
+              bitrateKbps: i,
+              fps: 30,
+              droppedVideoFrames: 0,
+              sentBytes: 0,
+              congestionPercent: 0,
+            ),
+          );
+          await Future<void>.delayed(Duration.zero);
+        }
+
+        // sum(1..200) == 20100; average == 100.5, which rounds to 101.
+        final latest = seen.last;
+        expect(latest.currentBitrateKbps, 200);
+        expect(latest.averageBitrateKbps, 101);
+        await sub.cancel();
+      },
+    );
+  });
 }

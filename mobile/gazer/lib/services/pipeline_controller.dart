@@ -57,8 +57,15 @@ class PipelineController {
   StreamTarget? _pendingTarget;
   int _reconnectAttempt = 0;
   bool _cancelled = false;
+  bool _isDisposed = false;
+  bool _goingLive = false;
   DateTime? _streamStartedAt;
-  final List<int> _bitrateSamples = [];
+
+  // Running sum/count instead of a growing sample list: the rolling
+  // average is O(1) per sample in both time and memory, however long a
+  // stream session runs.
+  int _bitrateSampleSum = 0;
+  int _bitrateSampleCount = 0;
 
   /// Every [PipelineState] transition after subscription; late subscribers
   /// do not receive states emitted before they listened — combine with
@@ -80,6 +87,14 @@ class PipelineController {
   /// is only honoured when `FlagKeys.adaptiveBitrate` is on in [flags];
   /// credentials are only forwarded to the native `start()` call when
   /// `FlagKeys.rtmpAuth` is on.
+  ///
+  /// Throws [StateError] if a previous call to [goLive] is still in
+  /// flight, or if [current] is not [IdleState], [ReadyState], or
+  /// [ErrorState] — the UI (Task 14) disables "Go Live" outside those
+  /// states, but the controller defends itself against a stale/overlapping
+  /// call regardless. If the native `prepare()` call reports failure
+  /// (`PrepareResult.ok == false`), emits [ErrorState] with the reported
+  /// `error`/`detail` and never calls `start()`.
   Future<void> goLive(
     GazerSettings settings, {
     required List<VideoDevice> devices,
@@ -87,63 +102,90 @@ class PipelineController {
     required FeatureFlags flags,
     OutputOrientation orientation = OutputOrientation.landscape,
   }) async {
-    final issues = const TargetValidator().validate(settings.target);
-    final hasCredentials =
-        (settings.target.username ?? '').isNotEmpty ||
-        (settings.target.password ?? '').isNotEmpty;
-    if (hasCredentials && !flags.isEnabled(FlagKeys.rtmpAuth)) {
-      issues.add(
-        const ValidationIssue(field: 'auth', messageKey: 'rtmpAuthDisabled'),
+    if (_goingLive) {
+      throw StateError('goLive() is already in progress');
+    }
+    if (current is! IdleState &&
+        current is! ReadyState &&
+        current is! ErrorState) {
+      throw StateError(
+        'goLive() can only be called from Idle, Ready, or Error states (current: $_current)',
       );
     }
-    if (!devices.any((d) => d.id == videoDeviceId)) {
-      issues.add(
-        const ValidationIssue(
-          field: 'videoDeviceId',
-          messageKey: 'errorDeviceNotFound',
-        ),
+    _goingLive = true;
+    try {
+      final issues = const TargetValidator().validate(settings.target);
+      final hasCredentials =
+          (settings.target.username ?? '').isNotEmpty ||
+          (settings.target.password ?? '').isNotEmpty;
+      if (hasCredentials && !flags.isEnabled(FlagKeys.rtmpAuth)) {
+        issues.add(
+          const ValidationIssue(field: 'auth', messageKey: 'rtmpAuthDisabled'),
+        );
+      }
+      if (!devices.any((d) => d.id == videoDeviceId)) {
+        issues.add(
+          const ValidationIssue(
+            field: 'videoDeviceId',
+            messageKey: 'errorDeviceNotFound',
+          ),
+        );
+      }
+      if (issues.isNotEmpty) {
+        throw ArgumentError(
+          issues.map((i) => '${i.field}:${i.messageKey}').join(', '),
+        );
+      }
+
+      _cancelled = false;
+      _reconnectAttempt = 0;
+      _streamStartedAt = null;
+      _bitrateSampleSum = 0;
+      _bitrateSampleCount = 0;
+      _statsSnapshot = StreamStats.zero();
+      _statsController.add(_statsSnapshot);
+
+      final adaptive =
+          settings.quality.adaptiveBitrate &&
+          flags.isEnabled(FlagKeys.adaptiveBitrate);
+      final config = StreamConfig(
+        videoDeviceId: videoDeviceId,
+        audioDeviceId: _audioDeviceIdFor(settings.audio),
+        width: settings.quality.resolution.width,
+        height: settings.quality.resolution.height,
+        fps: settings.quality.frameRate.value,
+        videoBitrateKbps: settings.quality.videoBitrateKbps,
+        adaptiveBitrate: adaptive,
+        audioBitrateKbps: kAudioBitrateKbps,
+        orientation: orientation,
       );
-    }
-    if (issues.isNotEmpty) {
-      throw ArgumentError(
-        issues.map((i) => '${i.field}:${i.messageKey}').join(', '),
+
+      final sendCredentials = flags.isEnabled(FlagKeys.rtmpAuth);
+      _pendingTarget = StreamTarget(
+        url: TargetValidator.effectiveUrl(settings.target),
+        username: sendCredentials ? settings.target.username : null,
+        password: sendCredentials ? settings.target.password : null,
       );
+
+      _emit(const PreparingState());
+      final result = await _host.prepare(config);
+      if (!result.ok) {
+        _emit(
+          ErrorState(
+            GazerError(
+              code: result.error ?? GazerErrorCode.encoderFailed,
+              detail: result.detail,
+            ),
+          ),
+        );
+        return;
+      }
+      _emit(const ReadyState());
+      _emit(const ConnectingState());
+      await _host.start(_pendingTarget!);
+    } finally {
+      _goingLive = false;
     }
-
-    _cancelled = false;
-    _reconnectAttempt = 0;
-    _streamStartedAt = null;
-    _bitrateSamples.clear();
-    _statsSnapshot = StreamStats.zero();
-    _statsController.add(_statsSnapshot);
-
-    final adaptive =
-        settings.quality.adaptiveBitrate &&
-        flags.isEnabled(FlagKeys.adaptiveBitrate);
-    final config = StreamConfig(
-      videoDeviceId: videoDeviceId,
-      audioDeviceId: _audioDeviceIdFor(settings.audio),
-      width: settings.quality.resolution.width,
-      height: settings.quality.resolution.height,
-      fps: settings.quality.frameRate.value,
-      videoBitrateKbps: settings.quality.videoBitrateKbps,
-      adaptiveBitrate: adaptive,
-      audioBitrateKbps: kAudioBitrateKbps,
-      orientation: orientation,
-    );
-
-    final sendCredentials = flags.isEnabled(FlagKeys.rtmpAuth);
-    _pendingTarget = StreamTarget(
-      url: TargetValidator.effectiveUrl(settings.target),
-      username: sendCredentials ? settings.target.username : null,
-      password: sendCredentials ? settings.target.password : null,
-    );
-
-    _emit(const PreparingState());
-    await _host.prepare(config);
-    _emit(const ReadyState());
-    _emit(const ConnectingState());
-    await _host.start(_pendingTarget!);
   }
 
   /// Requests a clean stop and cancels any pending reconnect retry.
@@ -179,6 +221,9 @@ class PipelineController {
         _emit(const ConnectingState());
       case NativePipelineState.streaming:
         _streamStartedAt ??= DateTime.now();
+        // Recovery resets the reconnect budget: each new outage gets its
+        // own 10-attempt window and restarts backoff from attempt 1.
+        _reconnectAttempt = 0;
         _emit(const StreamingState());
       case NativePipelineState.stopping:
         _emit(const StoppingState());
@@ -212,15 +257,15 @@ class PipelineController {
 
   Future<void> _retryAfter(Duration delay) async {
     await _sleeper(delay);
-    if (_cancelled || _pendingTarget == null) return;
+    if (_isDisposed || _cancelled || _pendingTarget == null) return;
     _emit(const ConnectingState());
     await _host.start(_pendingTarget!);
   }
 
   void _onNativeStats(StatsSample sample) {
-    _bitrateSamples.add(sample.bitrateKbps);
-    final average =
-        _bitrateSamples.reduce((a, b) => a + b) / _bitrateSamples.length;
+    _bitrateSampleSum += sample.bitrateKbps;
+    _bitrateSampleCount += 1;
+    final average = _bitrateSampleSum / _bitrateSampleCount;
     final uptime = _streamStartedAt == null
         ? Duration.zero
         : DateTime.now().difference(_streamStartedAt!);
@@ -237,12 +282,21 @@ class PipelineController {
   }
 
   void _emit(PipelineState next) {
+    if (_isDisposed) return;
     _current = next;
     _stateController.add(next);
   }
 
   /// Cancels native-event subscriptions and closes both broadcast streams.
+  ///
+  /// Sets [_isDisposed] before tearing anything down, so a reconnect retry
+  /// already in flight (waiting on the injected sleeper) becomes a no-op
+  /// when it resumes instead of emitting on a closed [StreamController] or
+  /// issuing a stray `start()` — see [_emit] and [_retryAfter]. Idempotent:
+  /// a second call is a no-op.
   void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
     _stateSub.cancel();
     _statsSub.cancel();
     _stateController.close();
