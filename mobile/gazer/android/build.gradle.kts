@@ -65,9 +65,27 @@ subprojects {
 // packages examined is a FAILURE, not a pass (critical-rules.md Verification Integrity). Scoped
 // to :app only, from this ROOT build file, so android/app/build.gradle.kts (owned by another
 // concurrent task) does not need to be touched. `android/app/gradle.lockfile` is generated via
-// `./gradlew :app:dependencies --write-locks` and committed; osv-scanner then scans that lockfile
-// directly instead of a directory walk that could legitimately find nothing.
+// `./gradlew :generateLockfiles` and committed; osv-scanner then scans that lockfile directly
+// instead of a directory walk that could legitimately find nothing.
 project(":app") {
+    configurations.all {
+        // org.jetbrains.kotlin:kotlin-stdlib-common is the Kotlin Multiplatform "common" metadata
+        // artifact; this app has no Kotlin Multiplatform common source set, and everything it
+        // could provide is already a subset of org.jetbrains.kotlin:kotlin-stdlib (the JVM
+        // artifact, which every configuration below already resolves). Some transitive dependency
+        // in this graph still declares it, and its resolution onto specific configurations
+        // (:app:debugRuntimeClasspath, :app:releaseRuntimeClasspath, :app:releaseCompileClasspath)
+        // proved NON-DETERMINISTIC across separate, individually clean `./gradlew` invocations --
+        // confirmed on GitHub Actions' own genuinely fresh runners, not just local caching
+        // artifacts (CI run 34484770058: android-unit and build both failed on
+        // ":app:debugRuntimeClasspath"/":app:releaseRuntimeClasspath" needing
+        // kotlin-stdlib-common:2.4.0 "not part of the dependency lock state"; a lockfile
+        // hand-edited to add it then failed the opposite way -- "did not resolve ... which is
+        // part of the dependency lock state" -- proving the artifact's actual presence in a given
+        // configuration's resolved graph is unstable, not just under- or over-locked). Excluding
+        // it here removes the instability at its source rather than chasing an unstable lock.
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-common")
+    }
     dependencyLocking {
         lockAllConfigurations()
     }
