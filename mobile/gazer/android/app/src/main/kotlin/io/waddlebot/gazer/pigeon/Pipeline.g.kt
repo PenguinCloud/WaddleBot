@@ -492,9 +492,7 @@ data class StreamConfig(
     }
 
     override fun toString(): String =
-        "StreamConfig(videoDeviceId=$videoDeviceId, audioDeviceId=$audioDeviceId, " +
-            "width=$width, height=$height, fps=$fps, videoBitrateKbps=$videoBitrateKbps, " +
-            "adaptiveBitrate=$adaptiveBitrate, audioBitrateKbps=$audioBitrateKbps, orientation=$orientation)"
+        "StreamConfig(videoDeviceId=$videoDeviceId, audioDeviceId=$audioDeviceId, width=$width, height=$height, fps=$fps, videoBitrateKbps=$videoBitrateKbps, adaptiveBitrate=$adaptiveBitrate, audioBitrateKbps=$audioBitrateKbps, orientation=$orientation)"
 }
 
 /**
@@ -618,8 +616,7 @@ data class PrepareResult(
     }
 
     override fun toString(): String =
-        "PrepareResult(ok=$ok, error=$error, detail=$detail, negotiatedWidth=$negotiatedWidth, " +
-            "negotiatedHeight=$negotiatedHeight, negotiatedFps=$negotiatedFps, negotiatedFormat=$negotiatedFormat)"
+        "PrepareResult(ok=$ok, error=$error, detail=$detail, negotiatedWidth=$negotiatedWidth, negotiatedHeight=$negotiatedHeight, negotiatedFps=$negotiatedFps, negotiatedFormat=$negotiatedFormat)"
 }
 
 /**
@@ -680,8 +677,7 @@ data class StatsSample(
     }
 
     override fun toString(): String =
-        "StatsSample(bitrateKbps=$bitrateKbps, fps=$fps, droppedVideoFrames=$droppedVideoFrames, " +
-            "sentBytes=$sentBytes, congestionPercent=$congestionPercent)"
+        "StatsSample(bitrateKbps=$bitrateKbps, fps=$fps, droppedVideoFrames=$droppedVideoFrames, sentBytes=$sentBytes, congestionPercent=$congestionPercent)"
 }
 
 /**

@@ -74,6 +74,20 @@ jacoco {
     toolVersion = libs.versions.jacoco.get()
 }
 
+// Pigeon-generated Kotlin (android/app/src/main/kotlin/io/waddlebot/gazer/pigeon/) is not
+// hand-maintained: its toString() overrides come out of the Pigeon 28.0.0 Kotlin template as a
+// single line per class and can exceed ktlint's max-line-length (140) rule, which ktlintFormat
+// cannot auto-correct (wrapping a string-template expression across lines is a semantic choice
+// the formatter won't make for you). Regenerating via `make mobile-codegen` is expected to
+// reproduce this on every run, so linting this directory would fail on generated code no author
+// ever hand-edits. Excluded from ktlint entirely -- mirrors the JaCoCo "**/pigeon/**" exclusion
+// in the jacocoTestReport task below for the same reason (generated code, not authored code).
+ktlint {
+    filter {
+        exclude { it.file.path.contains("/pigeon/") }
+    }
+}
+
 dependencies {
     implementation(libs.rootencoder.library)
     implementation(libs.kotlinx.coroutines.core)
