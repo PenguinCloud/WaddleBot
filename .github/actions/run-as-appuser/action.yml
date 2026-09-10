@@ -1,0 +1,45 @@
+name: Run as appuser
+description: >-
+  Hands the checked-out $GITHUB_WORKSPACE and appuser's home directory to appuser (uid 1000),
+  then runs one command as appuser inside a job container whose own checkout/cache/artifact
+  steps must run as root -- GitHub Actions job containers cannot run those as a non-root user
+  whose uid does not match the hosted runner's own account (actions/checkout#956, #1575). Every
+  actual toolchain command (flutter/dart/gradlew/osv-scanner/semgrep/gitleaks) in gazer-mobile.yml
+  runs through this action so it still executes rootless, matching the project's rootless
+  container mandate for the workload itself -- root only ever touches the one-time chown below.
+inputs:
+  working-directory:
+    description: Directory, relative to $GITHUB_WORKSPACE, to run the command from.
+    required: true
+  command:
+    description: Shell command to execute as appuser.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Hand workspace to appuser
+      shell: bash
+      run: chown -R appuser:appuser "$GITHUB_WORKSPACE" /home/appuser
+
+    - name: Run command as appuser
+      shell: bash
+      env:
+        RUN_AS_APPUSER_DIR: ${{ inputs.working-directory }}
+        RUN_AS_APPUSER_CMD: ${{ inputs.command }}
+      # RUN_AS_APPUSER_DIR/_CMD are carried in via `env:` and referenced as ordinary shell
+      # variables (positional args $1/$2 inside the inner bash -c) instead of being interpolated
+      # directly into this run: body -- splicing `${{ inputs.* }}` straight into the script text
+      # would let shell metacharacters in an input break out of the intended command (zizmor
+      # template-injection). HOME/PUB_CACHE/GRADLE_USER_HOME are set explicitly inside the
+      # runuser'd shell because GitHub's container-job runtime injects HOME=/github/home
+      # (root-owned) for every step, which would otherwise leak into the appuser shell.
+      run: |
+        runuser -u appuser -- bash -c '
+          set -euo pipefail
+          export HOME=/home/appuser
+          export PUB_CACHE=/home/appuser/.pub-cache
+          export GRADLE_USER_HOME=/home/appuser/.gradle
+          test "$(id -u)" = 1000
+          cd "$1"
+          eval "$2"
+        ' _ "$GITHUB_WORKSPACE/$RUN_AS_APPUSER_DIR" "$RUN_AS_APPUSER_CMD"

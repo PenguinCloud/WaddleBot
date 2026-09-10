@@ -59,6 +59,20 @@ subprojects {
     }
 }
 
+// Gradle dependency locking, :app only (controller ruling R16, Task 3 CI security gate).
+// osv-scanner's Gradle-side scan had nothing to examine (no gradle.lockfile existed anywhere in
+// the project), so the CI security job's Gradle vulnerability check passed vacuously -- zero
+// packages examined is a FAILURE, not a pass (critical-rules.md Verification Integrity). Scoped
+// to :app only, from this ROOT build file, so android/app/build.gradle.kts (owned by another
+// concurrent task) does not need to be touched. `android/app/gradle.lockfile` is generated via
+// `./gradlew :app:dependencies --write-locks` and committed; osv-scanner then scans that lockfile
+// directly instead of a directory walk that could legitimately find nothing.
+project(":app") {
+    dependencyLocking {
+        lockAllConfigurations()
+    }
+}
+
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
