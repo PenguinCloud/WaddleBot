@@ -16298,7 +16298,7 @@ class OtlpHttpExporter {
   }) {
     final Map<String, List<OtlpMetricPoint>> byNameAndKind = <String, List<OtlpMetricPoint>>{};
     for (final OtlpMetricPoint p in points) {
-      byNameAndKind.putIfAbsent('${p.name} ${p.kind}', () => <OtlpMetricPoint>[]).add(p);
+      byNameAndKind.putIfAbsent('${p.name}|${p.kind}', () => <OtlpMetricPoint>[]).add(p);
     }
     return <String, Object?>{
       'resourceMetrics': <Map<String, Object?>>[
