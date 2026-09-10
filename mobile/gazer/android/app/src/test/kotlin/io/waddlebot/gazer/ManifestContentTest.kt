@@ -30,6 +30,10 @@ class ManifestContentTest {
         }
     }
 
+    /**
+     * Returns every `android:name` value declared by a `uses-permission` element in the parsed
+     * manifest, in document order — the shared lookup each permission-focused test filters.
+     */
     private fun permissionNames(): List<String> {
         val nodes = document.getElementsByTagName("uses-permission")
         return (0 until nodes.length).map { (nodes.item(it) as Element).getAttribute("android:name") }
