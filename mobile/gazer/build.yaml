@@ -1,0 +1,10 @@
+targets:
+  $default:
+    builders:
+      json_serializable:
+        options:
+          # Nested freezed classes (e.g. GazerSettings.target/quality) must
+          # have their own toJson() called explicitly, or the generated
+          # toJson embeds the raw object instead of a Map, breaking
+          # round-trips. See lib/models/gazer_settings.dart.
+          explicit_to_json: true
