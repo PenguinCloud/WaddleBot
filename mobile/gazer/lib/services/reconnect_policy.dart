@@ -80,10 +80,10 @@ class ReconnectPolicy {
   /// Parameters:
   /// - [attempt]: 1-based attempt number
   ///
-  /// Returns a Duration, or null if attempt exceeds [maxAttempts].
+  /// Returns a Duration, or null if attempt is outside [1, maxAttempts].
   /// Jitter is applied as ±fraction of the final (capped) delay.
   Duration? delayFor(int attempt) {
-    if (attempt > maxAttempts) {
+    if (attempt < 1 || attempt > maxAttempts) {
       return null;
     }
 

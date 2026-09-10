@@ -76,6 +76,13 @@ void main() {
       expect(policy.delayFor(100), isNull);
     });
 
+    test('delayFor(0) returns null (attempts are 1-based)', () {
+      final policy = ReconnectPolicy();
+      expect(policy.delayFor(0), isNull);
+      expect(policy.delayFor(-1), isNull);
+      expect(policy.delayFor(-100), isNull);
+    });
+
     test('jitter bounds: ±20% applied to capped delay', () {
       // nextDouble() == 0.0 => jitter = -20%, lowest value
       final policyMin = ReconnectPolicy(random: _FakeRandom(0.0));
