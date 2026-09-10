@@ -4,9 +4,11 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../config/constants.dart';
 import '../models/license_state.dart';
 import '../services/device_id.dart';
 import '../services/feature_flags.dart';
+import '../services/keepalive_scheduler.dart';
 import '../services/license_client.dart';
 
 part 'license_provider.g.dart';
@@ -53,4 +55,27 @@ FeatureFlags featureFlags(Ref ref) {
   final asyncState = ref.watch(licenseProvider);
   final state = asyncState.value ?? LicenseState.initial('');
   return FeatureFlags(state);
+}
+
+/// The app-wide [KeepaliveScheduler], pinging the license server every
+/// [kLicenseKeepaliveInterval] while foregrounded — [GazerApp] starts it
+/// once the first [license] fetch resolves and drives it thereafter via
+/// `WidgetsBindingObserver.didChangeAppLifecycleState`.
+///
+/// `ref.onDispose(scheduler.stop)` guarantees the underlying [Timer] is
+/// always cancelled when the provider container is disposed — including
+/// in widget tests, where every `pumpGazerApp` call creates a fresh
+/// `ProviderScope` that must never leak a pending [Timer] into the next
+/// test.
+@Riverpod(keepAlive: true)
+KeepaliveScheduler keepaliveScheduler(Ref ref) {
+  final scheduler = KeepaliveScheduler(
+    ping: () async {
+      final LicenseClient client = await ref.read(licenseClientProvider.future);
+      await client.keepalive();
+    },
+    interval: kLicenseKeepaliveInterval,
+  );
+  ref.onDispose(scheduler.stop);
+  return scheduler;
 }

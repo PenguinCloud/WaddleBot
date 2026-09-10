@@ -180,3 +180,83 @@ final class FeatureFlagsProvider
 }
 
 String _$featureFlagsHash() => r'5824535ddd6eab1f0d0e7c4e389e780b96698a47';
+
+/// The app-wide [KeepaliveScheduler], pinging the license server every
+/// [kLicenseKeepaliveInterval] while foregrounded — [GazerApp] starts it
+/// once the first [license] fetch resolves and drives it thereafter via
+/// `WidgetsBindingObserver.didChangeAppLifecycleState`.
+///
+/// `ref.onDispose(scheduler.stop)` guarantees the underlying [Timer] is
+/// always cancelled when the provider container is disposed — including
+/// in widget tests, where every `pumpGazerApp` call creates a fresh
+/// `ProviderScope` that must never leak a pending [Timer] into the next
+/// test.
+
+@ProviderFor(keepaliveScheduler)
+final keepaliveSchedulerProvider = KeepaliveSchedulerProvider._();
+
+/// The app-wide [KeepaliveScheduler], pinging the license server every
+/// [kLicenseKeepaliveInterval] while foregrounded — [GazerApp] starts it
+/// once the first [license] fetch resolves and drives it thereafter via
+/// `WidgetsBindingObserver.didChangeAppLifecycleState`.
+///
+/// `ref.onDispose(scheduler.stop)` guarantees the underlying [Timer] is
+/// always cancelled when the provider container is disposed — including
+/// in widget tests, where every `pumpGazerApp` call creates a fresh
+/// `ProviderScope` that must never leak a pending [Timer] into the next
+/// test.
+
+final class KeepaliveSchedulerProvider
+    extends
+        $FunctionalProvider<
+          KeepaliveScheduler,
+          KeepaliveScheduler,
+          KeepaliveScheduler
+        >
+    with $Provider<KeepaliveScheduler> {
+  /// The app-wide [KeepaliveScheduler], pinging the license server every
+  /// [kLicenseKeepaliveInterval] while foregrounded — [GazerApp] starts it
+  /// once the first [license] fetch resolves and drives it thereafter via
+  /// `WidgetsBindingObserver.didChangeAppLifecycleState`.
+  ///
+  /// `ref.onDispose(scheduler.stop)` guarantees the underlying [Timer] is
+  /// always cancelled when the provider container is disposed — including
+  /// in widget tests, where every `pumpGazerApp` call creates a fresh
+  /// `ProviderScope` that must never leak a pending [Timer] into the next
+  /// test.
+  KeepaliveSchedulerProvider._()
+    : super(
+        from: null,
+        argument: null,
+        retry: null,
+        name: r'keepaliveSchedulerProvider',
+        isAutoDispose: false,
+        dependencies: null,
+        $allTransitiveDependencies: null,
+      );
+
+  @override
+  String debugGetCreateSourceHash() => _$keepaliveSchedulerHash();
+
+  @$internal
+  @override
+  $ProviderElement<KeepaliveScheduler> $createElement(
+    $ProviderPointer pointer,
+  ) => $ProviderElement(pointer);
+
+  @override
+  KeepaliveScheduler create(Ref ref) {
+    return keepaliveScheduler(ref);
+  }
+
+  /// {@macro riverpod.override_with_value}
+  Override overrideWithValue(KeepaliveScheduler value) {
+    return $ProviderOverride(
+      origin: this,
+      providerOverride: $SyncValueProvider<KeepaliveScheduler>(value),
+    );
+  }
+}
+
+String _$keepaliveSchedulerHash() =>
+    r'3313b05822d1e655916ae16975e9048d52bd963f';

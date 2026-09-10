@@ -12,6 +12,7 @@ import 'package:gazer/providers/settings_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
 import 'package:gazer/screens/home_screen.dart';
 import 'package:gazer/screens/settings_screen.dart';
+import 'package:gazer/services/keepalive_scheduler.dart';
 
 import 'helpers/fake_host_api.dart';
 import 'helpers/fakes.dart';
@@ -66,4 +67,31 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(SettingsScreen), findsOneWidget);
   });
+
+  testWidgets(
+    'keepalive scheduler starts after the first license fetch and stops on paused',
+    (WidgetTester tester) async {
+      late KeepaliveScheduler scheduler;
+      await pumpGazerApp(
+        tester,
+        overrides: <Override>[
+          ...overrides(),
+          keepaliveSchedulerProvider.overrideWith((Ref ref) {
+            scheduler = KeepaliveScheduler(
+              ping: () async {},
+              interval: const Duration(minutes: 5),
+            );
+            ref.onDispose(scheduler.stop);
+            return scheduler;
+          }),
+        ],
+      );
+
+      expect(scheduler.isRunning, isTrue);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump();
+      expect(scheduler.isRunning, isFalse);
+    },
+  );
 }

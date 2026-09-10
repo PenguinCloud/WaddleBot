@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_libs/flutter_libs.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import 'l10n/app_localizations.dart';
+import 'providers/license_provider.dart';
 import 'screens/home_screen.dart';
 import 'screens/settings_screen.dart';
 
@@ -37,7 +41,7 @@ final GoRouter gazerRouter = GoRouter(
 /// set to the same Elder-dark [ThemeData], so the app renders dark
 /// regardless of the platform brightness setting (house rule: dark
 /// default for client apps with a single supported theme).
-class GazerApp extends StatelessWidget {
+class GazerApp extends ConsumerStatefulWidget {
   const GazerApp({super.key});
 
   static ThemeData get _elderDarkTheme => ThemeData.dark().copyWith(
@@ -51,12 +55,53 @@ class GazerApp extends StatelessWidget {
   );
 
   @override
+  ConsumerState<GazerApp> createState() => _GazerAppState();
+}
+
+/// Owns the app-wide [KeepaliveScheduler] lifecycle: starts it once the
+/// first [licenseProvider] fetch resolves (success or degraded/offline —
+/// [LicenseClient] never throws), then starts/stops it on every
+/// subsequent foreground/background transition via
+/// [WidgetsBindingObserver].
+class _GazerAppState extends ConsumerState<GazerApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_startKeepaliveAfterFirstFetch());
+  }
+
+  Future<void> _startKeepaliveAfterFirstFetch() async {
+    try {
+      await ref.read(licenseProvider.future);
+    } catch (_) {
+      // LicenseClient never throws by contract; if this ever fires we
+      // still want the keepalive loop foregrounded rather than silently
+      // never starting.
+    }
+    if (!mounted) return;
+    ref.read(keepaliveSchedulerProvider).start();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    ref.read(keepaliveSchedulerProvider).onLifecycle(state);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
       onGenerateTitle: (BuildContext context) =>
           AppLocalizations.of(context).appTitle,
-      theme: _elderDarkTheme,
-      darkTheme: _elderDarkTheme,
+      theme: GazerApp._elderDarkTheme,
+      darkTheme: GazerApp._elderDarkTheme,
       themeMode: ThemeMode.system,
       routerConfig: gazerRouter,
       localizationsDelegates: AppLocalizations.localizationsDelegates,
