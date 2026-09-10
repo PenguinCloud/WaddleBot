@@ -121,7 +121,7 @@ jobs:
 
       - name: flutter pub get
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -130,7 +130,7 @@ jobs:
 
       - name: flutter analyze
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -139,7 +139,7 @@ jobs:
 
       - name: dart format check
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -169,7 +169,7 @@ jobs:
 
       - name: flutter pub get
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -178,7 +178,7 @@ jobs:
 
       - name: flutter test --coverage
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -187,7 +187,7 @@ jobs:
 
       - name: Coverage gate (>=90%)
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -224,7 +224,7 @@ jobs:
 
       - name: flutter pub get
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -233,7 +233,7 @@ jobs:
 
       - name: gradlew testDebugUnitTest jacocoTestReport
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer/android"
@@ -242,7 +242,7 @@ jobs:
 
       - name: Coverage gate (>=90%)
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -279,7 +279,7 @@ jobs:
 
       - name: flutter pub get
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -288,7 +288,7 @@ jobs:
 
       - name: flutter build apk --split-per-abi
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -297,7 +297,7 @@ jobs:
 
       - name: flutter build appbundle
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -341,7 +341,7 @@ jobs:
 
       - name: flutter pub get
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -350,7 +350,7 @@ jobs:
 
       - name: osv-scanner (pubspec.lock)
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -365,7 +365,7 @@ jobs:
         # lockfile that does exist. Matches the equivalent fix in the Makefile's mobile-security
         # target (Task 3 osv-scanner path/flag fix).
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer/android"
@@ -374,7 +374,7 @@ jobs:
 
       - name: semgrep
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
@@ -383,7 +383,7 @@ jobs:
 
       - name: gitleaks
         run: |
-          runuser --preserve-environment -u appuser -- bash -eo pipefail -c '
+          runuser -u appuser -- bash -eo pipefail -c '
             id -u
             test "$(id -u)" = 1000
             cd "$GITHUB_WORKSPACE/mobile/gazer"
