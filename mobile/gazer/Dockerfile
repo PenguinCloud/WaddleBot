@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ninja-build \
         clang \
         python3 \
+        python3-venv \
         file \
     && rm -rf /var/lib/apt/lists/*
 
@@ -52,6 +53,47 @@ RUN curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public -o /
     && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# --- Security scanners for mobile-security (osv-scanner, gitleaks, semgrep) -
+# Installed here as root, before appuser exists, so mobile-security never
+# needs root at runtime. This image is amd64-only today (matches the host
+# this toolchain builds on) -- linux_amd64/linux_x64 assets are selected
+# explicitly; no arm64 branch is added until a genuine multi-arch need
+# exists (see devops-containers.md Multi-Arch Builds).
+
+# osv-scanner v2.5.1 (latest stable release as of 2026-09-11, verified via
+# `gh release list --repo google/osv-scanner`) -- linux_amd64 binary,
+# sha256 independently verified against the release's own
+# osv-scanner_SHA256SUMS file (re-downloaded and hashed directly, not just
+# read from the checksums file).
+ENV OSV_SCANNER_VERSION="2.5.1"
+ENV OSV_SCANNER_SHA256="f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be"
+RUN curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" -o /tmp/osv-scanner \
+    && echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum -c - \
+    && install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner \
+    && rm /tmp/osv-scanner
+
+# gitleaks v8.30.1 (latest stable release as of 2026-09-11, verified via
+# `gh release list --repo gitleaks/gitleaks`) -- linux_x64 tarball, sha256
+# independently verified against the release's own
+# gitleaks_8.30.1_checksums.txt file (re-downloaded and hashed directly).
+ENV GITLEAKS_VERSION="8.30.1"
+ENV GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+RUN curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz \
+    && echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks \
+    && install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks \
+    && rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks
+
+# semgrep 1.176.1 (latest stable on PyPI as of 2026-09-11, verified via
+# https://pypi.org/pypi/semgrep/json) -- installed into its own venv (not
+# system python3, which stays free for other tooling) and symlinked onto
+# PATH. Exact version pinned; `pip install semgrep` with no pin is
+# forbidden by critical-rules.md Dependency Pinning.
+ENV SEMGREP_VERSION="1.176.1"
+RUN python3 -m venv /opt/semgrep \
+    && /opt/semgrep/bin/pip install --no-cache-dir "semgrep==${SEMGREP_VERSION}" \
+    && ln -s /opt/semgrep/bin/semgrep /usr/local/bin/semgrep
 
 # --- Non-root user (UID 1000) ----------------------------------------------
 # ubuntu:24.04 ships a stock "ubuntu" user/group already at uid/gid 1000 --
