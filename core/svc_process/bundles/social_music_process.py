@@ -99,7 +99,7 @@ async def transform(event: PlatformEvent) -> PlatformEvent | None:
 
     ctx = get_bundle_context()
     enabled = await feature_enabled(
-        _FEATURE_FLAG, tenant=ctx.tenant, community=_community_id(ctx.community), default=False
+        _FEATURE_FLAG, tenant=ctx.tenant, community=_community_id(ctx.community), default=True
     )
     if not enabled:
         return None  # feature disabled -- behaves like an unrecognized command
