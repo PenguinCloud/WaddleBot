@@ -63,14 +63,36 @@ class LicenseClient {
   /// Validates this install and fetches its feature flags.
   ///
   /// Success -> `valid` with fresh flags and `lastFetched = now()`.
-  /// Network error with a cache fetched within [kLicenseGracePeriod] ->
-  /// `gracePeriod` with the cached flags. Network error with a stale or
+  /// Network error with a cache fetched less than [kLicenseGracePeriod] ago
+  /// -> `gracePeriod` with the cached flags. Network error with a stale or
   /// absent cache -> `unknown`. A 4xx response -> `invalid`. Any other
-  /// failure (including a malformed response body) is swallowed and
-  /// treated the same as a network error — this method never throws.
+  /// failure — including a malformed response body, a device-id provider
+  /// failure, or a corrupted cache — is swallowed and degrades to a cached
+  /// or `unknown` result. This method never throws.
   Future<LicenseState> validateAndFetchFlags() async {
-    final deviceId = await _deviceIdProvider.deviceId();
-    final cached = await _cache.read();
+    String? deviceId;
+    try {
+      deviceId = await _deviceIdProvider.deviceId();
+    } catch (_) {
+      deviceId = null;
+    }
+
+    LicenseState? cached;
+    try {
+      cached = await _cache.read();
+    } catch (_) {
+      // A corrupted cache is treated exactly like no cache at all.
+      cached = null;
+    }
+
+    if (deviceId == null) {
+      // No device id available: never call the server without a real one
+      // -- degrade exactly like a network failure, using the cached device
+      // id (if any) only to shape the returned LicenseState, never sent
+      // anywhere.
+      return _offlineFallback(cached, cached?.deviceId ?? '');
+    }
+
     try {
       await _dio.post<dynamic>('$baseUrl/validate', data: _payload(deviceId));
       final response = await _dio.post<dynamic>(
@@ -92,6 +114,10 @@ class LicenseClient {
     } on DioException catch (e) {
       final statusCode = e.response?.statusCode;
       if (statusCode != null && statusCode >= 400 && statusCode < 500) {
+        // Cached even though invalid: lastFetched is deliberately left as
+        // whatever it was before this call (not reset to `now()`), so
+        // `_offlineFallback`'s grace-period math still grades off the last
+        // *successful* fetch, not off this invalid response.
         final invalid = LicenseState(
           status: LicenseStatus.invalid,
           flags: cached?.flags ?? const {},
@@ -107,10 +133,15 @@ class LicenseClient {
     }
   }
 
-  /// Fire-and-forget keepalive ping; failures are swallowed silently.
+  /// Fire-and-forget keepalive ping; failures — including a device-id
+  /// provider failure — are swallowed silently.
   Future<void> keepalive() async {
-    final deviceId = await _deviceIdProvider.deviceId();
-    unawaited(_sendKeepalive(deviceId));
+    try {
+      final deviceId = await _deviceIdProvider.deviceId();
+      unawaited(_sendKeepalive(deviceId));
+    } catch (_) {
+      // No device id available -- nothing to keep alive.
+    }
   }
 
   /// Wrapped in its own `async` body so that a synchronous throw from
@@ -125,9 +156,14 @@ class LicenseClient {
     }
   }
 
+  /// Degrades to a cached result when the server can't be reached (or no
+  /// device id could be resolved): `gracePeriod` with the cached flags if
+  /// [cached] was fetched strictly less than [kLicenseGracePeriod] ago,
+  /// otherwise `unknown` with whatever flags [cached] holds (or empty, if
+  /// there is no usable cache at all).
   LicenseState _offlineFallback(LicenseState? cached, String deviceId) {
     if (cached?.lastFetched != null &&
-        _now().difference(cached!.lastFetched!) <= kLicenseGracePeriod) {
+        _now().difference(cached!.lastFetched!) < kLicenseGracePeriod) {
       return cached.copyWith(status: LicenseStatus.gracePeriod);
     }
     return LicenseState(
@@ -138,6 +174,9 @@ class LicenseClient {
     );
   }
 
+  /// Builds the request body sent to `/validate`, `/features`, and
+  /// `/keepalive` — the resolved [deviceId] plus fixed product/component
+  /// identifiers identifying this app to the license server.
   Map<String, String> _payload(String deviceId) => {
     'device_id': deviceId,
     'product': 'waddlebot',

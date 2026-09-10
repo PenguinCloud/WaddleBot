@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gazer/config/constants.dart';
 import 'package:gazer/models/license_state.dart';
 import 'package:gazer/services/device_id.dart';
 import 'package:gazer/services/license_client.dart';
@@ -13,6 +14,11 @@ class _MockDio extends Mock implements Dio {}
 class _FakeDeviceIdProvider implements DeviceIdProvider {
   @override
   Future<String> deviceId() async => 'device-abc';
+}
+
+class _ThrowingDeviceIdProvider implements DeviceIdProvider {
+  @override
+  Future<String> deviceId() => throw Exception('device id unavailable');
 }
 
 void main() {
@@ -110,6 +116,31 @@ void main() {
       expect(state.status, LicenseStatus.gracePeriod);
       expect(state.flags['waddlebot.gazer.camera-stream'], isTrue);
     });
+
+    test(
+      'exactly at the grace boundary (== 7 days) -> unknown, not gracePeriod',
+      () async {
+        await cache.write(
+          LicenseState(
+            status: LicenseStatus.valid,
+            flags: const {'waddlebot.gazer.camera-stream': true},
+            lastFetched: fakeNow.subtract(kLicenseGracePeriod),
+            deviceId: 'device-abc',
+          ),
+        );
+        when(() => dio.post<dynamic>(any(), data: any(named: 'data')))
+            .thenThrow(
+              DioException(
+                requestOptions: RequestOptions(path: '/validate'),
+                type: DioExceptionType.connectionTimeout,
+              ),
+            );
+
+        final state = await buildClient().validateAndFetchFlags();
+
+        expect(state.status, LicenseStatus.unknown);
+      },
+    );
   });
 
   group('validateAndFetchFlags network error with stale cache', () {
@@ -147,6 +178,47 @@ void main() {
       expect(state.status, LicenseStatus.unknown);
       expect(state.flags, isEmpty);
     });
+  });
+
+  group('validateAndFetchFlags device id provider throws', () {
+    test('-> unknown, does not throw, and never calls the server', () async {
+      final client = LicenseClient(
+        dio: dio,
+        cache: cache,
+        deviceIdProvider: _ThrowingDeviceIdProvider(),
+        now: () => fakeNow,
+      );
+
+      final state = await client.validateAndFetchFlags();
+
+      expect(state.status, LicenseStatus.unknown);
+      expect(state.flags, isEmpty);
+      verifyNever(() => dio.post<dynamic>(any(), data: any(named: 'data')));
+    });
+  });
+
+  group('validateAndFetchFlags cache.read() throws', () {
+    test(
+      'corrupted cached JSON is treated as no cache -> unknown, not rethrown',
+      () async {
+        await SharedPreferencesAsync().setString(
+          'gazer.license.state',
+          'not-valid-json',
+        );
+        when(() => dio.post<dynamic>(any(), data: any(named: 'data')))
+            .thenThrow(
+              DioException(
+                requestOptions: RequestOptions(path: '/validate'),
+                type: DioExceptionType.connectionTimeout,
+              ),
+            );
+
+        final state = await buildClient().validateAndFetchFlags();
+
+        expect(state.status, LicenseStatus.unknown);
+        expect(state.flags, isEmpty);
+      },
+    );
   });
 
   group('validateAndFetchFlags 4xx response', () {
@@ -194,6 +266,20 @@ void main() {
       );
 
       await expectLater(buildClient().keepalive(), completes);
+    });
+  });
+
+  group('keepalive device id provider throws', () {
+    test('completes normally and never calls the server', () async {
+      final client = LicenseClient(
+        dio: dio,
+        cache: cache,
+        deviceIdProvider: _ThrowingDeviceIdProvider(),
+        now: () => fakeNow,
+      );
+
+      await expectLater(client.keepalive(), completes);
+      verifyNever(() => dio.post<dynamic>(any(), data: any(named: 'data')));
     });
   });
 }
