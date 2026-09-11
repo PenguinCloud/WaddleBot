@@ -3,6 +3,7 @@ package io.waddlebot.gazer.pipeline
 import io.waddlebot.gazer.pigeon.GazerErrorCode
 import io.waddlebot.gazer.pigeon.NativePipelineState
 import io.waddlebot.gazer.pigeon.StatsSample
+import org.junit.jupiter.api.Assertions.assertDoesNotThrow
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
@@ -88,5 +89,38 @@ class RelayPipelineListenerTest {
         relay.onState(NativePipelineState.IDLE, null, null)
 
         assertEquals(emptyList<NativePipelineState>(), listener.states)
+    }
+
+    @Test
+    fun `attaching a new listener during onState iteration does not throw`() {
+        val relay = RelayPipelineListener()
+        val lateJoiner = RecordingListener()
+        var alreadyAttached = false
+        val selfAttachingListener =
+            object : PipelineListener {
+                override fun onState(
+                    state: NativePipelineState,
+                    error: GazerErrorCode?,
+                    detail: String?,
+                ) {
+                    if (!alreadyAttached) {
+                        alreadyAttached = true
+                        relay.attach(lateJoiner)
+                    }
+                }
+
+                override fun onStats(sample: StatsSample) = Unit
+
+                override fun onAuthResult(ok: Boolean) = Unit
+            }
+        relay.attach(selfAttachingListener)
+
+        assertDoesNotThrow { relay.onState(NativePipelineState.STREAMING, null, null) }
+
+        // CopyOnWriteArrayList's iterator is a point-in-time snapshot: the listener attached
+        // mid-iteration above never sees that call, but does see every call after it.
+        assertEquals(emptyList<NativePipelineState>(), lateJoiner.states)
+        relay.onState(NativePipelineState.IDLE, null, null)
+        assertEquals(listOf(NativePipelineState.IDLE), lateJoiner.states)
     }
 }

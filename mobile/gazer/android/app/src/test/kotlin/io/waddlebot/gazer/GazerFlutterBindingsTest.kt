@@ -35,4 +35,22 @@ class GazerFlutterBindingsTest {
         verify { context.getSystemService(Context.CAMERA_SERVICE) }
         verify { flutterEngine.dartExecutor }
     }
+
+    @Test
+    fun `uninstall detaches GazerHostApi and disposes the installed impl without throwing`() {
+        val messenger = mockk<BinaryMessenger>(relaxed = true)
+        val dartExecutor = mockk<DartExecutor>(relaxed = true)
+        every { dartExecutor.binaryMessenger } returns messenger
+        val flutterEngine = mockk<FlutterEngine>(relaxed = true)
+        every { flutterEngine.dartExecutor } returns dartExecutor
+        val cameraManager = mockk<CameraManager>(relaxed = true)
+        val context = mockk<Context>(relaxed = true)
+        every { context.getSystemService(Context.CAMERA_SERVICE) } returns cameraManager
+        GazerFlutterBindings.install(flutterEngine, context)
+
+        assertDoesNotThrow { GazerFlutterBindings.uninstall(flutterEngine) }
+
+        // install + uninstall each read dartExecutor.binaryMessenger once.
+        verify(exactly = 2) { flutterEngine.dartExecutor }
+    }
 }

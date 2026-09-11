@@ -15,16 +15,20 @@ import androidx.core.app.NotificationCompat
 import io.waddlebot.gazer.pigeon.GazerErrorCode
 import io.waddlebot.gazer.pigeon.NativePipelineState
 import io.waddlebot.gazer.pigeon.StatsSample
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
 /**
  * Fans PipelineListener calls out to every attached listener, so PigeonHostApiImpl can attach
  * itself after binding without ever replacing StreamService's own wake-lock-controlling
  * listener - GazerPipeline's `listener` constructor field (fixed at construction, per the
- * SHARED CONTRACT) never changes.
+ * SHARED CONTRACT) never changes. Backed by [CopyOnWriteArrayList]: StatsSampler's own
+ * ScheduledExecutorService thread delivers `onStats` here concurrently with attach/detach calls
+ * that can happen on the main thread (PigeonHostApiImpl binding/unbinding), so a plain
+ * MutableList would risk a ConcurrentModificationException.
  */
 class RelayPipelineListener : PipelineListener {
-    private val listeners = mutableListOf<PipelineListener>()
+    private val listeners = CopyOnWriteArrayList<PipelineListener>()
 
     fun attach(listener: PipelineListener) {
         listeners.add(listener)
@@ -104,8 +108,15 @@ class StreamService : Service() {
                 context: Context,
                 intent: Intent,
             ) {
+                // isStopAction is the only decision here (already extracted, unit-tested in
+                // StreamServicePoliciesTest); the resulting teardown sequence below is fixed and
+                // entirely Service-framework-bound (pipeline.stop() needs the live pipeline,
+                // stopForeground()/stopSelf() need a real Service instance), so there is no
+                // further pure logic to pull out of this receiver.
                 if (isStopAction(intent.action)) {
                     pipeline.stop()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
                 }
             }
         }

@@ -222,4 +222,55 @@ class PigeonHostApiImplTest {
             assertEquals(GazerErrorCode.SERVICE_START_DENIED, result.error)
             coVerify { flutterApi.onStateChanged(any()) }
         }
+
+    @Test
+    fun `stop unbinds and stops the service, then the next prepare rebinds`() =
+        runBlocking {
+            impl.host = null
+            every { pipeline.prepare(config) } returns PrepareResult(ok = true)
+            val localBinder = StreamService.LocalBinder(pipelineProvider = { pipeline }, attachListener = {})
+            every { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) } answers {
+                impl.connection.onServiceConnected(null, localBinder)
+                true
+            }
+
+            impl.prepare(config)
+            impl.stop()
+
+            verify { pipeline.stop() }
+            verify { context.unbindService(impl.connection) }
+            assertNull(impl.host)
+
+            impl.prepare(config)
+
+            verify(exactly = 2) { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) }
+        }
+
+    @Test
+    fun `stop is idempotent - a second call does not unbind or stop again`() =
+        runBlocking {
+            impl.host = null
+            val localBinder = StreamService.LocalBinder(pipelineProvider = { pipeline }, attachListener = {})
+            every { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) } answers {
+                impl.connection.onServiceConnected(null, localBinder)
+                true
+            }
+            impl.prepare(config)
+
+            impl.stop()
+            impl.stop()
+
+            verify(exactly = 1) { context.unbindService(any()) }
+        }
+
+    @Test
+    fun `stop never unbinds when the host was injected directly rather than through a real bind`() =
+        runBlocking {
+            // impl.host is set directly by setUp() (test seam), never via a real bindService()
+            // call, so isBound is still false here - stop() must not call unbindService in that
+            // case (there is nothing real to unbind).
+            impl.stop()
+
+            verify(exactly = 0) { context.unbindService(any()) }
+        }
 }

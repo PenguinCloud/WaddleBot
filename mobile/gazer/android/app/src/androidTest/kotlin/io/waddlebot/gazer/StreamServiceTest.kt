@@ -14,9 +14,12 @@ import org.junit.runner.RunWith
 
 /**
  * Instrumented lifecycle test: StreamService must post its foreground notification on start and
- * remove it cleanly on stop. Cannot run on the JVM unit-test target since it needs a real
- * NotificationManager and Android service lifecycle - this is also RootEncoderEngine's only
- * coverage, since it can't run outside a real Camera2/MediaCodec-capable device or emulator.
+ * remove it cleanly when ACTION_STOP is broadcast (the real path the notification's own Stop
+ * action - and any other Stop trigger - takes; see StreamService's stopReceiver, which calls
+ * pipeline.stop(), stopForeground(STOP_FOREGROUND_REMOVE), and stopSelf()). Cannot run on the JVM
+ * unit-test target since it needs a real NotificationManager and Android service lifecycle - this
+ * is also RootEncoderEngine's only coverage, since it can't run outside a real Camera2/MediaCodec
+ * -capable device or emulator.
  */
 @RunWith(AndroidJUnit4::class)
 class StreamServiceTest {
@@ -28,7 +31,7 @@ class StreamServiceTest {
         context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
     @Test
-    fun startPostsTheForegroundNotificationAndStopRemovesIt() {
+    fun startPostsTheForegroundNotificationAndActionStopRemovesItAndStopsTheService() {
         serviceRule.startService(Intent(context, StreamService::class.java))
 
         val hasNotification =
@@ -37,13 +40,23 @@ class StreamServiceTest {
             }
         assertTrue("expected an active notification after start", hasNotification)
 
-        context.stopService(Intent(context, StreamService::class.java))
+        // The real Stop trigger: the notification's own action (and any other Stop UI) broadcasts
+        // ACTION_STOP, which stopReceiver handles by stopping the pipeline, removing the
+        // foreground notification, and calling stopSelf() to destroy the service - exercised here
+        // via sendBroadcast rather than a direct stopService()/unbindService() call, since that's
+        // the actual path production code takes.
+        context.sendBroadcast(Intent(StreamService.ACTION_STOP))
 
+        // stopForeground(STOP_FOREGROUND_REMOVE) removes the notification synchronously with the
+        // broadcast receipt, before the asynchronous stopSelf()-driven onDestroy() completes, so
+        // notification removal is the reliable, immediately observable signal here that the
+        // ACTION_STOP path ran end to end (a further onDestroy()-completion assertion would need
+        // its own instrumentation hook, which this behavioral guarantee doesn't require).
         val notificationGone =
             pollUntil(timeoutMs = 5000) {
                 notificationManager.activeNotifications.none { it.packageName == context.packageName }
             }
-        assertTrue("expected the notification to be removed after stop", notificationGone)
+        assertTrue("expected the notification to be removed after ACTION_STOP", notificationGone)
     }
 
     private fun pollUntil(

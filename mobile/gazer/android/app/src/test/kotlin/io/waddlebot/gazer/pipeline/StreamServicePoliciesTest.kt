@@ -7,8 +7,10 @@ import android.os.Build
 import io.mockk.mockk
 import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
@@ -32,9 +34,9 @@ class StreamServicePoliciesTest {
 
     @Test
     fun `isStopAction is true only for StreamService's ACTION_STOP`() {
-        assert(isStopAction(StreamService.ACTION_STOP))
-        assert(!isStopAction("some.other.action"))
-        assert(!isStopAction(null))
+        assertTrue(isStopAction(StreamService.ACTION_STOP))
+        assertFalse(isStopAction("some.other.action"))
+        assertFalse(isStopAction(null))
     }
 
     @Test

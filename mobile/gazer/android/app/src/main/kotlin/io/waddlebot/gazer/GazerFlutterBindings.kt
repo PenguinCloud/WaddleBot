@@ -17,6 +17,9 @@ import io.waddlebot.gazer.pipeline.sources.VideoSourceFactory
  * bridge that only calls into this object - all real logic lives here instead.
  */
 object GazerFlutterBindings {
+    /** The PigeonHostApiImpl installed for the currently-attached engine, if any - retained so [uninstall] can dispose it. */
+    private var activeImpl: PigeonHostApiImpl? = null
+
     /** Wires PigeonHostApiImpl into [flutterEngine] for [context]; safe to call once per engine attach. */
     fun install(
         flutterEngine: FlutterEngine,
@@ -32,6 +35,20 @@ object GazerFlutterBindings {
                 videoDevices = { VideoSourceFactory(context, CameraManagerIds(cameraManager)).list() },
                 audioDevices = { AudioSourceFactory().list() },
             )
+        activeImpl = impl
         GazerHostApi.setUp(messenger, impl)
+    }
+
+    /**
+     * Detaches GazerHostApi from [flutterEngine]'s channel and disposes the PigeonHostApiImpl
+     * installed by [install] (cancels its mainScope, unbinds StreamService if still bound). Call
+     * from MainActivity.cleanUpFlutterEngine so a torn-down engine's messenger is never used
+     * again by a stray PipelineListener callback.
+     */
+    fun uninstall(flutterEngine: FlutterEngine) {
+        val messenger = flutterEngine.dartExecutor.binaryMessenger
+        GazerHostApi.setUp(messenger, null)
+        activeImpl?.dispose()
+        activeImpl = null
     }
 }

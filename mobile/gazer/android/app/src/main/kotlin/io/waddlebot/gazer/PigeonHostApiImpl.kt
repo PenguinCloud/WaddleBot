@@ -23,6 +23,7 @@ import io.waddlebot.gazer.pipeline.StreamService
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
@@ -46,6 +47,15 @@ class PigeonHostApiImpl(
     /** Test/composition seam - `internal` so PigeonHostApiImplTest can inject a fake without a real ServiceConnection. */
     internal var host: PipelineHost? = null
     private var hostDeferred: CompletableDeferred<PipelineHost>? = null
+
+    /**
+     * Tracks whether this instance currently owns an active `bindService()` call that must be
+     * matched with exactly one `unbindService()` - set the moment `bindService()` returns true
+     * (per the Android contract, regardless of whether `onServiceConnected` has fired yet), and
+     * cleared once `unbindIfBound()` actually unbinds. `host != null` is not a substitute for
+     * this: `host` is also set directly in tests without a real bind ever happening.
+     */
+    private var isBound = false
 
     /**
      * Test seam - `internal` so PigeonHostApiImplTest can drive onServiceConnected/
@@ -97,6 +107,9 @@ class PigeonHostApiImpl(
 
     override suspend fun stop() {
         host?.pipeline()?.stop()
+        unbindIfBound()
+        StreamService.stop(context)
+        host = null
     }
 
     override fun setVideoBitrate(kbps: Long) {
@@ -119,7 +132,27 @@ class PigeonHostApiImpl(
 
     private fun bindService(): Boolean {
         StreamService.start(context)
-        return context.bindService(Intent(context, StreamService::class.java), connection, Context.BIND_AUTO_CREATE)
+        val bound = context.bindService(Intent(context, StreamService::class.java), connection, Context.BIND_AUTO_CREATE)
+        isBound = bound
+        return bound
+    }
+
+    /** Unbinds StreamService if this instance currently owns an active bind; safe (no-op) otherwise, and idempotent. */
+    private fun unbindIfBound() {
+        if (!isBound) return
+        runCatching { context.unbindService(connection) }
+        isBound = false
+    }
+
+    /**
+     * Cancels [mainScope] and unbinds StreamService if still bound. Call exactly once, when the
+     * platform channel itself is being torn down (GazerFlutterBindings.uninstall) - after this,
+     * no further PipelineListener callback can reach a detached GazerFlutterApi/BinaryMessenger.
+     */
+    fun dispose() {
+        unbindIfBound()
+        host = null
+        mainScope.cancel()
     }
 
     // PipelineListener - each call launches on mainScope, since GazerFlutterApi's methods are
