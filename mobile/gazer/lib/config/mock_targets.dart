@@ -21,13 +21,13 @@ import '../models/quality.dart';
 import '../models/stream_target_settings.dart';
 
 /// Target 1: plain RTMP, key auto-appended, no auth.
-final StreamTargetSettings mockTargetPlainRtmp = StreamTargetSettings(
+final StreamTargetSettings mockTargetPlainRtmp = const StreamTargetSettings(
   url: 'rtmp://ingest-a.example.com/live',
   streamKey: 'demo-key-0001',
 );
 
 /// Target 2: RTMPS with username/password auth.
-final StreamTargetSettings mockTargetRtmpsAuth = StreamTargetSettings(
+final StreamTargetSettings mockTargetRtmpsAuth = const StreamTargetSettings(
   url: 'rtmps://ingest-b.example.com/app',
   streamKey: 'demo-key-0002',
   username: 'demo',
@@ -36,13 +36,12 @@ final StreamTargetSettings mockTargetRtmpsAuth = StreamTargetSettings(
 
 /// Target 3: emulator host loopback — nothing listens here. Used by the
 /// go-live-unreachable integration test and offline-behaviour widget tests.
-final StreamTargetSettings mockTargetEmulatorLoopback = StreamTargetSettings(
-  url: 'rtmp://10.0.2.2:1935/live',
-);
+final StreamTargetSettings mockTargetEmulatorLoopback =
+    const StreamTargetSettings(url: 'rtmp://10.0.2.2:1935/live');
 
 /// Target 4: invalid scheme (`http`, not `rtmp`/`rtmps`) — used by
 /// TargetValidator tests asserting the scheme-validation issue fires.
-final StreamTargetSettings mockTargetInvalidScheme = StreamTargetSettings(
+final StreamTargetSettings mockTargetInvalidScheme = const StreamTargetSettings(
   url: 'http://bad.example.com',
 );
 
@@ -60,7 +59,7 @@ final QualitySettings mockQualityDefault = QualitySettings.defaults();
 
 /// Preset B: low-bandwidth — exercises the resolution/fps/bitrate pickers
 /// away from their defaults in widget tests and goldens.
-final QualitySettings mockQualityLowBandwidth = QualitySettings(
+final QualitySettings mockQualityLowBandwidth = const QualitySettings(
   resolution: Resolution.p360,
   frameRate: FrameRate.fps15,
   videoBitrateKbps: 800,

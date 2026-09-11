@@ -21,12 +21,15 @@ void main() {
     expect(mockTargets[3].url, 'http://bad.example.com');
   });
 
-  test('mockQualityPresets has exactly 2 presets: default and low-bandwidth', () {
-    expect(mockQualityPresets, hasLength(2));
-    expect(mockQualityPresets[0], QualitySettings.defaults());
-    expect(mockQualityPresets[1].resolution, Resolution.p360);
-    expect(mockQualityPresets[1].frameRate, FrameRate.fps15);
-    expect(mockQualityPresets[1].videoBitrateKbps, 800);
-    expect(mockQualityPresets[1].adaptiveBitrate, isFalse);
-  });
+  test(
+    'mockQualityPresets has exactly 2 presets: default and low-bandwidth',
+    () {
+      expect(mockQualityPresets, hasLength(2));
+      expect(mockQualityPresets[0], QualitySettings.defaults());
+      expect(mockQualityPresets[1].resolution, Resolution.p360);
+      expect(mockQualityPresets[1].frameRate, FrameRate.fps15);
+      expect(mockQualityPresets[1].videoBitrateKbps, 800);
+      expect(mockQualityPresets[1].adaptiveBitrate, isFalse);
+    },
+  );
 }

@@ -47,7 +47,9 @@ void main() {
 
     test('never overwrites a repository with non-default settings, even when GAZER_SEED=true', () async {
       final GazerSettings customized = GazerSettings.defaults().copyWith(
-        target: StreamTargetSettings(url: 'rtmp://real-user-endpoint.example.com/live'),
+        target: const StreamTargetSettings(
+          url: 'rtmp://real-user-endpoint.example.com/live',
+        ),
       );
       final repo = _InMemorySettingsRepository(customized);
       await applySeedIfRequested(repo);

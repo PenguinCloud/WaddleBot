@@ -8,4 +8,6 @@
 /// here keeps every existing `test/fixtures/mock_targets.dart` /
 /// `../fixtures/mock_targets.dart` import working unchanged, with exactly
 /// one copy of the data.
+library;
+
 export 'package:gazer/config/mock_targets.dart';

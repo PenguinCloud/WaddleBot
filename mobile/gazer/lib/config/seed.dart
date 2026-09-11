@@ -14,7 +14,8 @@ import '../models/quality.dart';
 import '../services/settings_repository.dart';
 import 'mock_targets.dart' as fixtures;
 
-bool get _seedRequested => kDebugMode && const bool.fromEnvironment('GAZER_SEED');
+bool get _seedRequested =>
+    kDebugMode && const bool.fromEnvironment('GAZER_SEED');
 
 /// Seeds [repo] with a mock target + default quality preset when
 /// `--dart-define=GAZER_SEED=true` was passed to a debug build AND the

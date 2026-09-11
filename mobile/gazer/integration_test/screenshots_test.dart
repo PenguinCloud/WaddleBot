@@ -25,7 +25,9 @@ void main() {
   final IntegrationTestWidgetsFlutterBinding binding =
       IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  testWidgets('capture docs/screenshots/gazer marketing set ($_formFactor)', (WidgetTester tester) async {
+  testWidgets('capture docs/screenshots/gazer marketing set ($_formFactor)', (
+    WidgetTester tester,
+  ) async {
     // `flutter build apk --target=integration_test/screenshots_test.dart`
     // makes THIS file's `main()` the app's actual Dart entrypoint --
     // lib/main.dart (and its applySeedIfRequested call before runApp) never
@@ -58,7 +60,9 @@ void main() {
     // Home, idle, mock target/quality already seeded by --dart-define=GAZER_SEED=true at launch.
     // Phone keeps the historical "home-idle-phone" name; tablet uses "home-tablet" to match
     // the fixed 5-file marketing set (see the Produces line and collect_screenshots.sh NAMES).
-    await binding.takeScreenshot(_formFactor == 'phone' ? 'home-idle-phone' : 'home-tablet');
+    await binding.takeScreenshot(
+      _formFactor == 'phone' ? 'home-idle-phone' : 'home-tablet',
+    );
 
     if (_formFactor == 'phone') {
       await tester.tap(find.byKey(const Key('settingsGearButton')));
