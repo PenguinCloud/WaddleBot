@@ -2,6 +2,7 @@ package io.waddlebot.gazer.pipeline
 
 import com.pedro.encoder.input.sources.audio.AudioSource
 import com.pedro.encoder.input.sources.video.VideoSource
+import io.mockk.clearMocks
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -113,6 +114,23 @@ class GazerPipelineTest {
 
         assertEquals(NativePipelineState.IDLE, pipeline.state)
         verify { listener.onState(NativePipelineState.IDLE) }
+    }
+
+    @Test
+    fun `the trailing disconnect after a failed connect keeps the error and never reports idle`() {
+        pipeline.prepare(validConfig)
+        pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
+        pipeline.onConnectionFailed("Connection refused")
+        clearMocks(listener, answers = false)
+
+        // RootEncoder always follows a terminal onConnectionFailed with onDisconnect as it tears
+        // the socket down. Reporting IDLE for it overwrites the failure Dart has already turned
+        // into ReconnectingState: the status chip drops to "Idle" mid-reconnect and the Stop
+        // button disappears, leaving no way to cancel the retry loop.
+        pipeline.onDisconnect()
+
+        assertEquals(NativePipelineState.ERROR, pipeline.state)
+        verify(exactly = 0) { listener.onState(NativePipelineState.IDLE) }
     }
 
     @Test

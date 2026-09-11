@@ -59,8 +59,26 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const Key('saveSettingsButton')));
-      await tester.pumpAndSettle();
-      expect(find.text(l10n.settingsSavedMessage), findsOneWidget);
+      // `SettingsNotifier.save` is asynchronous -- a secure-storage write over
+      // a platform channel -- and schedules no frames while it is in flight,
+      // so `pumpAndSettle` returns *before* the confirmation SnackBar is ever
+      // built and a plain `expect` right after it finds nothing. Poll for the
+      // message instead; polling is also what keeps this robust on a
+      // software-rendered emulator, where a single frame can take seconds and
+      // a settle-then-assert can just as easily overshoot the SnackBar's own
+      // ~4s auto-dismiss.
+      final bool savedMessageShown = await _pumpUntil(
+        tester,
+        () => find.text(l10n.settingsSavedMessage).evaluate().isNotEmpty,
+        timeout: const Duration(seconds: 15),
+      );
+      expect(
+        savedMessageShown,
+        isTrue,
+        reason:
+            'expected the "settings saved" confirmation SnackBar within 15s '
+            'of tapping Save',
+      );
 
       final saved = await container.read(settingsProvider.future);
       expect(saved.target.url, 'rtmp://10.0.2.2:1935/live');
@@ -74,42 +92,110 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text(l10n.sourceBackCameraLabel), findsOneWidget);
 
+      // Go Live stays disabled until the first license/flag fetch resolves --
+      // HomeScreen's canGoLive requires flags.hasFetchedOnce, and only the
+      // resolved LicenseState carries a lastFetched. LicenseClient never
+      // throws (an unreachable or rejecting license.penguintech.io degrades to
+      // the offline fallback), but the round trip still has to *finish*, and
+      // nothing earlier in this test waits for it. Wait for the button itself
+      // rather than tapping a disabled one and then blaming the pipeline for
+      // never reaching ConnectingState.
+      final bool goLiveEnabled = await _pumpUntil(
+        tester,
+        () =>
+            tester
+                .widget<FilledButton>(find.byKey(const Key('goLiveButton')))
+                .onPressed !=
+            null,
+        timeout: const Duration(seconds: 60),
+      );
+      expect(
+        goLiveEnabled,
+        isTrue,
+        reason:
+            'expected Go Live to become enabled once the license/flag fetch '
+            'resolved and a camera was selected',
+      );
+
+      // Record every state the pipeline emits, from the provider's own stream,
+      // starting before the tap. Snapshot polling cannot assert a *transition*
+      // here: ReconnectPolicy's first backoff window is ~1s (base 1s, +/-20%
+      // jitter) and on a software-rendered emulator one `tester.pump` can take
+      // longer than that, so `container.read(...)` polling steps straight over
+      // ReconnectingState(attempt: 1) even though it genuinely occurred. A
+      // listener sees every emission, so the assertions below cannot miss one.
+      final List<PipelineState> seenStates = <PipelineState>[];
+      final ProviderSubscription<AsyncValue<PipelineState>> stateSubscription =
+          container.listen<AsyncValue<PipelineState>>(pipelineStateProvider, (
+            AsyncValue<PipelineState>? previous,
+            AsyncValue<PipelineState> next,
+          ) {
+            final PipelineState? state = next.value;
+            if (state != null) {
+              seenStates.add(state);
+            }
+          });
+      addTearDown(stateSubscription.close);
+
       await tester.tap(find.byKey(const Key('goLiveButton')));
       await tester.pump(const Duration(milliseconds: 500));
 
-      // --- Connecting ---
-      final bool reachedConnecting = await _pumpUntil(
-        tester,
-        () => container.read(pipelineStateProvider).value is ConnectingState,
-        timeout: const Duration(seconds: 5),
-      );
+      // --- Connecting, then Reconnecting(attempt: 1) ---
+      //
+      // One accumulating poll rather than a chain of snapshot assertions.
+      // Every stage of this flow is transient and the windows are short
+      // relative to a frame on a software-rendered emulator: the RTMP connect
+      // to an unreachable host is refused immediately, ReconnectPolicy's first
+      // backoff window is ~1s, and each retry re-prepares the encoder (which
+      // republishes PreparingState) before reconnecting. A snapshot
+      // `expect(find.textContaining(...), findsOneWidget)` therefore asserts
+      // whatever happens to be on screen at one arbitrary instant. Recording
+      // every chip label seen and every state emitted, and asserting against
+      // the accumulated evidence, asserts the same three facts -- the pipeline
+      // reached Connecting, it reached ReconnectingState(attempt: 1), and the
+      // chip rendered both -- without depending on catching any one of them in
+      // a single frame. ReconnectPolicy doubles each backoff window, so the
+      // evidence set fills in within a few cycles.
+      final Set<String> chipLabelsSeen = <String>{};
+      final bool sawConnectAndReconnect = await _pumpUntil(tester, () {
+        final String? label = _currentChipLabel(tester);
+        if (label != null) {
+          chipLabelsSeen.add(label);
+        }
+        return chipLabelsSeen.contains(l10n.statusChipConnectingLabel) &&
+            chipLabelsSeen.contains(l10n.statusChipReconnectingLabel) &&
+            seenStates.any((PipelineState s) => s is ConnectingState) &&
+            seenStates.any(
+              (PipelineState s) => s is ReconnectingState && s.attempt == 1,
+            );
+      }, timeout: const Duration(seconds: 90));
       expect(
-        reachedConnecting,
-        isTrue,
-        reason: 'expected ConnectingState shortly after Go Live',
-      );
-      expect(
-        find.textContaining(l10n.statusChipConnectingLabel),
-        findsOneWidget,
-      );
-
-      // --- Reconnecting (attempt 1), within ReconnectPolicy's first backoff window ---
-      final bool reachedReconnecting = await _pumpUntil(tester, () {
-        final PipelineState? state = container
-            .read(pipelineStateProvider)
-            .value;
-        return state is ReconnectingState && state.attempt == 1;
-      }, timeout: const Duration(seconds: 15));
-      expect(
-        reachedReconnecting,
+        sawConnectAndReconnect,
         isTrue,
         reason:
-            'expected ReconnectingState(attempt: 1) within 15s of a failed '
-            'connection to an unreachable RTMP host',
+            'expected the pipeline to reach ConnectingState and then '
+            'ReconnectingState(attempt: 1) against an unreachable RTMP host, '
+            'with the status chip rendering both '
+            '"${l10n.statusChipConnectingLabel}" and '
+            '"${l10n.statusChipReconnectingLabel}". '
+            'Chip labels seen: $chipLabelsSeen. '
+            'States seen: ${seenStates.map((PipelineState s) => s.runtimeType).toList()}',
+      );
+
+      // Hold until a reconnect backoff window is actually on screen, so the
+      // screenshot below captures the reconnecting UI rather than whatever the
+      // retry loop happens to be doing.
+      final bool reconnectingOnScreen = await _pumpUntil(
+        tester,
+        () => _currentChipLabel(tester) == l10n.statusChipReconnectingLabel,
+        timeout: const Duration(seconds: 60),
       );
       expect(
-        find.textContaining(l10n.statusChipReconnectingLabel),
-        findsOneWidget,
+        reconnectingOnScreen,
+        isTrue,
+        reason:
+            'expected the status chip to be showing '
+            '"${l10n.statusChipReconnectingLabel}" when the screenshot is taken',
       );
 
       // Android renders Flutter into a SurfaceView the screenshot API cannot
@@ -125,19 +211,50 @@ void main() {
       await binding.takeScreenshot('go-live-unreachable');
 
       // --- Stop cancels the reconnect loop and returns to Idle ---
+      // Stop is only rendered while the pipeline is connecting/streaming/
+      // reconnecting; taking the screenshot above costs frames, so re-confirm
+      // the button is on screen instead of tapping into empty space.
+      final bool stopShown = await _pumpUntil(
+        tester,
+        () => find.byKey(const Key('stopButton')).evaluate().isNotEmpty,
+        timeout: const Duration(seconds: 15),
+      );
+      expect(stopShown, isTrue, reason: 'expected the Stop button on screen');
       await tester.tap(find.byKey(const Key('stopButton')));
+      // `PipelineController.stop` emits Idle only after the native
+      // `GazerPipeline.stop()` round trip returns, and that call tears down
+      // the RootEncoder engine (stopStream + release, a camera close and two
+      // MediaCodec releases). On a software-rendered emulator mid-reconnect
+      // that takes well over the couple of seconds it takes on real hardware,
+      // so bound this generously rather than asserting a wall-clock budget
+      // this test was never written to measure.
       final bool backToIdle = await _pumpUntil(
         tester,
-        () => container.read(pipelineStateProvider).value is IdleState,
-        timeout: const Duration(seconds: 5),
+        () => seenStates.any((PipelineState s) => s is IdleState),
+        timeout: const Duration(seconds: 45),
       );
       expect(
         backToIdle,
         isTrue,
-        reason: 'expected IdleState shortly after Stop',
+        reason:
+            'expected IdleState after Stop. '
+            'States seen: ${seenStates.map((PipelineState s) => s.runtimeType).toList()}',
       );
-      await tester.pumpAndSettle();
-      expect(find.textContaining(l10n.statusChipIdleLabel), findsOneWidget);
+      final Set<String?> idleChipLabelsSeen = <String?>{};
+      final bool idleShown = await _pumpUntil(tester, () {
+        final String? label = _currentChipLabel(tester);
+        idleChipLabelsSeen.add(label);
+        return label == l10n.statusChipIdleLabel;
+      }, timeout: const Duration(seconds: 30));
+      expect(
+        idleShown,
+        isTrue,
+        reason:
+            'expected the status chip to settle on '
+            '"${l10n.statusChipIdleLabel}" after Stop. '
+            'Chip labels seen after Stop: $idleChipLabelsSeen. '
+            'States seen: ${seenStates.map((PipelineState s) => s.runtimeType).toList()}',
+      );
     },
   );
 }
@@ -158,4 +275,22 @@ Future<bool> _pumpUntil(
     if (predicate()) return true;
   }
   return false;
+}
+
+/// The text currently rendered inside the status chip, or null when the chip
+/// (or its label) is not in the tree. Read through the chip's own key rather
+/// than a bare text finder so a label that also appears elsewhere in the tree
+/// can never be mistaken for the chip's own state.
+String? _currentChipLabel(WidgetTester tester) {
+  final Finder chip = find.byKey(const Key('statusChip'));
+  if (chip.evaluate().isEmpty) {
+    return null;
+  }
+  final Iterable<Element> labels = find
+      .descendant(of: chip, matching: find.byType(Text))
+      .evaluate();
+  if (labels.isEmpty) {
+    return null;
+  }
+  return (labels.first.widget as Text).data;
 }

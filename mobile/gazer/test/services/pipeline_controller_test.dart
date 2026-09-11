@@ -179,6 +179,7 @@ void main() {
         flags: flagsWith(),
       );
       final startCallsBefore = host.startCalls.length;
+      final prepareCallsBefore = host.prepareCalls.length;
 
       bridge.onStateChanged(
         StateEvent(
@@ -197,7 +198,50 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       expect(host.startCalls.length, startCallsBefore + 1);
+      // The retry must re-prepare first: GazerPipeline.onConnectionFailed
+      // releases the native engine, so a bare start() is rejected from a
+      // non-READY state with GazerErrorCode.unknown -- which ReconnectPolicy
+      // treats as non-retryable, ending the reconnect loop on its first
+      // attempt.
+      expect(host.prepareCalls.length, prepareCallsBefore + 1);
     });
+
+    test(
+      'a failed re-prepare on retry is terminal, not another retry',
+      () async {
+        await controller.goLive(
+          settingsWith(),
+          devices: [backCamera],
+          videoDeviceId: 'camera:back',
+          flags: flagsWith(),
+        );
+
+        bridge.onStateChanged(
+          StateEvent(
+            state: NativePipelineState.error,
+            error: GazerErrorCode.rtmpConnectFailed,
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        host.prepareResult = PrepareResult(
+          ok: false,
+          error: GazerErrorCode.encoderFailed,
+          detail: 'encoder gone',
+        );
+        final startCalls = host.startCalls.length;
+        sleeper.resolveNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(controller.current, isA<ErrorState>());
+        expect(
+          (controller.current as ErrorState).error.code,
+          GazerErrorCode.encoderFailed,
+        );
+        expect(host.startCalls.length, startCalls);
+        expect(sleeper.pendingCount, 0);
+      },
+    );
   });
 
   group('rtmpAuthFailed', () {
@@ -292,6 +336,33 @@ void main() {
       expect(host.startCalls.length, startCallsBefore);
       expect(controller.current, const IdleState());
     });
+
+    test(
+      "a trailing native Stopping event does not drag Stop's Idle backwards",
+      () async {
+        await controller.goLive(
+          settingsWith(),
+          devices: [backCamera],
+          videoDeviceId: 'camera:back',
+          flags: flagsWith(),
+        );
+        await controller.stop();
+        expect(controller.current, const IdleState());
+
+        // GazerPipeline.stop() publishes STOPPING and then IDLE, and both are
+        // queued behind the Pigeon method's own reply -- so they arrive after
+        // stop() has already settled on Idle. Applying that trailing STOPPING
+        // would leave the status chip on "Stopping" for good and keep Go Live
+        // disabled, since canGoLive only accepts Idle/Ready/Error.
+        bridge.onStateChanged(StateEvent(state: NativePipelineState.stopping));
+        await Future<void>.delayed(Duration.zero);
+        expect(controller.current, const IdleState());
+
+        bridge.onStateChanged(StateEvent(state: NativePipelineState.idle));
+        await Future<void>.delayed(Duration.zero);
+        expect(controller.current, const IdleState());
+      },
+    );
   });
 
   group('stats aggregation', () {

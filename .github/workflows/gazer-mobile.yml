@@ -537,7 +537,7 @@ jobs:
         # with "Did not resolve io.flutter:armeabi_v7a_debug:... which is part of the dependency
         # lock state" (CI run 34613733371). Building here keeps the lock intact -- relaxing it to
         # LENIENT would disarm the osv-scanner Gradle gate R16/R23 exist to feed.
-        run: flutter build apk --debug --target=integration_test/go_live_unreachable_test.dart --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture
+        run: flutter build apk --debug --target=integration_test/go_live_unreachable_test.dart --dart-define=GAZER_FLAGS_OVERRIDE=waddlebot.gazer.camera-stream,waddlebot.gazer.adaptive-bitrate,waddlebot.gazer.rtmp-auth,waddlebot.gazer.uvc-capture
 
       - name: Run integration_test + connectedDebugAndroidTest on emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
@@ -572,6 +572,12 @@ jobs:
           # Fix round 5: `--use-application-binary` runs the APK the pre-build step already
           # produced rather than letting drive build a single-ABI one that breaks R23's Gradle
           # dependency lock -- see that step's comment for the full reasoning.
+          # `flutter drive --timeout=900` bounds the run. Without it the command has no
+          # timeout at all: CI run 34620730877 printed "Installing ... 7.7s" and then produced
+          # no further output for 35 minutes, until the job's own timeout-minutes cancelled it
+          # -- a cancelled job reports no failing step and no diagnosis. A bounded drive fails
+          # loudly instead, and 900s still leaves room inside timeout-minutes: 45 for the
+          # emulator boot, the APK install and connectedDebugAndroidTest.
           # Fix round 6: POST_NOTIFICATIONS is granted alongside CAMERA/RECORD_AUDIO.
           # PermissionHandlerGate requests it whenever sdkInt >= 33 (this AVD is android-34),
           # and the resulting system dialog lives outside the Flutter view, so the integration
@@ -584,7 +590,7 @@ jobs:
             adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
             adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
             adb shell pm grant io.waddlebot.gazer android.permission.POST_NOTIFICATIONS
-            bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk -d emulator-5554 --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
+            bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk -d emulator-5554 --timeout=900 --dart-define=GAZER_FLAGS_OVERRIDE=waddlebot.gazer.camera-stream,waddlebot.gazer.adaptive-bitrate,waddlebot.gazer.rtmp-auth,waddlebot.gazer.uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
             grep -qE '\+[1-9][0-9]*' /tmp/flutter_integration.log
             python3 scripts/decode_screenshots.py
             bash -eo pipefail -c "cd android && ./gradlew connectedDebugAndroidTest 2>&1 | tee /tmp/gradle_connected.log"
@@ -603,14 +609,17 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: gazer-android-connected-test-report
-          path: mobile/gazer/android/app/build/reports/androidTests/connected/
+          # Flutter redirects the Android build directory to mobile/gazer/build/app, so the
+          # connected-test report lands here, NOT under android/app/build -- pointing at the
+          # latter fails this upload (if-no-files-found: error) even on a passing test run.
+          path: mobile/gazer/build/app/reports/androidTests/connected/
           if-no-files-found: error
 
       - name: Clean up runner workspace artifacts
         if: always()
         run: |
           rm -rf mobile/gazer/build/integration_screenshots
-          rm -rf mobile/gazer/android/app/build/reports/androidTests/connected
+          rm -rf mobile/gazer/build/app/reports/androidTests/connected
           rm -rf mobile/gazer/build/app/outputs/flutter-apk
 
   # `integration` gates this job (Task 21) so a tagged release never ships without the emulator

@@ -128,8 +128,16 @@ mobile-test-android:
 
 mobile-test-integration: ## Boot the container-hosted Android emulator (needs /dev/kvm) and run integration_test/ + connectedDebugAndroidTest
 	@test -e /dev/kvm || { echo "ERROR: /dev/kvm not present - integration tests require KVM. Check 'ls -l /dev/kvm' and that your user is in the kvm group; GitHub Actions ubuntu-latest runners enable it via udev rules (see the integration CI job)."; exit 1; }
+# --group-add is load-bearing: the host's access to /dev/kvm usually comes from a
+# POSIX ACL (the `+` in `crw-rw----+`), and `docker run --device` recreates the node
+# with the host's uid/gid/mode but WITHOUT its ACLs -- so the container's appuser
+# (uid 1000) would see a root:kvm 0660 node it cannot open, and the emulator would
+# silently fall back to (or fail on) software virtualisation. Adding the device
+# node's own gid as a supplementary group restores rw access portably, without
+# depending on the `kvm` group having the same gid on every host.
 	docker run --rm \
 		--device /dev/kvm \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		--network host \
 		--user $(shell id -u):$(shell id -g) \
 		-v $(PWD)/mobile/gazer:/work \

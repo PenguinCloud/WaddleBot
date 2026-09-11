@@ -56,6 +56,12 @@ class PipelineController {
   StreamStats _statsSnapshot = StreamStats.zero();
 
   StreamTarget? _pendingTarget;
+
+  /// The [StreamConfig] the current Go Live was prepared with, retained so a
+  /// reconnect can re-prepare: a failed connection releases the native engine
+  /// (`GazerPipeline.onConnectionFailed`), so `start()` alone on the next
+  /// attempt is rejected from a non-READY state and the retry never happens.
+  StreamConfig? _pendingConfig;
   int _reconnectAttempt = 0;
   bool _cancelled = false;
   bool _isDisposed = false;
@@ -173,6 +179,7 @@ class PipelineController {
       });
 
       _emit(const PreparingState());
+      _pendingConfig = config;
       final result = await _host.prepare(config);
       if (!result.ok) {
         _emit(
@@ -217,7 +224,7 @@ class PipelineController {
   void _onNativeStateEvent(StateEvent event) {
     switch (event.state) {
       case NativePipelineState.idle:
-        if (!_cancelled) _emit(const IdleState());
+        _emit(const IdleState());
       case NativePipelineState.preparing:
         _emit(const PreparingState());
       case NativePipelineState.ready:
@@ -231,7 +238,16 @@ class PipelineController {
         _reconnectAttempt = 0;
         _emit(const StreamingState());
       case NativePipelineState.stopping:
-        _emit(const StoppingState());
+        // A user-requested Stop owns its own Stopping -> Idle sequence: [stop]
+        // emits Stopping, awaits the native stop() round trip, then emits Idle.
+        // GazerPipeline.stop() also publishes STOPPING and IDLE, and those
+        // events are queued behind the method's own reply -- so the trailing
+        // STOPPING lands *after* Idle and would drag the status chip back to
+        // "Stopping" permanently, with Go Live still disabled (canGoLive
+        // requires Idle/Ready/Error). Ignore it while cancelled; the IDLE that
+        // follows it is applied unconditionally above, so a native-initiated
+        // stop still converges on Idle either way.
+        if (!_cancelled) _emit(const StoppingState());
       case NativePipelineState.error:
         _handleError(event.error ?? GazerErrorCode.unknown, event.detail);
     }
@@ -264,9 +280,37 @@ class PipelineController {
     }
   }
 
+  /// Waits out [delay], then re-prepares the native pipeline and reconnects.
+  ///
+  /// The re-prepare is required, not defensive: a terminal RootEncoder failure
+  /// releases the engine natively and leaves the pipeline outside READY, so
+  /// `start()` on its own is rejected with `GazerErrorCode.unknown`
+  /// ("start() called from state=ERROR") -- which [ReconnectPolicy] classifies
+  /// as non-retryable, so the very first retry would end the whole reconnect
+  /// loop in [ErrorState]. A prepare failure here is terminal for the same
+  /// reason it is in [goLive]: nothing about waiting longer fixes an encoder
+  /// or camera that will not open.
   Future<void> _retryAfter(Duration delay) async {
     await _sleeper(delay);
-    if (_isDisposed || _cancelled || _pendingTarget == null) return;
+    if (_isDisposed ||
+        _cancelled ||
+        _pendingTarget == null ||
+        _pendingConfig == null) {
+      return;
+    }
+    final result = await _host.prepare(_pendingConfig!);
+    if (_isDisposed || _cancelled) return;
+    if (!result.ok) {
+      _emit(
+        ErrorState(
+          GazerError(
+            code: result.error ?? GazerErrorCode.encoderFailed,
+            detail: result.detail,
+          ),
+        ),
+      );
+      return;
+    }
     _emit(const ConnectingState());
     await _host.start(_pendingTarget!);
   }

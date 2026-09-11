@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.rule.GrantPermissionRule
 import androidx.test.rule.ServiceTestRule
 import io.waddlebot.gazer.pipeline.StreamService
 import org.junit.Assert.assertTrue
@@ -26,6 +27,22 @@ class StreamServiceTest {
     @get:Rule
     val serviceRule = ServiceTestRule()
 
+    /**
+     * StreamService.onStartCommand calls startForeground with the camera+microphone FGS types, and
+     * Android 14+ rejects that with a SecurityException ("requires permissions: all of ...") unless
+     * CAMERA and RECORD_AUDIO are actually granted -- which crashes the whole instrumentation
+     * process, not just this test. The connectedAndroidTest install does not grant them, so the
+     * test grants what the service it exercises needs rather than depending on whatever the device
+     * happened to be left in by an earlier install.
+     */
+    @get:Rule
+    val permissionRule: GrantPermissionRule =
+        GrantPermissionRule.grant(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO,
+            android.Manifest.permission.POST_NOTIFICATIONS,
+        )
+
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val notificationManager: NotificationManager =
         context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -45,7 +62,7 @@ class StreamServiceTest {
         // foreground notification, and calling stopSelf() to destroy the service - exercised here
         // via sendBroadcast rather than a direct stopService()/unbindService() call, since that's
         // the actual path production code takes.
-        context.sendBroadcast(Intent(StreamService.ACTION_STOP))
+        context.sendBroadcast(Intent(StreamService.ACTION_STOP).setPackage(context.packageName))
 
         // stopForeground(STOP_FOREGROUND_REMOVE) removes the notification synchronously with the
         // broadcast receipt, before the asynchronous stopSelf()-driven onDestroy() completes, so

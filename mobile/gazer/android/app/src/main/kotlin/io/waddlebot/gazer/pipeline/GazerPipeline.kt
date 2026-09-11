@@ -249,15 +249,17 @@ class GazerPipeline(
 
     override fun onDisconnect() {
         val wasStreaming: Boolean
+        val alreadyFailed: Boolean
         var engineToRelease: StreamEngine? = null
         synchronized(lock) {
             wasStreaming = state == NativePipelineState.STREAMING
+            alreadyFailed = state == NativePipelineState.ERROR
             if (wasStreaming) {
                 engineToRelease = engine
                 engine = null
                 bitrateAdapter = null
                 state = NativePipelineState.ERROR
-            } else {
+            } else if (!alreadyFailed) {
                 state = NativePipelineState.IDLE
             }
         }
@@ -265,9 +267,15 @@ class GazerPipeline(
         if (wasStreaming) {
             runCatching { engineToRelease?.release() }
             listener.onState(NativePipelineState.ERROR, GazerErrorCode.RTMP_DISCONNECTED, "RootEncoder onDisconnect while streaming")
-        } else {
+        } else if (!alreadyFailed) {
             listener.onState(NativePipelineState.IDLE)
         }
+        // alreadyFailed: RootEncoder always follows a terminal onConnectionFailed/onAuthError with
+        // an onDisconnect as it tears the socket down. Reporting IDLE for that trailing callback
+        // overwrites the failure the Dart side has already turned into ReconnectingState, so the
+        // status chip drops back to "Idle" mid-reconnect and the Stop button - only rendered while
+        // connecting/streaming/reconnecting - disappears, leaving no way to cancel the retry loop.
+        // The failure was already reported by the callback that classified it; stay quiet here.
     }
 
     override fun onAuthError() {

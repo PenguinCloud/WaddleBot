@@ -14,17 +14,46 @@
 #   adb shell pm grant io.waddlebot.gazer android.permission.POST_NOTIFICATIONS
 set -euo pipefail
 
-FLAGS_DEFINE="camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture"
+# The canonical PostHog keys from lib/config/flag_keys.dart, in full
+# {product}.{feature-name} form. DebugOverrides matches these verbatim against
+# FlagKeys.cameraStream etc, so the short "camera-stream" spellings silently
+# match nothing: every flag stays OFF, HomeScreen's canGoLive stays false, and
+# Go Live is a disabled button the test taps to no effect.
+FLAGS_DEFINE="waddlebot.gazer.camera-stream,waddlebot.gazer.adaptive-bitrate,waddlebot.gazer.rtmp-auth,waddlebot.gazer.uvc-capture"
 
 avdmanager --verbose create avd --force -n gazer_ci \
   -k "system-images;android-34;google_apis;x86_64" -d "pixel_6"
 
-emulator -avd gazer_ci -no-window -gpu swiftshader_indirect -no-audio \
+# The toolchain image installs the `emulator` package under
+# $ANDROID_SDK_ROOT/emulator but only puts cmdline-tools/platform-tools/
+# build-tools on PATH, so a bare `emulator` here is a command-not-found --
+# resolve the binary explicitly, the same way CI resolves sdkmanager.
+EMULATOR_BIN="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME/ANDROID_SDK_ROOT not set}}/emulator/emulator"
+if [ ! -x "$EMULATOR_BIN" ]; then
+  echo "ERROR: emulator binary not found at $EMULATOR_BIN" >&2
+  exit 1
+fi
+
+# The emulator's gfxstream/Vulkan init dlopen()s libX11-xcb.so.1 even under
+# -no-window and aborts ("Could not open libX11-xcb.so.1, give up") if it is
+# missing. The toolchain image is a slim Debian base without libx11-xcb1, but
+# the emulator package ships its own copy under lib64/qt/lib -- point the
+# emulator process (and only it: this prefix applies to this one child, not to
+# the flutter/gradle/java invocations below, whose own libfreetype/libjpeg must
+# keep resolving from the system paths) at that directory.
+LD_LIBRARY_PATH="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/emulator/lib64/qt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$EMULATOR_BIN" -avd gazer_ci -no-window -gpu swiftshader_indirect -no-audio \
   -no-boot-anim -no-snapshot -accel on \
   -camera-back emulated -camera-front emulated &
 EMULATOR_PID=$!
 
-adb wait-for-device
+# Bounded: if the emulator dies during startup (as it does when a dlopen it
+# needs fails), a bare `adb wait-for-device` blocks forever and the failure
+# only ever surfaces as a job-level timeout with no diagnosis.
+if ! timeout 300 adb wait-for-device; then
+  echo "ERROR: no emulator attached within 300s - it most likely exited during startup; see the emulator output above" >&2
+  exit 1
+fi
 
 timeout=180
 while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
@@ -69,6 +98,7 @@ flutter drive \
   --target=integration_test/go_live_unreachable_test.dart \
   --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk \
   -d emulator-5554 \
+  --timeout=900 \
   --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE" \
   | tee /tmp/integration_test.log
 

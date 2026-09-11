@@ -67,12 +67,22 @@ internal fun registerNotificationChannel(manager: NotificationManager) {
     manager.createNotificationChannel(buildNotificationChannel())
 }
 
-/** Builds the PendingIntent StreamService's Stop notification action broadcasts ACTION_STOP through when tapped. */
+/**
+ * Builds the PendingIntent StreamService's Stop notification action broadcasts ACTION_STOP through
+ * when tapped.
+ *
+ * setPackage is load-bearing, not tidiness: StreamService registers its stop receiver with
+ * RECEIVER_NOT_EXPORTED (required from API 33), and an implicit broadcast - one carrying neither a
+ * package nor a component - is not delivered to a non-exported receiver. Without it the Stop action
+ * on the ongoing notification silently does nothing on Android 14+, leaving the stream running with
+ * no way to end it from the notification shade. Proven by StreamServiceTest, which broadcasts the
+ * same way.
+ */
 internal fun buildStopPendingIntent(context: Context): PendingIntent? =
     PendingIntent.getBroadcast(
         context,
         0,
-        Intent(StreamService.ACTION_STOP),
+        Intent(StreamService.ACTION_STOP).setPackage(context.packageName),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
 
