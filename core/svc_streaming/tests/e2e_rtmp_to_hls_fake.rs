@@ -24,7 +24,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body as AxumBody;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{Request, StatusCode};
 use clap::Parser;
+use http_body_util::BodyExt;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::rml_amf0::Amf0Value;
 use rml_rtmp::sessions::{
@@ -35,10 +39,11 @@ use sea_orm::ConnectionTrait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tower::ServiceExt as _;
 use uuid::Uuid;
 
 use svc_streaming::config::{CliConfig, Config, Secret};
-use svc_streaming::egress::hls::{HlsSink, RunningPipelines};
+use svc_streaming::egress::hls::{hls_router, HlsRouterState, HlsSink, RunningPipelines};
 use svc_streaming::egress::relay::RelaySink;
 use svc_streaming::egress::whep::WhepState;
 use svc_streaming::ingest::rtmp::RtmpListener;
@@ -433,9 +438,127 @@ async fn rtmp_publish_starts_a_transcoded_pipeline_and_hls_lists_it() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, pipeline_id);
 
+    // 3. The public HLS HTTP surface -- built from the *same* registry Arc
+    // the orchestrator writes into, exactly like `run_with_shutdown` wires
+    // `AppState::hls_router_state` -- lists the pipeline too. This is the
+    // end-to-end proof that the router's `RunningPipelines` adapter is
+    // actually connected (S13: nothing in this suite previously drove a
+    // real HTTP request against the HLS router alongside a real
+    // orchestrator/registry; `tests/http_router_assembly.rs` only exercises
+    // the default `EmptyRunningPipelines` wiring).
+    let hls_router_state = HlsRouterState::new(
+        stream_data_dir.clone(),
+        registry.clone() as Arc<dyn RunningPipelines>,
+    );
+    let hls_app = hls_router(hls_router_state);
+
+    let response = hls_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/live/{COMMUNITY_ID}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let pipelines = parsed["pipelines"].as_array().expect("pipelines array");
+    assert_eq!(pipelines.len(), 1);
+    let entry = &pipelines[0];
+    assert_eq!(entry["id"], pipeline_id.to_string());
+    assert_eq!(entry["profile"], "default");
+    let expected_url = format!("/live/{COMMUNITY_ID}/{pipeline_id}/default/master.m3u8");
+    assert_eq!(entry["url"], expected_url);
+    assert!(
+        entry["started_at"].as_str().is_some(),
+        "started_at must be a serialized timestamp, got: {entry}"
+    );
+
+    // 4. Write a fixture playlist + segment into the pipeline's real HLS
+    // output dir (the same dir `HlsSink::start` created and the disk layout
+    // `pipeline::ffmpeg::build_argv`'s HLS argv now targets, see
+    // `expected_hls_dir` above) and confirm the file-serving route reads
+    // them back with the right content type.
+    tokio::fs::write(
+        expected_hls_dir.join("master.m3u8"),
+        b"#EXTM3U\n#EXT-X-STREAM-INF\nindex.m3u8\n",
+    )
+    .await
+    .expect("write fixture master playlist");
+    tokio::fs::write(expected_hls_dir.join("segment_00001.m4s"), vec![0u8; 64])
+        .await
+        .expect("write fixture segment");
+
+    let playlist_response = hls_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/live/{COMMUNITY_ID}/{pipeline_id}/default/master.m3u8"
+                ))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(playlist_response.status(), StatusCode::OK);
+    assert_eq!(
+        playlist_response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/vnd.apple.mpegurl"
+    );
+
+    let segment_response = hls_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/live/{COMMUNITY_ID}/{pipeline_id}/default/segment_00001.m4s"
+                ))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(segment_response.status(), StatusCode::OK);
+    assert_eq!(
+        segment_response.headers().get(CONTENT_TYPE).unwrap(),
+        "video/iso.segment"
+    );
+
     // Cleanup: stop the pipeline (kills the fake ffmpeg, tears down HLS),
     // then the seeded temp files.
     orchestrator.stop_pipeline(pipeline_id).await;
+
+    // 5. After teardown the registry -- and therefore the HTTP listing --
+    // is empty again (the file-serving route is unaffected: `HlsSink::stop`
+    // only removes the on-disk directory after `DEFAULT_CLEANUP_DELAY`, see
+    // that constant's doc comment, so this only asserts the listing side).
+    let response_after_stop = hls_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/live/{COMMUNITY_ID}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response_after_stop.status(), StatusCode::OK);
+    let body_after_stop = response_after_stop
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let parsed_after_stop: serde_json::Value = serde_json::from_slice(&body_after_stop).unwrap();
+    assert_eq!(
+        parsed_after_stop["pipelines"].as_array().unwrap().len(),
+        0,
+        "pipeline must be delisted immediately once stop_pipeline returns"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     tokio::fs::remove_dir_all(&stream_data_dir).await.ok();
     tokio::fs::remove_file(&db_path).await.ok();

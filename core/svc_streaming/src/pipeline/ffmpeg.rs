@@ -20,9 +20,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::egress::hls::HlsOutputTarget;
 use crate::pipeline::model::{
-    AudioCodec, HlsVariant, InputSpec, ObjectStoreRef, OutputSpec, PipelineError, PipelineId,
-    PipelineSpec, TranscodeProfile, VideoCodec,
+    AudioCodec, InputSpec, ObjectStoreRef, OutputSpec, PipelineError, PipelineId, PipelineSpec,
+    TranscodeProfile, VideoCodec,
 };
 use crate::store::SecretRef;
 
@@ -672,39 +673,22 @@ fn solo_muxer_args(
             Ok(vec!["-f".into(), "mpegts".into(), url])
         }
         OutputSpec::Hls { variant, profile } => {
-            let target = format!(
-                "{}/index.m3u8",
-                hls_dir(paths, spec_id, profile).to_string_lossy()
-            );
-            let mut a = vec!["-f".into(), "hls".into()];
-            match variant {
-                HlsVariant::Std => a.extend([
-                    "-hls_time".into(),
-                    "4".into(),
-                    "-hls_list_size".into(),
-                    "6".into(),
-                    "-hls_flags".into(),
-                    "delete_segments+independent_segments".into(),
-                    "-hls_segment_type".into(),
-                    "fmp4".into(),
-                ]),
-                HlsVariant::Ll => a.extend([
-                    "-hls_playlist_type".into(),
-                    "event".into(),
-                    "-hls_time".into(),
-                    "4".into(),
-                    "-hls_part_time".into(),
-                    "0.5".into(),
-                    "-hls_flags".into(),
-                    "independent_segments+program_date_time".into(),
-                    "-hls_segment_type".into(),
-                    "fmp4".into(),
-                    "-lhls".into(),
-                    "1".into(),
-                ]),
-            }
-            a.push(target);
-            Ok(a)
+            // Delegates to `egress::hls::output::HlsOutputTarget` -- the
+            // single source of truth for the HLS argv fragment (spec (issue
+            // #287) S7 §4), also consumed by `HlsSink`'s own doc comments as
+            // the contract this builder was always supposed to call. This
+            // used to be a hand-rolled, drifted duplicate here that omitted
+            // `-master_pl_name`/`-hls_segment_filename`/
+            // `-hls_fmp4_init_filename` -- ffmpeg never wrote a
+            // `master.m3u8` and segments landed under ffmpeg's *default*
+            // naming (`index<N>.m4s`) instead of `HlsOutputTarget`'s
+            // `segment_%05d.m4s`, so `GET /live/{cid}/.../master.m3u8` (the
+            // exact URL the `/live/{cid}` listing hands back) 404'd forever
+            // even while the pipeline was running and writing real segments
+            // -- see this crate's `README.md` Runtime Wiring / issue #287
+            // S13 postmortem.
+            let target = HlsOutputTarget::new(&paths.stream_data_dir, spec_id, profile, *variant);
+            Ok(target.ffmpeg_output_args())
         }
         OutputSpec::Record { target, .. } => {
             let pattern = format!(
@@ -911,6 +895,46 @@ mod tests {
             ],
         );
         assert!(argv.last().unwrap().ends_with("/720p30/index.m3u8"));
+    }
+
+    /// Regression guard (issue #287 S13): a solo (non-tee) HLS output's argv
+    /// must come from `egress::hls::output::HlsOutputTarget::
+    /// ffmpeg_output_args` -- this function used to hand-roll an incomplete
+    /// duplicate that omitted `-master_pl_name`/`-hls_segment_filename`/
+    /// `-hls_fmp4_init_filename`, so ffmpeg never wrote `master.m3u8` (the
+    /// exact file the `/live/{cid}` listing's `url` field points at) even
+    /// while it was actively writing (default-named) segments -- listing a
+    /// pipeline whose playback URL 404'd forever.
+    #[test]
+    fn solo_hls_output_argv_matches_hls_output_target_exactly() {
+        let s = spec(
+            vec![InputSpec::Pull {
+                url: "https://src.example/live.m3u8".into(),
+            }],
+            vec![copy_profile("copy")],
+            vec![OutputSpec::Hls {
+                variant: HlsVariant::Std,
+                profile: "copy".into(),
+            }],
+        );
+        let paths = paths_with_secrets(&[]);
+        let argv = build_argv(&s, &paths).expect("builds");
+
+        let expected = HlsOutputTarget::new(&paths.stream_data_dir, s.id, "copy", HlsVariant::Std)
+            .ffmpeg_output_args();
+
+        // The Hls output's own argv fragment is the trailing portion of the
+        // full argv (after the shared input/map/codec args this test
+        // doesn't otherwise assert on) -- it must appear verbatim, in the
+        // exact order `HlsOutputTarget` produces it, not just as scattered
+        // sub-fragments.
+        assert!(
+            argv.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "expected the exact HlsOutputTarget fragment {expected:?} inside argv: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "-master_pl_name"));
+        assert!(argv.iter().any(|a| a == "master.m3u8"));
     }
 
     // Case 3: SRT in -> SRT push, x265.

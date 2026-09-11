@@ -209,7 +209,8 @@ async fn ingest_auth_denies_disabled_config() {
                 .header(SERVICE_KEY_HEADER, SERVICE_KEY)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"kind": "rtmp", "key": "demo-stream-key-disabled"}).to_string(),
+                    serde_json::json!({"kind": "rtmp", "key": "demo-stream-key-disabled"})
+                        .to_string(),
                 ))
                 .unwrap(),
         )

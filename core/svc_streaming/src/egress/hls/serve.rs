@@ -291,6 +291,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_entry_has_exactly_the_documented_field_set() {
+        // Output-validation regression guard (`rules/security.md` Output
+        // Validation): `core/svc_presentation/blueprints/live_stream.py`'s
+        // `_normalize_pipelines` reads exactly `id`/`profile`/`url`/
+        // `started_at` off each entry and silently drops anything it
+        // doesn't recognize -- an extra or renamed field here degrades
+        // playback there without either side raising an error, so pin the
+        // exact key set rather than only spot-checking a few of them (as
+        // `listing_returns_pipelines_as_json` above does).
+        let pipeline_id = Uuid::new_v4();
+        let app = hls_router(state_with(vec![RunningPipeline {
+            id: pipeline_id,
+            profile: "1080p60".into(),
+            started_at: Utc::now(),
+        }]));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/live/community-1")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let top_level_keys: std::collections::BTreeSet<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top_level_keys,
+            std::collections::BTreeSet::from(["pipelines"])
+        );
+
+        let entry = parsed["pipelines"][0].as_object().unwrap();
+        let entry_keys: std::collections::BTreeSet<&str> =
+            entry.keys().map(String::as_str).collect();
+        assert_eq!(
+            entry_keys,
+            std::collections::BTreeSet::from(["id", "profile", "url", "started_at"])
+        );
+        assert_eq!(entry["id"], pipeline_id.to_string());
+        assert_eq!(entry["profile"], "1080p60");
+        assert_eq!(
+            entry["url"],
+            format!("/live/community-1/{pipeline_id}/1080p60/master.m3u8")
+        );
+        assert!(entry["started_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
     async fn listing_rejects_unsafe_community_id() {
         let app = hls_router(state_with(vec![]));
         let response = app
