@@ -252,6 +252,24 @@ jobs:
           working-directory: mobile/gazer
           command: flutter pub get
 
+      # The `secrets` context is not a recognized named-value in `if:` conditionals (job- or
+      # step-level) -- GitHub Actions rejects the whole workflow file at parse time if it's used
+      # there ("Unrecognized named-value: 'secrets'"), confirmed by run 34547396519 failing with
+      # zero jobs scheduled. The standard workaround: read the secret into `env:` (allowed) in a
+      # step that always runs, emit a step output, and gate the real step on `steps.*.outputs`
+      # (which IS available in step.if) instead of `secrets` directly.
+      - name: Check for upload keystore secret
+        id: check_keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_B64}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Never inline ${{ secrets.* }} inside `run:` (zizmor template-injection rule) -- every
       # secret value crosses into the shell only via `env:`. Runs as root (this job container's
       # default user -- see options: --user 0:0 above), unlike the run-as-appuser steps around
@@ -259,7 +277,7 @@ jobs:
       # later step that reads key.properties/the keystore (the two `flutter build` steps below)
       # runs as appuser via run-as-appuser and needs read access to what this step writes.
       - name: Decode upload keystore and write key.properties
-        if: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_B64 != '' }}
+        if: steps.check_keystore.outputs.present == 'true'
         working-directory: mobile/gazer/android
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_B64 }}
