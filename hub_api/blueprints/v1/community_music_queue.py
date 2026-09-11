@@ -33,13 +33,15 @@ from flask_core.tenancy import get_tenant_context, tenant_middleware
 from quart import Blueprint, current_app, jsonify, request
 from quart_schema import validate_request, validate_response
 
+from config import HubAPIConfig
 from services import community_music_queue_service as svc
 from services.community_authz import authorize_community
 from services.community_common import is_valid_service_key
 from services.current_user import get_current_user_id, get_optional_current_user_id
 from services.dto_response import jsonify_dto
 from services.errors import ApiError, bad_request, not_found
-from services.music_status_service import check_spotify_health
+from services.music_status_service import check_spotify_health, check_youtube_health
+from services.rate_limiting import RATE_LIMITER_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,58 @@ music_internal_bp = Blueprint(
 def _dal() -> tuple[Any, Any]:
     """Return `(async_dal, dal)` from app config -- tables already bound at startup."""
     return current_app.config["async_dal"], current_app.config["dal"]
+
+
+#: `app.config` key a lazily-opened raw Valkey client is cached under, for
+#: apps that never called `services.rate_limiting.install_rate_limiting()`
+#: -- see `_redis_client()`'s own docstring for when this path is used.
+MUSIC_PLAYBACK_REDIS_CONFIG_KEY = "music_playback_redis"
+
+
+def _redis_client() -> Any:
+    """Resolve the async Valkey/Redis client used for `music:playback:*` state (gh-315).
+
+    `app.py::create_app()` (outside this task's edit scope) always wires
+    ONE Redis/Valkey connection via `services.rate_limiting.
+    install_rate_limiting()` -> `flask_core.rate_limiter.RateLimiter` --
+    reused directly here (`RateLimiter._redis`, the raw `redis.asyncio`
+    client that class opens against `HubAPIConfig.valkey_url`) whenever it
+    exists, so this feature never opens a second real connection in
+    production. `RateLimiter` exposes no public accessor for its raw
+    client (it's a rate-limiting abstraction, not a generic cache), so
+    this reaches its private attribute directly rather than duplicating
+    connection logic against a private, third-party (`libs/flask_core`,
+    outside this task's edit scope) implementation detail.
+
+    Test apps (and any hypothetical deployment that never calls
+    `install_rate_limiting`) have no `RateLimiter` instance at all -- for
+    those, a client is opened lazily against the same `HubAPIConfig.
+    valkey_url` (`VALKEY_URL`/`REDIS_URL`, `config.py`'s own fallback
+    chain) and cached on `current_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_
+    KEY]` so at most one is ever created per app process, never per
+    request.
+    """
+    limiter = current_app.config.get(RATE_LIMITER_CONFIG_KEY)
+    existing = getattr(limiter, "_redis", None) if limiter is not None else None
+    if existing is not None:
+        return existing
+
+    cached = current_app.config.get(MUSIC_PLAYBACK_REDIS_CONFIG_KEY)
+    if cached is not None:
+        return cached
+
+    import redis.asyncio as redis_asyncio
+
+    cfg = cast(HubAPIConfig, current_app.config["HUB_API_CONFIG"])
+    client = redis_asyncio.from_url(
+        cfg.valkey_url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    current_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY] = client
+    return client
 
 
 def _tenant_id() -> int:
@@ -259,6 +313,7 @@ async def enqueue_song_request(data: EnqueueRequestRequest, community_id: int) -
         item = await svc.enqueue_request(
             async_dal,
             dal,
+            _redis_client(),
             tenant_id=_tenant_id(),
             community_id=community_id,
             url_or_query=data.urlOrQuery,
@@ -340,6 +395,7 @@ async def kick_song(community_id: int, queue_id: int) -> Any:
         await svc.kick_song(
             async_dal,
             dal,
+            _redis_client(),
             tenant_id=_tenant_id(),
             community_id=community_id,
             queue_id=queue_id,
@@ -409,7 +465,9 @@ async def advance_queue(community_id: int) -> Any:
     async_dal, dal = _dal()
     try:
         await authorize_community(request, async_dal, dal, community_id=community_id, admin=True)
-        previous, next_item = await svc.advance_queue(async_dal, dal, community_id=community_id)
+        previous, next_item = await svc.advance_queue(
+            async_dal, dal, _redis_client(), community_id=community_id
+        )
     except ApiError as exc:
         return _err(exc)
     return jsonify_dto(AdvanceResponse(success=True, previous=previous, next=next_item))
@@ -527,6 +585,7 @@ async def internal_enqueue_song_request() -> Any:
         item = await svc.enqueue_request(
             async_dal,
             dal,
+            _redis_client(),
             tenant_id=tenant_id,
             community_id=community_id,
             url_or_query=url_or_query,
@@ -655,6 +714,7 @@ async def internal_music_status() -> Any:
 
         length = await svc.queue_length(async_dal, dal, community_id=community_id)
         health = await check_spotify_health()
+        youtube_health = await check_youtube_health()
     except ApiError as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
@@ -663,7 +723,14 @@ async def internal_music_status() -> Any:
         )
         return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
 
-    state = "enabled" if health.healthy else "error"
+    # Top-level `state`/`cause`/`provider` keep their pre-YouTube meaning
+    # (Spotify's own health) byte-compatible for existing callers, except
+    # `state` is now an OR across both providers -- see `providers` below
+    # for each provider's own state/cause, and `playback_provider` for
+    # which one actually serves full-length playback.
+    spotify_state = "enabled" if health.healthy else "error"
+    state = "enabled" if (health.healthy or youtube_health.state == "enabled") else "error"
+    playback_provider = "youtube" if youtube_health.state == "enabled" else "spotify"
     return (
         jsonify(
             {
@@ -673,6 +740,11 @@ async def internal_music_status() -> Any:
                     "cause": health.cause,
                     "provider": "spotify",
                     "queue_length": length,
+                    "providers": {
+                        "spotify": {"state": spotify_state, "cause": health.cause},
+                        "youtube": {"state": youtube_health.state, "cause": youtube_health.cause},
+                    },
+                    "playback_provider": playback_provider,
                 },
                 "meta": {"version": 1},
             }
@@ -687,6 +759,25 @@ async def internal_music_status() -> Any:
 
 
 @dataclass(slots=True, frozen=True)
+class PlaybackSnapshotDTO:
+    """`data.playback` wire shape (gh-315) -- shared by both live-queue-read endpoints.
+
+    `paused`/`paused_since` reflect the community's raw `music:playback:*`
+    Valkey state; `position_ms` is `None` whenever nothing's playing.
+    """
+
+    paused: bool
+    paused_since: str | None
+    position_ms: int | None
+
+
+def _playback_snapshot(snapshot: svc.LiveQueueSnapshot) -> PlaybackSnapshotDTO:
+    return PlaybackSnapshotDTO(
+        paused=snapshot.paused, paused_since=snapshot.paused_since, position_ms=snapshot.position_ms
+    )
+
+
+@dataclass(slots=True, frozen=True)
 class LiveQueueStateResponse:
     """`{status, data, meta}`-enveloped data payload for the internal live-queue GET."""
 
@@ -694,6 +785,7 @@ class LiveQueueStateResponse:
     now_playing: svc.LiveQueueItemDTO | None
     queue: list[svc.LiveQueueItemDTO]
     updated_at: str
+    playback: PlaybackSnapshotDTO
 
 
 @dataclass(slots=True, frozen=True)
@@ -705,6 +797,7 @@ class LiveQueueAdvanceResponse:
     queue: list[svc.LiveQueueItemDTO]
     updated_at: str
     advanced: bool
+    playback: PlaybackSnapshotDTO
 
 
 def _live_envelope(data: Any) -> tuple[Any, int]:
@@ -753,8 +846,8 @@ async def internal_get_live_queue() -> Any:
         if community_row is None:
             return _err(not_found("Community not found"))
 
-        now_playing, queue, _advanced = await svc.get_live_queue_state(
-            async_dal, dal, community_id=community_id, auto_advance=True
+        snapshot = await svc.get_live_queue_state(
+            async_dal, dal, _redis_client(), community_id=community_id, auto_advance=True
         )
     except ApiError as exc:
         return _err(exc)
@@ -767,9 +860,10 @@ async def internal_get_live_queue() -> Any:
     return _live_envelope(
         LiveQueueStateResponse(
             community_id=community_id,
-            now_playing=now_playing,
-            queue=queue,
+            now_playing=snapshot.now_playing,
+            queue=snapshot.queue,
             updated_at=datetime.now(UTC).isoformat(),
+            playback=_playback_snapshot(snapshot),
         )
     )
 
@@ -801,8 +895,8 @@ async def internal_advance_live_queue() -> Any:
         if community_row is None:
             return _err(not_found("Community not found"))
 
-        now_playing, queue, advanced = await svc.advance_live_queue(
-            async_dal, dal, community_id=community_id, item_id=item_id
+        snapshot = await svc.advance_live_queue(
+            async_dal, dal, _redis_client(), community_id=community_id, item_id=item_id
         )
     except ApiError as exc:
         return _err(exc)
@@ -815,12 +909,59 @@ async def internal_advance_live_queue() -> Any:
     return _live_envelope(
         LiveQueueAdvanceResponse(
             community_id=community_id,
-            now_playing=now_playing,
-            queue=queue,
+            now_playing=snapshot.now_playing,
+            queue=snapshot.queue,
             updated_at=datetime.now(UTC).isoformat(),
-            advanced=advanced,
+            advanced=snapshot.advanced,
+            playback=_playback_snapshot(snapshot),
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Internal: pause/resume the currently-playing track (gh-315)
+# ---------------------------------------------------------------------------
+
+
+@music_internal_bp.route("/music/playback", methods=["POST"])
+async def internal_set_music_playback() -> Any:
+    """`POST /api/v1/internal/music/playback` -- service-to-service only (gh-315).
+
+    Body: `{"community_id": int, "action": "pause"|"resume"}`. Pauses or
+    resumes the community's currently-`playing` track by writing/clearing
+    `music:playback:{community_id}` in Valkey -- see `services.
+    community_music_queue_service.set_playback()`'s own docstring for the
+    full state machine (`reason` in `{"paused", "resumed",
+    "already_paused", "already_playing", "nothing_playing"}`, `changed`
+    `False` for every no-op reason).
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    body = await request.get_json(force=True, silent=True) or {}
+    community_id = body.get("community_id")
+    action = body.get("action")
+    if not isinstance(community_id, int) or not isinstance(action, str):
+        return {"success": False, "error": "community_id and action are required"}, 400
+
+    async_dal, dal = _dal()
+    try:
+        community_row = dal(dal.communities.id == community_id).select(dal.communities.id).first()
+        if community_row is None:
+            return _err(not_found("Community not found"))
+
+        result = await svc.set_playback(
+            async_dal, dal, _redis_client(), community_id=community_id, action=action
+        )
+    except ApiError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_set_music_playback.unhandled_error", extra={"community_id": community_id}
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
+
+    return _live_envelope(result)
 
 
 BLUEPRINTS: list[Blueprint] = [music_queue_bp, music_internal_bp]

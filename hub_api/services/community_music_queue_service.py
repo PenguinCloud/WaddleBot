@@ -29,7 +29,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from services.errors import ApiError, bad_request, forbidden, not_found, unprocessable
@@ -533,15 +533,16 @@ async def _sum_duration_ms_ahead(
 
 
 async def _compute_eta_seconds(
-    async_dal: Any, dal: Any, *, community_id: int, position: int
+    async_dal: Any, dal: Any, redis_client: Any, *, community_id: int, position: int
 ) -> int:
     """ETA (seconds) until `position` starts playing: queued-ahead durations + playing remainder.
 
     `0` means "next up" (nothing queued ahead AND nothing currently
-    playing). The currently-`playing` item's remaining time is derived
-    from `started_at` + its track's `duration_ms`, clamped to >=0 (a
-    `playing` row with a stale/missing `started_at` degrades to counting
-    its full duration rather than raising).
+    playing). The currently-`playing` item's remaining time is `duration_ms
+    - elapsed_ms` (gh-315 `_elapsed_ms()` -- pause-aware, "as if resumed
+    now" while paused, see that function's own docstring), clamped to >=0
+    (a `playing` row with a stale/missing `started_at` degrades to
+    counting its full duration rather than raising).
     """
     total_ms = await _sum_duration_ms_ahead(
         async_dal, dal, community_id=community_id, position=position
@@ -557,7 +558,10 @@ async def _compute_eta_seconds(
         duration_ms = int(track_row.duration_ms or 0)
         started_at = _as_aware_utc(playing_row.started_at)
         if started_at is not None:
-            elapsed_ms = max(0, int((datetime.now(UTC) - started_at).total_seconds() * 1000))
+            playback = await _read_playback_state(redis_client, community_id=community_id)
+            elapsed_ms = _elapsed_ms(
+                started_at=started_at, now=datetime.now(UTC), playback=playback
+            )
             remaining_ms = max(0, duration_ms - elapsed_ms)
         else:
             remaining_ms = duration_ms
@@ -594,6 +598,7 @@ async def _next_queue_position(async_dal: Any, dal: Any, *, community_id: int) -
 async def enqueue_request(
     async_dal: Any,
     dal: Any,
+    redis_client: Any,
     *,
     tenant_id: int,
     community_id: int,
@@ -646,7 +651,7 @@ async def enqueue_request(
     queue_rows = await async_dal.select_async(dal(dal.music_station_queue.id == int(new_id)))
     track_row = await _get_track_row(async_dal, dal, track_id=track_id)
     eta_seconds = await _compute_eta_seconds(
-        async_dal, dal, community_id=community_id, position=position
+        async_dal, dal, redis_client, community_id=community_id, position=position
     )
     return _queue_item_dto(queue_rows.first(), track_row, eta_seconds=eta_seconds)
 
@@ -748,6 +753,7 @@ async def list_queue(
 async def kick_song(
     async_dal: Any,
     dal: Any,
+    redis_client: Any,
     *,
     tenant_id: int,
     community_id: int,
@@ -755,15 +761,22 @@ async def kick_song(
     actor_user_id: int,
     reason: str | None,
 ) -> None:
-    """Remove one queue entry (any status) and record the moderation action."""
+    """Remove one queue entry (any status) and record the moderation action.
+
+    Kicking the currently-`playing` item resets `music:playback:
+    {community_id}` (gh-315) -- whatever plays next must start unpaused.
+    """
     query = (dal.music_station_queue.id == queue_id) & (
         dal.music_station_queue.community_id == community_id
     )
     rows = await async_dal.select_async(dal(query))
     if not rows:
         raise not_found(f"Queue item {queue_id} not found in this community")
+    was_playing = rows.first().status == "playing"
 
     await async_dal.update_async(query, status="removed", ended_at=datetime.now(UTC))
+    if was_playing:
+        await _clear_playback_state(redis_client, community_id=community_id)
     await _log_moderation(
         async_dal,
         dal,
@@ -839,9 +852,14 @@ async def reorder_queue(
 
 
 async def advance_queue(
-    async_dal: Any, dal: Any, *, community_id: int
+    async_dal: Any, dal: Any, redis_client: Any, *, community_id: int
 ) -> tuple[QueueItemDTO | None, QueueItemDTO | None]:
-    """Mark the current `playing` item `played`, promote the next `queued` item to `playing`."""
+    """Mark the current `playing` item `played`, promote the next `queued` item to `playing`.
+
+    Always resets `music:playback:{community_id}` (gh-315) at the end --
+    an explicit admin advance is still "an advance" per that key's own
+    reset contract, same as the lazy/live-queue auto-advance path.
+    """
     now = datetime.now(UTC)
 
     playing_query = (dal.music_station_queue.community_id == community_id) & (
@@ -884,6 +902,7 @@ async def advance_queue(
                 dal.music_station_queue.id == row.id, position=new_position
             )
 
+    await _clear_playback_state(redis_client, community_id=community_id)
     return previous_dto, next_dto
 
 
@@ -959,6 +978,150 @@ def _as_aware_utc(value: Any) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+# ---------------------------------------------------------------------------
+# Playback (pause/resume) -- gh-315. State lives ENTIRELY in Valkey
+# (`music:playback:{community_id}`, JSON `{paused_since, paused_total_ms,
+# updated_at}`), never in `music_station_queue` itself -- a paused track is
+# still `status="playing"` in the DB; pausing is a clock adjustment layered
+# on top. Absence of the key means "playing" (the default), so a community
+# that never touches pause/resume needs no Valkey write at all. Written by
+# `set_playback()` below; read (and reset) by the live-queue read model.
+# ---------------------------------------------------------------------------
+
+_PLAYBACK_KEY_PREFIX = "music:playback:"
+_VALID_PLAYBACK_ACTIONS = frozenset({"pause", "resume"})
+
+
+@dataclass(slots=True, frozen=True)
+class PlaybackStateDTO:
+    """One community's current pause/resume state, read from Valkey.
+
+    `paused` is `False` (and `paused_since`/`paused_total_ms` folded into
+    the caller's own elapsed-time math as "no pause") whenever the Valkey
+    key is absent, corrupt, wrong-shape, or Valkey itself is unreachable
+    -- "playing" is always the fail-open default, never a 500. See
+    `_read_playback_state()`'s own docstring.
+    """
+
+    paused: bool
+    paused_since: datetime | None
+    paused_total_ms: int
+
+
+#: A community that's never paused (or was just reset by an advance/kick) --
+#: the same value `_read_playback_state()` returns for an absent key.
+_UNPAUSED_STATE = PlaybackStateDTO(paused=False, paused_since=None, paused_total_ms=0)
+
+
+def _playback_key(community_id: int) -> str:
+    return f"{_PLAYBACK_KEY_PREFIX}{community_id}"
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Best-effort ISO-8601 parse -- `None` on anything not a valid, non-empty string."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+async def _read_playback_state(redis_client: Any, *, community_id: int) -> PlaybackStateDTO:
+    """Best-effort read of `music:playback:{community_id}` -- never raises.
+
+    A missing key, a Valkey error, or a corrupt/wrong-shape payload all
+    collapse to `_UNPAUSED_STATE` -- see `PlaybackStateDTO`'s own
+    docstring for why fail-open is correct here (a read must never 500
+    the two queue-read endpoints that depend on it).
+    """
+    try:
+        raw = await redis_client.get(_playback_key(community_id))
+    except Exception:
+        logger.warning("music.playback.read_failed community_id=%s", community_id, exc_info=True)
+        return _UNPAUSED_STATE
+
+    if not raw:
+        return _UNPAUSED_STATE
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return _UNPAUSED_STATE
+    if not isinstance(data, dict):
+        return _UNPAUSED_STATE
+
+    paused_since = _parse_iso(data.get("paused_since"))
+    raw_total = data.get("paused_total_ms")
+    paused_total_ms = int(raw_total) if isinstance(raw_total, int | float) else 0
+    return PlaybackStateDTO(
+        paused=paused_since is not None, paused_since=paused_since, paused_total_ms=paused_total_ms
+    )
+
+
+async def _write_playback_state(
+    redis_client: Any,
+    *,
+    community_id: int,
+    paused_since: datetime | None,
+    paused_total_ms: int,
+    now: datetime,
+) -> bool:
+    """Best-effort write of the full playback JSON shape; returns success (never raises)."""
+    payload = json.dumps(
+        {
+            "paused_since": paused_since.isoformat() if paused_since else None,
+            "paused_total_ms": paused_total_ms,
+            "updated_at": now.isoformat(),
+        }
+    )
+    try:
+        await redis_client.set(_playback_key(community_id), payload)
+        return True
+    except Exception:
+        logger.warning("music.playback.write_failed community_id=%s", community_id, exc_info=True)
+        return False
+
+
+async def _clear_playback_state(redis_client: Any, *, community_id: int) -> None:
+    """Best-effort delete -- swallow errors; a failed clear just leaves a stale key.
+
+    Called on every advance (lazy or explicit) and on kicking the
+    currently-`playing` item -- the NEXT track must always start unpaused.
+    Never blocks the queue mutation that triggered it: that DB write
+    already succeeded, so a Valkey hiccup here is a lesser evil than
+    failing the whole advance/kick.
+    """
+    try:
+        await redis_client.delete(_playback_key(community_id))
+    except Exception:
+        logger.warning("music.playback.clear_failed community_id=%s", community_id, exc_info=True)
+
+
+def _elapsed_ms(*, started_at: datetime, now: datetime, playback: PlaybackStateDTO) -> int:
+    """Milliseconds of actual playback elapsed since `started_at`, pause time excluded.
+
+    `elapsed = (now - started_at) - paused_total_ms - (now - paused_since if
+    currently paused)`. While paused this is CONSTANT -- the `now -
+    paused_since` term grows in lockstep with `now - started_at`, canceling
+    out -- which is exactly "pausing stops the clock": auto-advance can
+    never fire mid-pause (`_sync_get_live_state`'s own expiry check uses
+    this directly), and `duration_ms - elapsed_ms` is automatically the
+    correct "ETA as if resumed right now" with no special-casing.
+    """
+    elapsed_ms = (now - started_at).total_seconds() * 1000
+    elapsed_ms -= playback.paused_total_ms
+    if playback.paused_since is not None:
+        elapsed_ms -= (now - playback.paused_since).total_seconds() * 1000
+    return max(0, int(elapsed_ms))
+
+
+def _clamped_position_ms(elapsed_ms: int, duration_ms: int) -> int:
+    """`elapsed_ms` clamped to `[0, duration_ms]` -- never past the end of the track."""
+    return max(0, min(elapsed_ms, duration_ms))
+
+
 def _sync_resolve_requested_by(
     dal: Any, *, community_id: int, requested_by: int | None
 ) -> RequestedByDTO:
@@ -1015,7 +1178,13 @@ def _sync_live_item_dto(
 
 
 def _sync_build_live_dtos(
-    dal: Any, *, community_id: int, playing_row: Any, queued_rows: list[Any], now: datetime
+    dal: Any,
+    *,
+    community_id: int,
+    playing_row: Any,
+    queued_rows: list[Any],
+    now: datetime,
+    playback: PlaybackStateDTO,
 ) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO]]:
     """Build `(now_playing, queue)` DTOs from already-locked/committed rows.
 
@@ -1023,7 +1192,10 @@ def _sync_build_live_dtos(
     of it plus the currently-playing track's own remaining time -- same
     formula as `_compute_eta_seconds()` above, recomputed here from the
     rows already in hand (no extra query) since this always runs inside
-    the same locked transaction that read them. `now_playing` itself gets
+    the same locked transaction that read them. `playback` (gh-315) makes
+    the playing track's remaining time pause-aware via `_elapsed_ms()` --
+    while paused, ETAs for everything queued behind it are naturally
+    frozen too (computed "as if resumed now"). `now_playing` itself gets
     `eta_seconds=None` -- it's already playing, there's nothing to wait
     for.
     """
@@ -1046,7 +1218,7 @@ def _sync_build_live_dtos(
         duration_ms = int(track.duration_ms or 0)
         started_at = _as_aware_utc(playing_row.started_at)
         if started_at is not None:
-            elapsed_ms = max(0, int((now - started_at).total_seconds() * 1000))
+            elapsed_ms = _elapsed_ms(started_at=started_at, now=now, playback=playback)
             running_ahead_ms = max(0, duration_ms - elapsed_ms)
         else:
             running_ahead_ms = duration_ms
@@ -1065,7 +1237,12 @@ def _sync_build_live_dtos(
 
 
 def _sync_get_live_state(
-    dal: Any, *, community_id: int, auto_advance: bool, now: datetime
+    dal: Any,
+    *,
+    community_id: int,
+    auto_advance: bool,
+    now: datetime,
+    playback: PlaybackStateDTO,
 ) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
     """Single executor job: lock + (optionally) auto-advance/auto-start + build DTOs + commit.
 
@@ -1109,11 +1286,14 @@ def _sync_get_live_state(
                 track = dal(dal.music_tracks.id == playing_row.track_id).select().first()
                 duration_ms = int(track.duration_ms or 0) if track is not None else 0
                 started_at = _as_aware_utc(playing_row.started_at)
+                # gh-315: pause-aware elapsed -- `_elapsed_ms()` freezes while
+                # `playback.paused`, so a track paused past its own duration
+                # never expires here (the auto-advance-not-firing-while-paused
+                # contract), with no separate `if playback.paused: skip` branch
+                # needed.
                 expired = started_at is not None and (
-                    started_at
-                    + timedelta(milliseconds=duration_ms)
-                    + timedelta(seconds=_ADVANCE_GRACE_SECONDS)
-                    < now
+                    _elapsed_ms(started_at=started_at, now=now, playback=playback)
+                    >= duration_ms + _ADVANCE_GRACE_SECONDS * 1000
                 )
                 if expired:
                     dal(q.id == playing_row.id).update(status="played", ended_at=now)
@@ -1147,6 +1327,7 @@ def _sync_get_live_state(
             playing_row=playing_row,
             queued_rows=queued_rows,
             now=now,
+            playback=playback,
         )
         dal.commit()
         return now_playing_dto, queue_dtos, advanced
@@ -1156,7 +1337,7 @@ def _sync_get_live_state(
 
 
 def _sync_guarded_advance(
-    dal: Any, *, community_id: int, item_id: int, now: datetime
+    dal: Any, *, community_id: int, item_id: int, now: datetime, playback: PlaybackStateDTO
 ) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
     """Single executor job: advance ONLY if `item_id` is still the community's `playing` item.
 
@@ -1209,6 +1390,7 @@ def _sync_guarded_advance(
             playing_row=playing_row,
             queued_rows=queued_rows,
             now=now,
+            playback=playback,
         )
         dal.commit()
         return now_playing_dto, queue_dtos, advanced
@@ -1217,33 +1399,302 @@ def _sync_guarded_advance(
         raise
 
 
+@dataclass(slots=True, frozen=True)
+class LiveQueueSnapshot:
+    """Bundled result of a live-queue read/advance -- avoids a 6-element return tuple (gh-315).
+
+    `paused`/`paused_since` are the community's raw Valkey playback state
+    (independent of what's playing); `position_ms` is `None` whenever
+    `now_playing` is `None` -- there's nothing to report a position for.
+    """
+
+    now_playing: LiveQueueItemDTO | None
+    queue: list[LiveQueueItemDTO]
+    advanced: bool
+    paused: bool
+    paused_since: str | None
+    position_ms: int | None
+
+
+def _now_playing_position_ms(
+    now_playing: LiveQueueItemDTO | None, playback: PlaybackStateDTO, now: datetime
+) -> int | None:
+    """`position_ms` for `now_playing`, or `None` if nothing's playing (gh-315).
+
+    Reconstructs `started_at` from `LiveQueueItemDTO.started_at`'s own ISO
+    string (produced by `_iso()` from an already-UTC-aware `datetime`, so
+    `fromisoformat()` round-trips it exactly) rather than re-querying the
+    DB -- this always runs right after the DTO was built, in the same
+    async wrapper, from the exact `now` used for that build.
+    """
+    if now_playing is None or now_playing.started_at is None:
+        return None
+    started_at = _parse_iso(now_playing.started_at) or now
+    elapsed_ms = _elapsed_ms(started_at=started_at, now=now, playback=playback)
+    return _clamped_position_ms(elapsed_ms, now_playing.duration_ms)
+
+
 async def get_live_queue_state(
-    async_dal: Any, dal: Any, *, community_id: int, auto_advance: bool
-) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
+    async_dal: Any, dal: Any, redis_client: Any, *, community_id: int, auto_advance: bool
+) -> LiveQueueSnapshot:
     """Read a community's live queue; `auto_advance=True` also expires/promotes atomically.
 
     `auto_advance=False` (the public, unauthenticated page) is a pure
     read with no side effects -- runs through the same locking helper for
     one consistent code path, but never mutates anything itself (`_sync_
     get_live_state`'s own `if auto_advance:` guard).
+
+    Playback state (gh-315) is read from Valkey BEFORE entering the locked
+    executor job and used for that job's own auto-advance-expiry check and
+    ETA math -- a pause/resume racing this call is accepted as a minor,
+    documented staleness window (Valkey and the `music_station_queue`
+    lock are two separate stores, never one transaction). If this call
+    itself advances the queue (lazy expiry or auto-start), the playback
+    key is reset (`_clear_playback_state`) and the returned snapshot
+    reports the fresh, unpaused state for whatever's playing now.
     """
     loop = asyncio.get_event_loop()
     now = datetime.now(UTC)
-    return await loop.run_in_executor(
+    playback = await _read_playback_state(redis_client, community_id=community_id)
+    now_playing, queue, advanced = await loop.run_in_executor(
         async_dal.executor,
         lambda: _sync_get_live_state(
-            dal, community_id=community_id, auto_advance=auto_advance, now=now
+            dal, community_id=community_id, auto_advance=auto_advance, now=now, playback=playback
         ),
+    )
+    if advanced:
+        await _clear_playback_state(redis_client, community_id=community_id)
+        playback = _UNPAUSED_STATE
+    return LiveQueueSnapshot(
+        now_playing=now_playing,
+        queue=queue,
+        advanced=advanced,
+        paused=playback.paused,
+        paused_since=_iso(playback.paused_since),
+        position_ms=_now_playing_position_ms(now_playing, playback, now),
     )
 
 
 async def advance_live_queue(
-    async_dal: Any, dal: Any, *, community_id: int, item_id: int
-) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
-    """Guarded advance: only if `item_id` is the community's current `playing` item."""
+    async_dal: Any, dal: Any, redis_client: Any, *, community_id: int, item_id: int
+) -> LiveQueueSnapshot:
+    """Guarded advance: only if `item_id` is the community's current `playing` item.
+
+    Resets `music:playback:{community_id}` (gh-315) whenever `advanced`
+    ends up `True` -- see `LiveQueueSnapshot`'s own docstring for the
+    returned shape.
+    """
     loop = asyncio.get_event_loop()
     now = datetime.now(UTC)
-    return await loop.run_in_executor(
+    playback = await _read_playback_state(redis_client, community_id=community_id)
+    now_playing, queue, advanced = await loop.run_in_executor(
         async_dal.executor,
-        lambda: _sync_guarded_advance(dal, community_id=community_id, item_id=item_id, now=now),
+        lambda: _sync_guarded_advance(
+            dal, community_id=community_id, item_id=item_id, now=now, playback=playback
+        ),
+    )
+    if advanced:
+        await _clear_playback_state(redis_client, community_id=community_id)
+        playback = _UNPAUSED_STATE
+    return LiveQueueSnapshot(
+        now_playing=now_playing,
+        queue=queue,
+        advanced=advanced,
+        paused=playback.paused,
+        paused_since=_iso(playback.paused_since),
+        position_ms=_now_playing_position_ms(now_playing, playback, now),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Playback (pause/resume) mutation -- `POST /api/v1/internal/music/playback`
+# (gh-315). Unlike the live-queue read model above, this needs no `SELECT
+# ... FOR UPDATE` locked-transaction executor job: Valkey, not this table's
+# own `status` column, is the resource being mutated, so it stays on the
+# ordinary `async_dal.select_async()` path every other function in this
+# module (outside the "Live queue read model" section) already uses.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class PlaybackActionResultDTO:
+    """Response payload for `POST /api/v1/internal/music/playback`.
+
+    `now_playing` is the same `LiveQueueItemDTO` shape the live-queue
+    endpoints return (this is an internal, service-key-gated, overlay-
+    adjacent endpoint, same family) -- `None` only when `reason ==
+    "nothing_playing"`.
+    """
+
+    community_id: int
+    paused: bool
+    paused_since: str | None
+    position_ms: int | None
+    now_playing: LiveQueueItemDTO | None
+    changed: bool
+    reason: str
+
+
+async def _async_resolve_requested_by(
+    async_dal: Any, dal: Any, *, community_id: int, requested_by: int | None
+) -> RequestedByDTO:
+    """Async, non-blocking counterpart of `_sync_resolve_requested_by()` -- same lookup.
+
+    `set_playback()` doesn't run inside `_sync_get_live_state()`'s locked
+    executor job (see this section's own module comment), so it needs an
+    `async_dal.select_async()`-based version rather than the sync `dal(
+    ...).select()` the executor-only helper uses.
+    """
+    if requested_by is None:
+        return RequestedByDTO(display_name=_DISPLAY_NAME_FALLBACK, platform=_PLATFORM_FALLBACK)
+
+    query = (
+        (dal.community_members.community_id == community_id)
+        & (dal.community_members.user_id == str(requested_by))
+        & (dal.community_members.is_active == True)  # noqa: E712 - pydal idiom
+    )
+    rows = await async_dal.select_async(
+        dal(query), orderby=dal.community_members.id, limitby=(0, 1)
+    )
+    if not rows or not rows.first().display_name:
+        platform = rows.first().platform if rows and rows.first().platform else _PLATFORM_FALLBACK
+        return RequestedByDTO(display_name=_DISPLAY_NAME_FALLBACK, platform=platform)
+    row = rows.first()
+    return RequestedByDTO(
+        display_name=row.display_name, platform=row.platform or _PLATFORM_FALLBACK
+    )
+
+
+async def _async_live_item_dto(
+    async_dal: Any, dal: Any, row: Any, track: Any, *, community_id: int, eta_seconds: int | None
+) -> LiveQueueItemDTO:
+    """Async, non-blocking counterpart of `_sync_live_item_dto()` -- see that function's shape."""
+    requested_by = await _async_resolve_requested_by(
+        async_dal, dal, community_id=community_id, requested_by=row.requested_by
+    )
+    return LiveQueueItemDTO(
+        id=int(row.id),
+        position=int(row.position),
+        status=row.status,
+        title=track.title,
+        artist=track.artist,
+        duration_ms=int(track.duration_ms or 0),
+        artwork_url=track.artwork_url,
+        provider=track.provider,
+        external_id=track.external_id,
+        url=track.url,
+        eta_seconds=eta_seconds,
+        started_at=_iso(row.started_at),
+        requested_by=requested_by,
+    )
+
+
+async def set_playback(
+    async_dal: Any, dal: Any, redis_client: Any, *, community_id: int, action: str
+) -> PlaybackActionResultDTO:
+    """Pause or resume a community's currently-playing track (gh-315).
+
+    Mutates ONLY `music:playback:{community_id}` -- never the
+    `music_station_queue` row's own `status`/`started_at` (a paused track
+    is still, in DB terms, `status="playing"`; pausing is purely a clock
+    adjustment layered on top, see `_elapsed_ms()`'s own docstring).
+    `reason="nothing_playing"` short-circuits before touching Valkey at
+    all -- there's no clock to pause/resume with nothing in the `playing`
+    slot. `already_paused`/`already_playing` are no-ops (`changed=False`,
+    no Valkey write) -- idempotent by design, never an error.
+    """
+    if action not in _VALID_PLAYBACK_ACTIONS:
+        raise bad_request("action must be 'pause' or 'resume'")
+
+    playing_query = (dal.music_station_queue.community_id == community_id) & (
+        dal.music_station_queue.status == "playing"
+    )
+    playing_rows = await async_dal.select_async(dal(playing_query))
+    if not playing_rows:
+        logger.debug(
+            "music.playback.nothing_playing community_id=%s action=%s", community_id, action
+        )
+        return PlaybackActionResultDTO(
+            community_id=community_id,
+            paused=False,
+            paused_since=None,
+            position_ms=None,
+            now_playing=None,
+            changed=False,
+            reason="nothing_playing",
+        )
+
+    playing_row = playing_rows.first()
+    track_row = await _get_track_row(async_dal, dal, track_id=playing_row.track_id)
+    duration_ms = int(track_row.duration_ms or 0)
+    started_at = _as_aware_utc(playing_row.started_at)
+    now = datetime.now(UTC)
+    current = await _read_playback_state(redis_client, community_id=community_id)
+
+    if action == "pause":
+        if current.paused:
+            new_state, changed, reason = current, False, "already_paused"
+            logger.debug("music.playback.already_paused community_id=%s", community_id)
+        else:
+            ok = await _write_playback_state(
+                redis_client,
+                community_id=community_id,
+                paused_since=now,
+                paused_total_ms=current.paused_total_ms,
+                now=now,
+            )
+            if not ok:
+                raise ApiError(
+                    "Unable to persist playback state", 503, "PLAYBACK_STORE_UNAVAILABLE"
+                )
+            new_state = PlaybackStateDTO(
+                paused=True, paused_since=now, paused_total_ms=current.paused_total_ms
+            )
+            changed, reason = True, "paused"
+            logger.debug(
+                "music.playback.paused community_id=%s queue_id=%s", community_id, playing_row.id
+            )
+    else:  # resume
+        if not current.paused:
+            new_state, changed, reason = current, False, "already_playing"
+            logger.debug("music.playback.already_playing community_id=%s", community_id)
+        else:
+            paused_since = current.paused_since
+            assert paused_since is not None  # noqa: S101 - current.paused implies this
+            additional_pause_ms = max(0, int((now - paused_since).total_seconds() * 1000))
+            new_total = current.paused_total_ms + additional_pause_ms
+            ok = await _write_playback_state(
+                redis_client,
+                community_id=community_id,
+                paused_since=None,
+                paused_total_ms=new_total,
+                now=now,
+            )
+            if not ok:
+                raise ApiError(
+                    "Unable to persist playback state", 503, "PLAYBACK_STORE_UNAVAILABLE"
+                )
+            new_state = PlaybackStateDTO(paused=False, paused_since=None, paused_total_ms=new_total)
+            changed, reason = True, "resumed"
+            logger.debug(
+                "music.playback.resumed community_id=%s queue_id=%s", community_id, playing_row.id
+            )
+
+    position_ms: int | None = None
+    if started_at is not None:
+        elapsed_ms = _elapsed_ms(started_at=started_at, now=now, playback=new_state)
+        position_ms = _clamped_position_ms(elapsed_ms, duration_ms)
+
+    now_playing_dto = await _async_live_item_dto(
+        async_dal, dal, playing_row, track_row, community_id=community_id, eta_seconds=None
+    )
+
+    return PlaybackActionResultDTO(
+        community_id=community_id,
+        paused=new_state.paused,
+        paused_since=_iso(new_state.paused_since),
+        position_ms=position_ms,
+        now_playing=now_playing_dto,
+        changed=changed,
+        reason=reason,
     )

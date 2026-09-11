@@ -34,6 +34,19 @@ unrecognized `key` (only `youtube_allowed_labels` is implemented so far)
 replies `song requests: unknown setting '<key>'` without a hub-api round
 trip.
 
+A fourth payload shape -- `subcommand="pause"|"resume"` (no other fields;
+`social_music_process._handle_pause_resume_subcommand`'s successful-parse
+output) -- routes `!sr pause`/`!sr resume` here too, same
+`PROCESS_TARGET_APP_ID_KEY` mechanism. `_set_playback()` calls hub-api's
+service-key-gated `POST /api/v1/internal/music/playback` and maps the
+response's `reason` field to one of five exact chat replies
+(`_PLAYBACK_REPLY_BY_REASON`); an unrecognized `reason` falls back to a
+generic `song requests: playback <reason>` reply rather than silence. A
+4xx response relays hub-api's `error.message` verbatim (same convention
+as `_set_policy()`); a 5xx response, a malformed 2xx body, or an
+unreachable hub-api (including a timeout) fall back to a generic
+`playback unavailable` reply instead.
+
 Reply-in-place: same channel-resolution (payload first, config fallback)
 and Discord/Twitch dispatch as `bundles.social_quote_action`/
 `bundles.discord_send_action`/`bundles.twitch_send_action` -- each
@@ -110,6 +123,35 @@ _LABELS_CLEARED_REPLY = "youtube labels cleared — all videos allowed"
 #: (a caught `httpx.HTTPError`, including timeouts) -- distinct from
 #: `_policy_unavailable_reply()`'s 5xx/malformed-response variant below.
 _POLICY_UNREACHABLE_REPLY = "song requests: settings unavailable (hub-api unreachable)"
+
+_PLAYBACK_PATH = "/api/v1/internal/music/playback"
+_PLAYBACK_TIMEOUT_SECONDS = 5.0
+
+#: `event.payload["subcommand"]` values `social_music_process
+#: ._handle_pause_resume_subcommand` stamps on a successful `!sr pause`/
+#: `!sr resume` parse -- routes here instead of `_enqueue()`/
+#: `_check_status()`/`_set_policy()`. Matches that module's own string
+#: literals (no shared import between the two bundle processes) and
+#: doubles as the internal POST body's `"action"` field value.
+_PAUSE_SUBCOMMAND = "pause"
+_RESUME_SUBCOMMAND = "resume"
+
+#: hub-api's `reason` -> this bundle's five exact `!sr pause`/`!sr resume`
+#: chat replies (task requirement). A `reason` not in this map (future
+#: hub-api addition) falls back to a generic `song requests: playback
+#: <reason>` reply rather than silence -- see `_set_playback()`.
+_PLAYBACK_REPLY_BY_REASON: dict[str, str] = {
+    "paused": "song requests paused",
+    "resumed": "song requests resumed",
+    "already_paused": "song requests are already paused",
+    "already_playing": "song requests are already playing",
+    "nothing_playing": "nothing is playing right now",
+}
+
+#: `_set_playback()`'s reply for an unreachable/network-failed hub-api call
+#: (a caught `httpx.HTTPError`, including timeouts) -- distinct from
+#: `_playback_unavailable_reply()`'s 5xx/malformed-response variant below.
+_PLAYBACK_UNREACHABLE_REPLY = "song requests: playback unavailable (hub-api unreachable)"
 
 #: Lazily-built, process-wide Valkey client for IRC relay (same pattern as
 #: twitch_send_action.py / social_quote_action.py).
@@ -265,17 +307,48 @@ async def _enqueue(
     return (reply, data_dict)
 
 
+def _provider_status_fragment(name: str, info: object) -> str:
+    """Render one provider's `providers.<name>` sub-status as one `!sr status` reply fragment.
+
+    `"enabled"` -> `"<name> ✓"`; `"not_configured"` -> `"<name>: not
+    configured"`; anything else (including a malformed/missing `info`) ->
+    `"<name>: error - <cause>"`, defaulting `cause` to `"unknown error"`.
+    """
+    provider_info = info if isinstance(info, dict) else {}
+    provider_state = str(provider_info.get("state", ""))
+    if provider_state == "enabled":
+        return f"{name} ✓"
+    if provider_state == "not_configured":
+        return f"{name}: not configured"
+    cause = provider_info.get("cause")
+    cause_text = str(cause) if cause else "unknown error"
+    return f"{name}: error - {cause_text}"
+
+
+def _format_enabled_status_reply(providers: Mapping[str, Any]) -> str:
+    """Render `!sr status`'s per-provider `enabled` reply from hub-api's `data.providers`."""
+    youtube_fragment = _provider_status_fragment("youtube", providers.get("youtube"))
+    spotify_fragment = _provider_status_fragment("spotify", providers.get("spotify"))
+    return f"song requests: enabled ({youtube_fragment}, {spotify_fragment})"
+
+
 async def _check_status(
     http_client: httpx.AsyncClient, *, community_id: int
 ) -> tuple[str, dict[str, object] | None]:
-    """GET hub-api's internal music-status endpoint; maps it to one of `!sr status`'s 4 replies.
+    """GET hub-api's internal music-status endpoint; maps it to one of `!sr status`'s replies.
 
-    Returns a tuple of (reply text, structured data dict or None).
-    Never raises, never returns anything other than the four allowed
-    reply strings (task requirement). `offline` covers an unreachable
-    hub-api, a non-2xx response, AND a malformed 2xx body -- hub-api's
-    own `state` is only ever `"enabled"`/`"error"`, see that endpoint's
-    own docstring for why `"offline"` is entirely this function's call.
+    Returns a tuple of (reply text, structured data dict or None). Never
+    raises, never returns silence. `offline` covers an unreachable hub-api,
+    a non-2xx response, AND a malformed 2xx body -- hub-api's own top-level
+    `state` is only ever `"enabled"`/`"error"`, see that endpoint's own
+    docstring for why `"offline"` is entirely this function's call.
+
+    When hub-api's response carries a `data.providers` breakdown (Spotify +
+    YouTube), the reply is a per-provider composite
+    (`_format_enabled_status_reply()` when enabled, `"error - <spotify
+    cause>; youtube: <cause>"` when neither provider works). An
+    older-format response with no `providers` key (back-compat) falls back
+    to the original bare `"enabled"`/`"error - <cause>"` replies.
     """
     hub_api_base = os.getenv("HUB_API_URL", "http://hub-api:8204")
     service_api_key = os.getenv("SERVICE_API_KEY", "")
@@ -317,6 +390,8 @@ async def _check_status(
         data = payload["data"]
         state = str(data["state"])
         cause = data.get("cause")
+        providers_raw = data.get("providers")
+        providers = providers_raw if isinstance(providers_raw, dict) else None
     except (ValueError, KeyError, TypeError) as exc:
         logger.warning(
             "social_music_action.status_malformed_response community_id=%s error=%s",
@@ -326,14 +401,27 @@ async def _check_status(
         return (_STATUS_OFFLINE_REPLY, None)
 
     logger.debug(
-        "social_music_action.status_reply_chosen community_id=%s state=%s", community_id, state
+        "social_music_action.status_reply_chosen community_id=%s state=%s has_providers=%s",
+        community_id,
+        state,
+        providers is not None,
     )
     data_dict: dict[str, object] = {"state": state}
     if state == "enabled":
-        return (_STATUS_ENABLED_REPLY, data_dict)
+        reply = _format_enabled_status_reply(providers) if providers else _STATUS_ENABLED_REPLY
+        return (reply, data_dict)
     if state == "error":
         cause_text = str(cause) if cause else "unknown error"
         data_dict["cause"] = cause_text
+        if providers:
+            youtube_cause = providers.get("youtube")
+            youtube_cause = (
+                youtube_cause.get("cause") if isinstance(youtube_cause, dict) else None
+            )
+            youtube_cause_text = str(youtube_cause) if youtube_cause else "unknown error"
+            data_dict["youtube_cause"] = youtube_cause_text
+            reply = f"song requests: error - {cause_text}; youtube: {youtube_cause_text}"
+            return (reply, data_dict)
         return (f"song requests: error - {cause_text}", data_dict)
     # Unknown/unexpected state from hub-api -- safest reply is offline, never silence.
     return (_STATUS_OFFLINE_REPLY, None)
@@ -441,6 +529,114 @@ async def _set_policy(
     )
     reply = f"youtube labels set: {', '.join(sorted(labels))}" if labels else _LABELS_CLEARED_REPLY
     data_dict: dict[str, object] = {"key": key, "count": len(labels)}
+    return (reply, data_dict)
+
+
+def _playback_unavailable_reply(status_code: int) -> str:
+    """Render the `playback unavailable` reply for a 5xx or malformed hub-api playback response.
+
+    Distinct from `_PLAYBACK_UNREACHABLE_REPLY` (network failure/timeout --
+    no status code to report) -- see `_set_playback()`.
+    """
+    return f"song requests: playback unavailable (hub-api error {status_code})"
+
+
+async def _set_playback(
+    http_client: httpx.AsyncClient,
+    *,
+    community_id: int,
+    action: str,
+) -> tuple[str, dict[str, object] | None]:
+    """POST hub-api's internal Music Station playback endpoint; never raises.
+
+    Returns (chat reply text, structured data dict or None), same contract
+    as `_enqueue()`/`_check_status()`/`_set_policy()`. Task requirement: a
+    4xx response relays hub-api's `error.message` verbatim (it's user-
+    facing); a 5xx response, a malformed 2xx body, or an unreachable
+    hub-api (including a timeout) fall back to a generic `playback
+    unavailable` reply instead (`_playback_unavailable_reply()` /
+    `_PLAYBACK_UNREACHABLE_REPLY`). A successful response's `reason` maps
+    to one of `_PLAYBACK_REPLY_BY_REASON`'s five exact replies; an
+    unrecognized `reason` falls back to a generic `song requests: playback
+    <reason>` reply rather than silence.
+    """
+    hub_api_base = os.getenv("HUB_API_URL", "http://hub-api:8204")
+    service_api_key = os.getenv("SERVICE_API_KEY", "")
+    body = {"community_id": community_id, "action": action}
+
+    logger.debug(
+        "social_music_action.playback_request community_id=%s action=%s", community_id, action
+    )
+
+    try:
+        response = await http_client.post(
+            f"{hub_api_base}{_PLAYBACK_PATH}",
+            json=body,
+            headers={"X-Service-Key": service_api_key},
+            timeout=_PLAYBACK_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "social_music_action.playback_hub_api_unreachable community_id=%s action=%s error=%s",
+            community_id,
+            action,
+            exc,
+        )
+        return (_PLAYBACK_UNREACHABLE_REPLY, None)
+
+    logger.debug(
+        "social_music_action.playback_response community_id=%s action=%s status=%s",
+        community_id,
+        action,
+        response.status_code,
+    )
+
+    if 400 <= response.status_code < 500:
+        message = ""
+        try:
+            error_body = response.json()
+            message = str((error_body.get("error") or {}).get("message", ""))
+        except ValueError:
+            pass
+        logger.warning(
+            "social_music_action.playback_rejected community_id=%s action=%s status=%s "
+            "message=%s",
+            community_id,
+            action,
+            response.status_code,
+            message,
+        )
+        return (message or _playback_unavailable_reply(response.status_code), None)
+
+    if response.status_code >= 500:
+        logger.warning(
+            "social_music_action.playback_server_error community_id=%s action=%s status=%s",
+            community_id,
+            action,
+            response.status_code,
+        )
+        return (_playback_unavailable_reply(response.status_code), None)
+
+    try:
+        data = response.json()["data"]
+        reason = str(data["reason"])
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "social_music_action.playback_malformed_response community_id=%s action=%s error=%s",
+            community_id,
+            action,
+            exc,
+        )
+        return (_playback_unavailable_reply(response.status_code), None)
+
+    reply = _PLAYBACK_REPLY_BY_REASON.get(reason, f"song requests: playback {reason}")
+    logger.debug(
+        "social_music_action.playback_reply_chosen community_id=%s action=%s reason=%s",
+        community_id,
+        action,
+        reason,
+    )
+    data_dict: dict[str, object] = {"reason": reason}
     return (reply, data_dict)
 
 
@@ -570,8 +766,9 @@ async def enqueue_song_request(
     `app_catalog` seed row (`"entrypoint": "bundles.social_music_action:
     enqueue_song_request"`) -- kept unchanged (module docstring) even
     though a `music_status_check` payload flag now routes some events to
-    `_check_status()` instead of `_enqueue()`, and `subcommand="set"` routes
-    others to `_set_policy()` -- see module docstring.
+    `_check_status()` instead of `_enqueue()`, `subcommand="set"` routes
+    others to `_set_policy()`, and `subcommand="pause"|"resume"` routes
+    others still to `_set_playback()` -- see module docstring.
 
     Requester identity is read from the SAME already-tokenized fields
     every other bundle uses -- `event.payload["author_id"]` (platform-
@@ -633,6 +830,15 @@ async def enqueue_song_request(
             text, data = await _set_policy(
                 http_client, community_id=community_id, key=key, value=labels
             )
+    elif subcommand in (_PAUSE_SUBCOMMAND, _RESUME_SUBCOMMAND):
+        logger.debug(
+            "social_music_action.dispatch_playback community_id=%s action=%s",
+            community_id,
+            subcommand,
+        )
+        text, data = await _set_playback(
+            http_client, community_id=community_id, action=str(subcommand)
+        )
     else:
         query = payload.get("music_query")
         if not isinstance(query, str) or not query.strip():
@@ -679,6 +885,17 @@ async def enqueue_song_request(
                 channel,
                 data.get("key"),
                 data.get("count"),
+                len(text),
+            )
+        elif subcommand in (_PAUSE_SUBCOMMAND, _RESUME_SUBCOMMAND):
+            logger.info(
+                "social_music_action.playback_changed community_id=%s action=%s reason=%s "
+                "platform=%s channel=%s reply_length=%s",
+                community_id,
+                subcommand,
+                data.get("reason"),
+                platform,
+                channel,
                 len(text),
             )
         else:

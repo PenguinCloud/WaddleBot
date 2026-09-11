@@ -20,12 +20,35 @@ import pytest
 from quart import Quart
 from quart_schema import QuartSchema
 
-from blueprints.v1.public_music_queue import public_music_queue_bp
+from blueprints.v1.public_music_queue import MUSIC_PLAYBACK_REDIS_CONFIG_KEY, public_music_queue_bp
 from config import HubAPIConfig
 from services.rate_limiting import install_rate_limiting
 from tests.conftest import TENANT_SLUG
 
 _ROUTE = "/api/v1/public/communities/{community_id}/music-station/queue"
+
+
+class FakeRedis:
+    """In-memory async Redis/Valkey stand-in -- get/set/delete only, what gh-315 needs.
+
+    See `tests/test_v1_community_music_queue_internal.py::FakeRedis`'s own
+    docstring for the full rationale -- duplicated here (not imported)
+    since every test file in this port owns its own app fixture.
+    """
+
+    def __init__(self) -> None:
+        """Start with an empty in-memory key/value store."""
+        self._store: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        self._store[key] = value
+
+    async def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+
 
 #: Exact top-level key set the contract pins -- a regression test fails
 #: loudly the moment an extra (potentially PII-bearing) field sneaks in.
@@ -80,6 +103,7 @@ def app(music_station_db: Any) -> Quart:
     quart_app.config["dal"] = music_station_db.dal
     quart_app.config["async_dal"] = music_station_db
     quart_app.config["HUB_API_CONFIG"] = _test_config()
+    quart_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY] = FakeRedis()
     return quart_app
 
 
@@ -181,11 +205,37 @@ class TestShapeAndNoPII:
         assert response.status_code == 200
         body = await response.get_json()
         assert body["status"] == "success"
-        assert set(body["data"].keys()) == {"community", "now_playing", "queue"}
+        assert set(body["data"].keys()) == {"community", "now_playing", "queue", "playback"}
         assert body["data"]["community"] == {"id": community_id, "name": "Test Community"}
         assert body["data"]["now_playing"] is None
         assert body["data"]["queue"] == []
         assert response.headers.get("Cache-Control") == "no-store"
+        # Nothing playing -> no position to report, and never paused by default.
+        assert body["data"]["playback"] == {
+            "paused": False,
+            "paused_since": None,
+            "position_ms": None,
+        }
+
+    async def test_playback_shape_has_no_pii(self, client: Any, music_station_db: Any) -> None:
+        """`data.playback` (gh-315) is exactly 3 fields, none of them PII."""
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=600000)
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+
+        response = await client.get(_ROUTE.format(community_id=community_id))
+        body = await response.get_json()
+        playback = body["data"]["playback"]
+        assert set(playback.keys()) == {"paused", "paused_since", "position_ms"}
+        assert playback["paused"] is False
+        assert playback["paused_since"] is None
+        assert isinstance(playback["position_ms"], int)
 
     async def test_queue_item_key_set_has_no_pii(self, client: Any, music_station_db: Any) -> None:
         community_id = _seed_community(music_station_db)

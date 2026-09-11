@@ -29,6 +29,7 @@ from bundles.social_music_action import (
 _ENQUEUE_URL_FRAGMENT = "/api/v1/internal/music/queue/requests"
 _STATUS_URL_FRAGMENT = "/api/v1/internal/music/status"
 _POLICY_URL_FRAGMENT = "/api/v1/internal/music/policy"
+_PLAYBACK_URL_FRAGMENT = "/api/v1/internal/music/playback"
 
 
 def _hub_api_item(eta_seconds: int | None = 187) -> dict[str, Any]:
@@ -108,6 +109,23 @@ def _set_envelope(
             "subcommand": "set",
             "key": key,
             "value": value if value is not None else ["official", "lyrics"],
+            "channel_id": "123",
+            "channel_name": "testchannel",
+            "author_id": "platform-user-1",
+        },
+        platform=platform,
+    )
+
+
+def _playback_envelope(*, action: str = "pause", platform: str = "twitch") -> StageEnvelope:
+    """`!sr pause`/`!sr resume`'s outgoing event shape.
+
+    `social_music_process._handle_pause_resume_subcommand`'s successful-
+    parse payload -- `subcommand` only, no `key`/`value`.
+    """
+    return _envelope(
+        payload={
+            "subcommand": action,
             "channel_id": "123",
             "channel_name": "testchannel",
             "author_id": "platform-user-1",
@@ -434,6 +452,122 @@ class TestStatusCheck:
         assert sent["message"]["text"] == (
             "song requests: error - spotify oauth token didn't work (401)"
         )
+
+    async def _status_reply(self, data: dict[str, Any]) -> str:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"status": "success", "data": data, "meta": {"version": 1}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+        return str(sent["message"]["text"])
+
+    async def test_both_providers_enabled_replies_with_checkmarks(self) -> None:
+        text = await self._status_reply(
+            {
+                "state": "enabled",
+                "cause": None,
+                "provider": "spotify",
+                "queue_length": 2,
+                "providers": {
+                    "spotify": {"state": "enabled", "cause": None},
+                    "youtube": {"state": "enabled", "cause": None},
+                },
+                "playback_provider": "youtube",
+            }
+        )
+        assert text == "song requests: enabled (youtube ✓, spotify ✓)"
+
+    async def test_youtube_not_configured_replies_with_fragment(self) -> None:
+        text = await self._status_reply(
+            {
+                "state": "enabled",
+                "cause": None,
+                "provider": "spotify",
+                "queue_length": 2,
+                "providers": {
+                    "spotify": {"state": "enabled", "cause": None},
+                    "youtube": {
+                        "state": "not_configured",
+                        "cause": "youtube credentials not configured",
+                    },
+                },
+                "playback_provider": "spotify",
+            }
+        )
+        assert text == "song requests: enabled (youtube: not configured, spotify ✓)"
+
+    async def test_youtube_error_replies_with_cause_fragment(self) -> None:
+        text = await self._status_reply(
+            {
+                "state": "enabled",
+                "cause": None,
+                "provider": "spotify",
+                "queue_length": 2,
+                "providers": {
+                    "spotify": {"state": "enabled", "cause": None},
+                    "youtube": {
+                        "state": "error",
+                        "cause": "youtube oauth token didn't work (401)",
+                    },
+                },
+                "playback_provider": "spotify",
+            }
+        )
+        assert text == (
+            "song requests: enabled (youtube: error - youtube oauth token didn't work (401), "
+            "spotify ✓)"
+        )
+
+    async def test_neither_provider_works_replies_with_both_causes(self) -> None:
+        text = await self._status_reply(
+            {
+                "state": "error",
+                "cause": "spotify oauth token didn't work (401)",
+                "provider": "spotify",
+                "queue_length": 0,
+                "providers": {
+                    "spotify": {
+                        "state": "error",
+                        "cause": "spotify oauth token didn't work (401)",
+                    },
+                    "youtube": {
+                        "state": "not_configured",
+                        "cause": "youtube credentials not configured",
+                    },
+                },
+                "playback_provider": "spotify",
+            }
+        )
+        assert text == (
+            "song requests: error - spotify oauth token didn't work (401); "
+            "youtube: youtube credentials not configured"
+        )
+
+    async def test_old_format_response_without_providers_still_replies_enabled(self) -> None:
+        """Back-compat: an older hub-api with no `data.providers` key still replies plainly."""
+        text = await self._status_reply(
+            {"state": "enabled", "cause": None, "provider": "spotify", "queue_length": 2}
+        )
+        assert text == _STATUS_ENABLED_REPLY
+
+    async def test_old_format_response_without_providers_still_replies_error(self) -> None:
+        """Back-compat: an older hub-api with no `data.providers` key still replies plainly."""
+        text = await self._status_reply(
+            {
+                "state": "error",
+                "cause": "spotify oauth token didn't work (401)",
+                "provider": "spotify",
+                "queue_length": 0,
+            }
+        )
+        assert text == "song requests: error - spotify oauth token didn't work (401)"
 
     async def test_hub_api_unreachable_replies_offline(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -947,3 +1081,282 @@ class TestSetPolicy:
         assert "key" in caplog.text
         assert "youtube_allowed_labels" in caplog.text
         assert "count" in caplog.text
+
+
+class TestPlayback:
+    """`!sr pause`/`!sr resume` dispatch -- `subcommand="pause"|"resume"` payload routes here."""
+
+    async def test_posts_correct_playback_payload_and_service_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SERVICE_API_KEY", "s3cr3t")
+        monkeypatch.setenv("HUB_API_URL", "https://hub-api.internal")
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["method"] = request.method
+            captured["service_key"] = request.headers.get("x-service-key")
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "paused": True,
+                        "changed": True,
+                        "reason": "paused",
+                        "now_playing": None,
+                        "position_ms": None,
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _playback_envelope(action="pause"), _config(), http_client=client
+                )
+
+        assert captured["url"] == f"https://hub-api.internal{_PLAYBACK_URL_FRAGMENT}"
+        assert captured["method"] == "POST"
+        assert captured["service_key"] == "s3cr3t"
+        assert captured["body"] == {"community_id": 42, "action": "pause"}
+
+    @pytest.mark.parametrize(
+        ("reason", "expected_reply"),
+        [
+            ("paused", "song requests paused"),
+            ("resumed", "song requests resumed"),
+            ("already_paused", "song requests are already paused"),
+            ("already_playing", "song requests are already playing"),
+            ("nothing_playing", "nothing is playing right now"),
+        ],
+    )
+    async def test_reason_maps_to_exact_reply(self, reason: str, expected_reply: str) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "paused": reason in ("paused", "already_paused"),
+                        "changed": reason in ("paused", "resumed"),
+                        "reason": reason,
+                        "now_playing": None,
+                        "position_ms": None,
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _playback_envelope(action="pause"), _config(), http_client=client
+                )
+
+        assert sent["message"]["text"] == expected_reply
+
+    async def test_unknown_reason_falls_back_to_generic_reply(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "paused": False,
+                        "changed": False,
+                        "reason": "queue_empty",
+                        "now_playing": None,
+                        "position_ms": None,
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _playback_envelope(action="resume"), _config(), http_client=client
+                )
+
+        assert sent["message"]["text"] == "song requests: playback queue_empty"
+
+    async def test_400_relays_error_message_verbatim(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400, json={"status": "error", "error": {"message": "nothing is queued"}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "nothing is queued"
+
+    async def test_404_relays_error_message_verbatim(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                404, json={"status": "error", "error": {"message": "community 42 not found"}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "community 42 not found"
+
+    async def test_5xx_replies_unavailable_with_status_code(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                503, json={"status": "error", "error": {"message": "unavailable"}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: playback unavailable (hub-api error 503)"
+        )
+
+    async def test_timeout_replies_unreachable(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: playback unavailable (hub-api unreachable)"
+        )
+
+    async def test_connection_error_replies_unreachable(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: playback unavailable (hub-api unreachable)"
+        )
+
+    async def test_malformed_2xx_response_replies_unavailable_with_status_code(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "data": {}})
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_playback_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: playback unavailable (hub-api error 200)"
+        )
+
+    async def test_resume_sends_resume_action(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "paused": False,
+                        "changed": True,
+                        "reason": "resumed",
+                        "now_playing": None,
+                        "position_ms": None,
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _playback_envelope(action="resume"), _config(), http_client=client
+                )
+
+        assert captured["body"]["action"] == "resume"
+        assert sent["message"]["text"] == "song requests resumed"
+
+    async def test_success_logs_playback_changed_info_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "paused": True,
+                        "changed": True,
+                        "reason": "paused",
+                        "now_playing": None,
+                        "position_ms": None,
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with (
+                caplog.at_level("INFO"),
+                patch(
+                    "bundles.social_music_action.RelayOutboundIrcTransport",
+                    return_value=_relay_transport(sent),
+                ),
+            ):
+                await enqueue_song_request(
+                    _playback_envelope(action="pause"), _config(), http_client=client
+                )
+
+        assert "social_music_action.playback_changed" in caplog.text
+        assert "community_id" in caplog.text
+        assert "42" in caplog.text
+        assert "action" in caplog.text
+        assert "pause" in caplog.text
+        assert "reason" in caplog.text

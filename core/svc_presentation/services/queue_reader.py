@@ -27,6 +27,12 @@ zero `votes` field would misrepresent a removed feature as still live
 Community resolution (slug vs numeric `community_id`) lives in
 `services/surfaces.py::resolve_community_id`, shared with
 `presentation_config_service.py`'s own pre-existing local-DB lookups.
+
+`QueueSnapshot.playback` (`PlaybackState`) carries hub-api's server-side
+pause/resume/seek state through unchanged (`paused`, `paused_since`,
+`position_ms`) -- absent on the wire defaults to "playing"
+(`_DEFAULT_PLAYBACK`), matching this task's contract for a field that may
+not exist on an older hub-api build.
 """
 
 from __future__ import annotations
@@ -67,6 +73,27 @@ class RequestedBy:
 
 
 @dataclass(slots=True, frozen=True)
+class PlaybackState:
+    """Server-side pause/resume/seek control -- hub-api's `QueueItem.playback` on the wire.
+
+    Drives `services/render.py`'s player JS: `paused` pauses/resumes the
+    embed, `position_ms` is the authoritative seek target on resume, and
+    `paused_since` is display-only (unused today, carried through for a
+    future "paused Xs ago" affordance). Absent on the wire -- an older
+    hub-api build, or a race before the first pause -- means "playing":
+    see `_DEFAULT_PLAYBACK`.
+    """
+
+    paused: bool
+    paused_since: str | None
+    position_ms: int | None
+
+
+#: The wire contract's documented default when `playback` is missing entirely.
+_DEFAULT_PLAYBACK = PlaybackState(paused=False, paused_since=None, position_ms=None)
+
+
+@dataclass(slots=True, frozen=True)
 class QueueTrack:
     """One normalized queue entry as rendered to the Music Station overlay."""
 
@@ -94,6 +121,7 @@ class QueueSnapshot:
     upcoming: list[QueueTrack]
     updated_at: str | None
     stale: bool
+    playback: PlaybackState = _DEFAULT_PLAYBACK
 
 
 def _requested_by_from_dto(raw: Any) -> RequestedBy | None:
@@ -133,8 +161,22 @@ def _queue_track_from_dto(raw: Any) -> QueueTrack | None:
     )
 
 
+def _playback_from_dto(raw: Any) -> PlaybackState:
+    """Parse hub-api's `QueueItem.playback` DTO -- missing/malformed defaults to "playing"."""
+    if not isinstance(raw, dict):
+        return _DEFAULT_PLAYBACK
+    paused_since = raw.get("paused_since")
+    position_raw = raw.get("position_ms")
+    position_ms = int(position_raw) if isinstance(position_raw, int | float) else None
+    return PlaybackState(
+        paused=bool(raw.get("paused", False)),
+        paused_since=str(paused_since) if paused_since else None,
+        position_ms=position_ms,
+    )
+
+
 def _snapshot_from_dto(community_id: int, data: dict[str, Any]) -> QueueSnapshot:
-    """Parse hub-api's `{community_id, now_playing, queue, updated_at}` response `data` object."""
+    """Parse hub-api's `{community_id, now_playing, queue, updated_at, playback}` `data` object."""
     now_playing = _queue_track_from_dto(data.get("now_playing"))
     upcoming: list[QueueTrack] = []
     raw_queue = data.get("queue")
@@ -150,6 +192,7 @@ def _snapshot_from_dto(community_id: int, data: dict[str, Any]) -> QueueSnapshot
         upcoming=upcoming,
         updated_at=str(updated_at) if updated_at else None,
         stale=False,
+        playback=_playback_from_dto(data.get("playback")),
     )
 
 
@@ -160,7 +203,12 @@ def _stale_or_empty(
     if cache_entry is not None:
         return dataclasses.replace(cache_entry[1], stale=True)
     return QueueSnapshot(
-        community_id=community_id, now_playing=None, upcoming=[], updated_at=None, stale=False
+        community_id=community_id,
+        now_playing=None,
+        upcoming=[],
+        updated_at=None,
+        stale=False,
+        playback=_DEFAULT_PLAYBACK,
     )
 
 

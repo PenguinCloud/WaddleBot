@@ -16,7 +16,13 @@ from typing import Any
 from quart import Blueprint, current_app, jsonify, request
 
 from services.presentation_config_service import get_theme_config, is_surface_enabled
-from services.queue_reader import MusicQueueReader, QueueSnapshot, QueueTrack, RequestedBy
+from services.queue_reader import (
+    MusicQueueReader,
+    PlaybackState,
+    QueueSnapshot,
+    QueueTrack,
+    RequestedBy,
+)
 from services.render import render_music
 from services.surfaces import is_valid_community, resolve_community_id
 
@@ -63,6 +69,24 @@ def _track_dict(track: QueueTrack) -> dict[str, Any]:
     }
 
 
+def _playback_dict(playback: PlaybackState) -> dict[str, Any]:
+    """Explicit wire-schema for `playback` (security.md Output Validation) -- named fields only."""
+    return {
+        "paused": playback.paused,
+        "paused_since": playback.paused_since,
+        "position_ms": playback.position_ms,
+    }
+
+
+#: Same default `_snapshot_payload` renders for a never-paused snapshot -- reused by
+#: `_unavailable_payload` so every response carries the same `playback` shape.
+_DEFAULT_PLAYBACK_DICT: dict[str, Any] = {
+    "paused": False,
+    "paused_since": None,
+    "position_ms": None,
+}
+
+
 def _snapshot_payload(community: str, snapshot: QueueSnapshot) -> dict[str, Any]:
     """Wire payload for a successful queue read -- `available: true`, no reason."""
     return {
@@ -72,6 +96,7 @@ def _snapshot_payload(community: str, snapshot: QueueSnapshot) -> dict[str, Any]
         "stale": snapshot.stale,
         "available": True,
         "unavailable_reason": None,
+        "playback": _playback_dict(snapshot.playback),
     }
 
 
@@ -89,6 +114,7 @@ def _unavailable_payload(community: str, *, reason: str) -> dict[str, Any]:
         "stale": False,
         "available": False,
         "unavailable_reason": reason,
+        "playback": _DEFAULT_PLAYBACK_DICT,
     }
 
 

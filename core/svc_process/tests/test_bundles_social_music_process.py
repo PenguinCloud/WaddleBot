@@ -16,6 +16,7 @@ from flask_core import (
 import bundles.social_music_process as social_music_process
 from bundles.social_music_process import (
     _MUSIC_APP_ID,
+    _PAUSE_RESUME_PERMISSION_DENIED_REPLY,
     _QUEUE_LINK_NOT_CONFIGURED,
     _SET_PERMISSION_DENIED_REPLY,
     _SET_UNAVAILABLE_REPLY,
@@ -518,6 +519,104 @@ class TestSetYoutubeLabelsFeatureFlag:
         assert captured["tenant"] == TENANT
         assert captured["community"] == 42
         assert captured["default"] is True
+
+
+class TestTransformPauseResume:
+    """`!sr pause`/`!sr resume` -- moderator/admin only, routed to the action stage on allow."""
+
+    async def test_pause_allowed_emits_subcommand_and_target_app_id(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "pause"
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+        assert "key" not in result.payload
+        assert "value" not in result.payload
+
+    async def test_resume_allowed_emits_subcommand_and_target_app_id(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr resume", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "resume"
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+        assert "key" not in result.payload
+        assert "value" not in result.payload
+
+    async def test_pause_preserves_original_text_and_requester_identity(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "!sr pause"
+        assert result.payload["channel_id"] == "123"
+        assert result.payload["author_id"] == "platform-user-1"
+
+    async def test_pause_case_insensitive(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!SR PAUSE", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "pause"
+
+    async def test_pause_ignores_trailing_args(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause extra", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "pause"
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_resume_ignores_trailing_args(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr resume please", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "resume"
+
+    async def test_pause_non_moderator_denied(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _PAUSE_RESUME_PERMISSION_DENIED_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_resume_non_moderator_denied(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr resume", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _PAUSE_RESUME_PERMISSION_DENIED_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_pause_allowed_by_platform_user_id_match(self, _dal: Any) -> None:
+        _dal.roles_by_platform_user_id["platform-user-1"] = "admin"
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_pause_role_lookup_error_fails_closed(self, _dal: Any) -> None:
+        _dal.should_error_on_role_lookup = True
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pause"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _PAUSE_RESUME_PERMISSION_DENIED_REPLY
+
+    async def test_pause_returns_none_when_flag_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_off)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            assert await transform(_event("!sr pause", actor=MOD_ACTOR)) is None
+
+    async def test_resume_returns_none_when_flag_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_off)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            assert await transform(_event("!sr resume", actor=MOD_ACTOR)) is None
+
+    async def test_a_song_literally_titled_pausing_is_not_mistaken_for_pause(self) -> None:
+        """Word-boundary check: `pausing time` must not match the `pause` subcommand."""
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr pausing time"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["music_query"] == "pausing time"
 
 
 class TestTransformErrorHandling:

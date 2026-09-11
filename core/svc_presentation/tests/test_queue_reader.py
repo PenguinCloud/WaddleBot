@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
-from services.queue_reader import MusicQueueReader, QueueSnapshot
+from services.queue_reader import MusicQueueReader, PlaybackState, QueueSnapshot
 
 
 class _FakeResponse:
@@ -191,6 +191,68 @@ async def test_get_queue_handles_null_now_playing_and_empty_queue() -> None:
     assert snapshot.now_playing is None
     assert snapshot.upcoming == []
     assert snapshot.stale is False
+
+
+@pytest.mark.asyncio
+async def test_get_queue_maps_playback_state() -> None:
+    """hub-api's `data.playback` -- `{paused, paused_since, position_ms}` -- passes through."""
+    reader, fake = await _connected_reader()
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "now_playing": None,
+                    "queue": [],
+                    "updated_at": None,
+                    "playback": {
+                        "paused": True,
+                        "paused_since": "2026-09-11T00:00:10Z",
+                        "position_ms": 45000,
+                    },
+                },
+            },
+        )
+    )
+
+    snapshot = await reader.get_queue(20)
+
+    assert snapshot.playback == PlaybackState(
+        paused=True, paused_since="2026-09-11T00:00:10Z", position_ms=45000
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_queue_defaults_playback_when_missing_or_malformed() -> None:
+    """No `playback` key (or a non-dict value) on the wire -- defaults to "playing"."""
+    reader, fake = await _connected_reader()
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {"status": "success", "data": {"now_playing": None, "queue": [], "updated_at": None}},
+        )
+    )
+    snapshot = await reader.get_queue(21)
+    assert snapshot.playback == PlaybackState(paused=False, paused_since=None, position_ms=None)
+
+    reader2, fake2 = await _connected_reader()
+    fake2.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "now_playing": None,
+                    "queue": [],
+                    "updated_at": None,
+                    "playback": "not-a-dict",
+                },
+            },
+        )
+    )
+    snapshot2 = await reader2.get_queue(22)
+    assert snapshot2.playback == PlaybackState(paused=False, paused_since=None, position_ms=None)
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,19 @@ closed) -- replicated locally rather than imported, since these bundle
 modules don't cross-import each other's internals; deny reply `only
 moderators/admins can change song request settings`.
 
+`!sr pause` / `!sr resume` -- moderator/admin-only playback controls for
+the community's Music Station. Same permission gate as `!sr set
+youtube-labels` (`_caller_is_moderator_or_admin`, replicated locally per
+this module's own dependency convention -- see above); a denied caller
+gets `_PAUSE_RESUME_PERMISSION_DENIED_REPLY` directly, no hub-api round
+trip. An allowed caller's event is routed to the action stage the same
+way `set`'s successful parse is (`PROCESS_TARGET_APP_ID_KEY` stamped,
+`social_music_action` performs the actual service-key-authenticated call
+and sends the reply) -- but stamps only `subcommand="pause"|"resume"`, no
+`key`/`value`. Gated by the same `_FEATURE_FLAG` as every other `!sr`
+subcommand (already required ON to reach subcommand parsing at all); flag
+OFF behaves like an unrecognized command, same as `set`/a song request.
+
 ROUTING (mirrors `bundles.community_forums_process`'s gh #298 mechanism):
 a successful parse -- but not a usage-hint/disabled-status/unavailable-set
 reply -- stamps `PROCESS_TARGET_APP_ID_KEY` onto the returned event's
@@ -178,6 +191,17 @@ _MAX_YOUTUBE_LABEL_LEN = 64
 _YOUTUBE_LABELS_USAGE_REPLY = "usage: !sr set youtube-labels <label,label,...> | none"
 _YOUTUBE_LABELS_LIMIT_REPLY = "youtube-labels: up to 32 labels, 64 chars each"
 _SET_PERMISSION_DENIED_REPLY = "only moderators/admins can change song request settings"
+
+#: `!sr pause`/`!sr resume` -- matched so neither is misinterpreted as a
+#: song title/search query. Both route through the same permission gate
+#: and action-stage handoff (module docstring); a trailing argument
+#: (`!sr pause <anything>`) is ignored, same convention as `status`/`set`.
+_PAUSE_SUBCOMMAND = "pause"
+_RESUME_SUBCOMMAND = "resume"
+
+#: `!sr pause`/`!sr resume`'s single denial reply -- shared by both
+#: subcommands (task requirement), unlike `!sr set`'s own denial reply.
+_PAUSE_RESUME_PERMISSION_DENIED_REPLY = "only moderators/admins can pause song requests"
 
 #: `!sr set youtube-labels <value>` values that clear the allowlist
 #: (`value` -> `[]`) rather than being parsed as labels.
@@ -353,6 +377,12 @@ async def transform(event: PlatformEvent) -> PlatformEvent | None:
     if subcommand == _SET_SUBCOMMAND or subcommand.startswith(f"{_SET_SUBCOMMAND} "):
         return await _handle_set_subcommand(event, query, ctx)
 
+    if subcommand == _PAUSE_SUBCOMMAND or subcommand.startswith(f"{_PAUSE_SUBCOMMAND} "):
+        return await _handle_pause_resume_subcommand(event, _PAUSE_SUBCOMMAND, ctx)
+
+    if subcommand == _RESUME_SUBCOMMAND or subcommand.startswith(f"{_RESUME_SUBCOMMAND} "):
+        return await _handle_pause_resume_subcommand(event, _RESUME_SUBCOMMAND, ctx)
+
     if not query:
         logger.debug("social_music_process.usage_hint_reply")
         return _usage_reply_event(event)
@@ -443,6 +473,40 @@ async def _handle_set_subcommand(
             "subcommand": "set",
             "key": _YOUTUBE_LABELS_PAYLOAD_KEY,
             "value": labels,
+            PROCESS_TARGET_APP_ID_KEY: _MUSIC_APP_ID,
+        },
+    )
+
+
+async def _handle_pause_resume_subcommand(
+    event: PlatformEvent, subcommand: str, ctx: BundleContext
+) -> PlatformEvent:
+    """Route `!sr pause`/`!sr resume` -- moderator/admin only, no direct reply on success.
+
+    Same permission gate as `!sr set youtube-labels`
+    (`_caller_is_moderator_or_admin`) -- a denied caller gets the fixed
+    `_PAUSE_RESUME_PERMISSION_DENIED_REPLY`, never routed to the action
+    stage. An allowed caller's event is stamped with `subcommand` and
+    `PROCESS_TARGET_APP_ID_KEY` only (no `key`/`value`, unlike `set`) and
+    routed to `social_music_action`, which performs the actual hub-api
+    call and sends the reply -- no direct reply here (module docstring).
+    """
+    community_id = _community_id(ctx.community)
+    if not await _caller_is_moderator_or_admin(event, community_id):
+        logger.debug(
+            "social_music_process.pause_resume_denied subcommand=%s actor=%s community_id=%s",
+            subcommand,
+            event.actor,
+            community_id,
+        )
+        return _text_reply(event, _PAUSE_RESUME_PERMISSION_DENIED_REPLY)
+
+    logger.debug("social_music_process.pause_resume_routed_to_action subcommand=%s", subcommand)
+    return dataclasses.replace(
+        event,
+        payload={
+            **event.payload,
+            "subcommand": subcommand,
             PROCESS_TARGET_APP_ID_KEY: _MUSIC_APP_ID,
         },
     )

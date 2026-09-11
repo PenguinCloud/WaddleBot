@@ -43,6 +43,7 @@ function samplePayload(overrides = {}) {
       started_at: '2026-09-11T00:00:00Z',
       requested_by: { display_name: 'Requester One', platform: 'twitch' },
     },
+    playback: { paused: false, paused_since: null, position_ms: 30000 },
     queue: [
       {
         id: 2,
@@ -125,6 +126,71 @@ describe('MusicQueuePage', () => {
     expect(screen.getByTestId('now-playing')).toHaveTextContent('Twitch');
     expect(screen.getByTestId('queue-row-2')).toHaveTextContent('Requester Two');
     expect(screen.getByTestId('queue-row-3')).toHaveTextContent('Queued automatically');
+
+    // Playback progress (m:ss / m:ss) on now-playing only, no paused badge
+    // while playing; queue rows never show a progress readout.
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('0:30 / 3:20');
+    expect(screen.queryByTestId('playback-paused-badge')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('queue-row-2')).not.toHaveTextContent('/');
+  });
+
+  it('shows the "⏸ Paused" badge and freezes progress at position_ms while paused', async () => {
+    vi.useFakeTimers();
+    mockAuth();
+    publicApi.getMusicQueue.mockResolvedValue({
+      data: {
+        data: samplePayload({
+          playback: { paused: true, paused_since: '2026-09-11T00:05:00Z', position_ms: 45000 },
+        }),
+      },
+    });
+
+    mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('⏸ Paused');
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('0:45 / 3:20');
+
+    // Frozen: even after several seconds of wall-clock time, the paused
+    // position never advances (no local ticker runs while paused).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('0:45 / 3:20');
+  });
+
+  it('advances the progress readout locally between polls while playing', async () => {
+    vi.useFakeTimers();
+    mockAuth();
+    publicApi.getMusicQueue.mockResolvedValue({ data: { data: samplePayload() } });
+
+    mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('0:30 / 3:20');
+
+    // 3s of local wall-clock ticking, no new poll response yet -> position
+    // projects forward from the last synced 30000ms.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByTestId('now-playing')).toHaveTextContent('0:33 / 3:20');
+  });
+
+  it('omits the progress readout when playback is absent from the payload', async () => {
+    mockAuth();
+    publicApi.getMusicQueue.mockResolvedValue({
+      data: { data: samplePayload({ playback: undefined }) },
+    });
+
+    mount();
+    await screen.findByText('Now Playing Song');
+
+    expect(screen.queryByTestId('playback-progress')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('playback-paused-badge')).not.toBeInTheDocument();
   });
 
   it('shows the empty state when nothing is queued', async () => {

@@ -22,7 +22,11 @@ from quart import Quart
 from quart_schema import QuartSchema
 
 import blueprints.v1.community_music_queue as community_music_queue_module
-from blueprints.v1.community_music_queue import music_internal_bp, music_queue_bp
+from blueprints.v1.community_music_queue import (
+    MUSIC_PLAYBACK_REDIS_CONFIG_KEY,
+    music_internal_bp,
+    music_queue_bp,
+)
 from config import HubAPIConfig
 from services import music_status_service
 from services.music_providers.track import Track
@@ -34,6 +38,32 @@ _STATUS_ROUTE = "/api/v1/internal/music/status"
 _LIVE_QUEUE_ROUTE = "/api/v1/internal/music/queue"
 _LIVE_ADVANCE_ROUTE = "/api/v1/internal/music/queue/advance"
 _POLICY_ROUTE = "/api/v1/internal/music/policy"
+_PLAYBACK_ROUTE = "/api/v1/internal/music/playback"
+
+
+class FakeRedis:
+    """In-memory async Redis/Valkey stand-in -- get/set/delete only, what gh-315 needs.
+
+    No test app in this file calls `services.rate_limiting.
+    install_rate_limiting()`, so `blueprints/v1/community_music_queue.py::
+    _redis_client()`'s "reuse `RateLimiter._redis`" branch never fires --
+    injecting this directly onto `app.config[MUSIC_PLAYBACK_REDIS_CONFIG_
+    KEY]` short-circuits that helper's own lazy-real-client fallback
+    before it ever tries to open a real connection.
+    """
+
+    def __init__(self) -> None:
+        """Start with an empty in-memory key/value store."""
+        self._store: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        self._store[key] = value
+
+    async def delete(self, key: str) -> None:
+        self._store.pop(key, None)
 
 
 def _test_config() -> HubAPIConfig:
@@ -73,6 +103,7 @@ def app(music_station_db: Any) -> Quart:
     quart_app.config["dal"] = music_station_db.dal
     quart_app.config["async_dal"] = music_station_db
     quart_app.config["HUB_API_CONFIG"] = _test_config()
+    quart_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY] = FakeRedis()
     return quart_app
 
 
@@ -993,3 +1024,304 @@ class TestLiveQueueAdvance:
         body = await response.get_json()
         assert body["data"]["advanced"] is False
         assert body["data"]["now_playing"] is None
+
+
+def _playback_key(community_id: int) -> str:
+    """Mirrors `services.community_music_queue_service._playback_key()` -- gh-315 contract."""
+    return f"music:playback:{community_id}"
+
+
+class TestPlayback:
+    """`POST /api/v1/internal/music/playback` -- pause/resume (gh-315).
+
+    Fail-first proof (executed, not narrated): temporarily made
+    `set_playback()` skip the `current.paused` check entirely (always
+    treat `pause` as a fresh pause) -- `test_double_pause_is_already_
+    paused` went red (`changed=True`/`reason="paused"` on the second call
+    instead of `changed=False`/`reason="already_paused"`); reverted,
+    green again.
+    """
+
+    async def test_pause_then_resume_round_trip(
+        self, client: Any, app: Quart, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=200_000)
+        queue_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+
+        pause_response = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "pause"},
+        )
+        assert pause_response.status_code == 200
+        pause_body = (await pause_response.get_json())["data"]
+        assert pause_body["changed"] is True
+        assert pause_body["reason"] == "paused"
+        assert pause_body["paused"] is True
+        assert pause_body["paused_since"] is not None
+        assert pause_body["now_playing"]["id"] == queue_id
+        assert pause_body["community_id"] == community_id
+
+        redis_client = app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY]
+        assert await redis_client.get(_playback_key(community_id)) is not None
+
+        resume_response = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "resume"},
+        )
+        assert resume_response.status_code == 200
+        resume_body = (await resume_response.get_json())["data"]
+        assert resume_body["changed"] is True
+        assert resume_body["reason"] == "resumed"
+        assert resume_body["paused"] is False
+        assert resume_body["paused_since"] is None
+
+        # Idempotent no-op: resuming again when already playing changes nothing.
+        second_resume = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "resume"},
+        )
+        second_body = (await second_resume.get_json())["data"]
+        assert second_body["changed"] is False
+        assert second_body["reason"] == "already_playing"
+
+    async def test_double_pause_is_already_paused(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=200_000)
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+
+        first = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "pause"},
+        )
+        assert (await first.get_json())["data"]["reason"] == "paused"
+
+        second = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "pause"},
+        )
+        second_body = (await second.get_json())["data"]
+        assert second_body["changed"] is False
+        assert second_body["reason"] == "already_paused"
+        assert second_body["paused"] is True
+
+    async def test_nothing_playing_pause_and_resume(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+
+        for action in ("pause", "resume"):
+            response = await client.post(
+                _PLAYBACK_ROUTE,
+                headers={"X-Service-Key": SERVICE_API_KEY},
+                json={"community_id": community_id, "action": action},
+            )
+            assert response.status_code == 200
+            body = (await response.get_json())["data"]
+            assert body["reason"] == "nothing_playing"
+            assert body["changed"] is False
+            assert body["paused"] is False
+            assert body["now_playing"] is None
+            assert body["position_ms"] is None
+
+    async def test_unknown_community_is_404(self, client: Any) -> None:
+        response = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": 999999, "action": "pause"},
+        )
+        assert response.status_code == 404
+
+    async def test_bad_action_is_400(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "stop"},
+        )
+        assert response.status_code == 400
+
+    async def test_missing_service_key_is_401(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.post(
+            _PLAYBACK_ROUTE, json={"community_id": community_id, "action": "pause"}
+        )
+        assert response.status_code == 401
+
+
+class TestPlaybackTimeMath:
+    """Position/ETA math + auto-advance interaction with a paused clock (gh-315)."""
+
+    async def test_position_ms_reflects_prior_pause_duration(
+        self, client: Any, app: Quart, music_station_db: Any
+    ) -> None:
+        """Known-length pause: 100s since `started_at`, 30s of that was paused -> ~70s position."""
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=600_000)
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC) - timedelta(seconds=100),
+        )
+        redis_client = app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY]
+        await redis_client.set(
+            _playback_key(community_id),
+            (
+                '{"paused_since": null, "paused_total_ms": 30000, '
+                f'"updated_at": "{datetime.now(UTC).isoformat()}"}}'
+            ),
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        playback = (await response.get_json())["data"]["playback"]
+        assert playback["paused"] is False
+        # ~100s elapsed - 30s paused == ~70s; generous tolerance for test wall-clock drift.
+        assert 65_000 <= playback["position_ms"] <= 75_000
+
+    async def test_auto_advance_does_not_fire_while_paused_past_duration(
+        self, client: Any, app: Quart, music_station_db: Any
+    ) -> None:
+        """Raw wall-clock time since `started_at` is WAY past duration+grace -- but paused."""
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=1000)  # 1s track
+        playing_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC) - timedelta(seconds=30),
+        )
+        redis_client = app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY]
+        # Currently paused, and has been for 25s -- pause-adjusted elapsed is
+        # only ~5s (30s wall-clock - 25s paused), well under duration(1s) +
+        # grace(10s) = 11s, so this must NOT auto-advance.
+        paused_since = (datetime.now(UTC) - timedelta(seconds=25)).isoformat()
+        await redis_client.set(
+            _playback_key(community_id),
+            f'{{"paused_since": "{paused_since}", "paused_total_ms": 0, '
+            f'"updated_at": "{datetime.now(UTC).isoformat()}"}}',
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["id"] == playing_id
+        assert body["data"]["now_playing"]["status"] == "playing"
+        assert body["data"]["playback"]["paused"] is True
+
+        row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == playing_id)
+            .select()
+            .first()
+        )
+        assert row.status == "playing"  # unchanged in the DB, not just the response
+
+    async def test_auto_advance_fires_once_elapsed_reaches_duration_after_resume(
+        self, client: Any, app: Quart, music_station_db: Any
+    ) -> None:
+        """Same 30s wall-clock gap, but resumed with only 5s of accumulated pause -> expired."""
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=1000)  # 1s track
+        expired_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC) - timedelta(seconds=30),
+        )
+        next_track_id = _seed_track(music_station_db)
+        next_id = _seed_queue_item(
+            music_station_db, community_id=community_id, track_id=next_track_id, status="queued"
+        )
+        redis_client = app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY]
+        # Not currently paused (resumed) -- pause-adjusted elapsed is ~25s
+        # (30s wall-clock - 5s paused_total_ms), past duration(1s) + grace(10s).
+        await redis_client.set(
+            _playback_key(community_id),
+            (
+                '{"paused_since": null, "paused_total_ms": 5000, '
+                f'"updated_at": "{datetime.now(UTC).isoformat()}"}}'
+            ),
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["id"] == next_id
+        assert body["data"]["playback"]["paused"] is False
+
+        expired_row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == expired_id)
+            .select()
+            .first()
+        )
+        assert expired_row.status == "played"
+
+    async def test_advance_resets_playback_key(
+        self, client: Any, app: Quart, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db)
+        playing_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+        next_track_id = _seed_track(music_station_db)
+        _seed_queue_item(
+            music_station_db, community_id=community_id, track_id=next_track_id, status="queued"
+        )
+
+        pause_response = await client.post(
+            _PLAYBACK_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "action": "pause"},
+        )
+        assert (await pause_response.get_json())["data"]["paused"] is True
+        redis_client = app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY]
+        assert await redis_client.get(_playback_key(community_id)) is not None
+
+        advance_response = await client.post(
+            _LIVE_ADVANCE_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "item_id": playing_id},
+        )
+        assert advance_response.status_code == 200
+        advance_body = await advance_response.get_json()
+        assert advance_body["data"]["advanced"] is True
+        assert advance_body["data"]["playback"]["paused"] is False
+
+        # The key itself is gone, not just reported unpaused -- the next
+        # track starts with a completely clean slate.
+        assert await redis_client.get(_playback_key(community_id)) is None

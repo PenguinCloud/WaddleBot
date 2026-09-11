@@ -97,6 +97,16 @@ async def test_music_page_renders_html_with_playback_hooks(client: TestClientPro
     assert "onStateChange" in body
     assert "playback_update" in body
     assert "testcommunity" in body
+    # Playback pause/resume/seek wiring (issue #315): embed pause/resume
+    # calls, the resume-time seek, the paused badge markup, and the
+    # paused-guard on both ended handlers (never advance while paused).
+    assert "pauseVideo" in body
+    assert "playVideo" in body
+    assert "seekTo" in body
+    assert "np-paused-badge" in body
+    assert "⏸ paused" in body
+    assert "event.data === YT.PlayerState.ENDED && !isPaused" in body
+    assert "!isPaused &&" in body
 
 
 @pytest.mark.asyncio
@@ -129,6 +139,7 @@ async def test_queue_endpoint_unavailable_when_service_key_not_configured(
     assert payload["unavailable_reason"] == "service_key_not_configured"
     assert payload["now_playing"] is None
     assert payload["upcoming"] == []
+    assert payload["playback"] == {"paused": False, "paused_since": None, "position_ms": None}
 
 
 @pytest.mark.asyncio
@@ -197,6 +208,11 @@ async def test_queue_endpoint_proxies_hub_api_and_maps_dto(
                         )
                     ],
                     "updated_at": "2026-09-11T00:00:05Z",
+                    "playback": {
+                        "paused": True,
+                        "paused_since": "2026-09-11T00:00:10Z",
+                        "position_ms": 12000,
+                    },
                 },
             },
         )
@@ -218,6 +234,11 @@ async def test_queue_endpoint_proxies_hub_api_and_maps_dto(
     assert payload["upcoming"][0]["provider"] == "youtube"
     assert payload["upcoming"][0]["external_id"] == "ytABC"
     assert payload["upcoming"][0]["requested_by"] is None
+    assert payload["playback"] == {
+        "paused": True,
+        "paused_since": "2026-09-11T00:00:10Z",
+        "position_ms": 12000,
+    }
 
     call = fake.get_calls[0]
     assert call["params"] == {"community_id": 42}

@@ -74,10 +74,32 @@ from quart import Quart
 from quart_schema import QuartSchema
 
 import blueprints.v1.community_music_queue as community_music_queue_module
-from blueprints.v1.community_music_queue import music_queue_bp
+from blueprints.v1.community_music_queue import MUSIC_PLAYBACK_REDIS_CONFIG_KEY, music_queue_bp
 from config import HubAPIConfig
 from services.music_providers.track import Track
 from tests.conftest import TENANT_SLUG, make_user_token, make_user_token_with_roles
+
+
+class FakeRedis:
+    """In-memory async Redis/Valkey stand-in -- get/set/delete only, what gh-315 needs.
+
+    See `tests/test_v1_community_music_queue_internal.py::FakeRedis`'s own
+    docstring for the full rationale -- duplicated here (not imported)
+    since every test file in this port owns its own app fixture.
+    """
+
+    def __init__(self) -> None:
+        """Start with an empty in-memory key/value store."""
+        self._store: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str) -> None:
+        self._store[key] = value
+
+    async def delete(self, key: str) -> None:
+        self._store.pop(key, None)
 
 
 def _test_config() -> HubAPIConfig:
@@ -111,6 +133,7 @@ def app(music_station_db: Any) -> Quart:
     quart_app.config["dal"] = music_station_db.dal
     quart_app.config["async_dal"] = music_station_db
     quart_app.config["HUB_API_CONFIG"] = _test_config()
+    quart_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY] = FakeRedis()
     return quart_app
 
 

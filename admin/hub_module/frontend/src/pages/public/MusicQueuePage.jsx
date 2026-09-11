@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import {
   MusicalNoteIcon,
@@ -47,6 +47,17 @@ function resolveEtaLabel(item) {
   return formatEtaSeconds(etaSeconds);
 }
 
+/**
+ * Projects the now-playing track's live position forward from the last poll's
+ * authoritative `playback.position_ms`: frozen at that value while paused,
+ * advancing with wall-clock time between polls while playing.
+ */
+function computeDisplayPositionMs(playback, syncedPosition, nowMs) {
+  if (!playback || syncedPosition.baseMs == null) return null;
+  if (playback.paused) return syncedPosition.baseMs;
+  return syncedPosition.baseMs + Math.max(0, nowMs - syncedPosition.atMs);
+}
+
 /** Renders the requester's display name with a small platform badge, or a muted fallback for autoplay. */
 function RequesterBadge({ requestedBy }) {
   if (!requestedBy) {
@@ -63,8 +74,13 @@ function RequesterBadge({ requestedBy }) {
   );
 }
 
-/** One queue row -- title/artist/requester/length/ETA, with an optional moderator Remove control. */
-function QueueItemCard({ item, canModerate, onRemove, removing, testId }) {
+/**
+ * One queue row -- title/artist/requester/length/ETA, with an optional moderator
+ * Remove control. `paused`/`positionMs` are only ever passed for the now-playing
+ * card (queue rows have no live playback position) and render a "⏸ Paused" badge
+ * plus a `m:ss / m:ss` progress readout when present.
+ */
+function QueueItemCard({ item, canModerate, onRemove, removing, testId, paused = false, positionMs = null }) {
   return (
     <div
       data-testid={testId}
@@ -76,11 +92,24 @@ function QueueItemCard({ item, canModerate, onRemove, removing, testId }) {
             <span className="text-xs font-mono text-navy-500 flex-shrink-0">#{item.position}</span>
           )}
           <p className="font-medium text-sky-100 truncate">{item.title}</p>
+          {paused && (
+            <span
+              data-testid="playback-paused-badge"
+              className="text-xs font-semibold text-gold-400 flex-shrink-0"
+            >
+              ⏸ Paused
+            </span>
+          )}
         </div>
         <p className="text-sm text-navy-400 truncate">{item.artist}</p>
         <div className="mt-1">
           <RequesterBadge requestedBy={item.requested_by} />
         </div>
+        {positionMs != null && (
+          <p data-testid="playback-progress" className="text-xs text-navy-500 font-mono mt-1">
+            {formatDurationMs(positionMs)} / {formatDurationMs(item.duration_ms)}
+          </p>
+        )}
       </div>
       <div className="flex items-center gap-4 flex-shrink-0 self-end sm:self-auto">
         <div className="text-right">
@@ -125,6 +154,12 @@ function MusicQueuePage() {
   const [modAllowed, setModAllowed] = useState(true);
   const [removingId, setRemovingId] = useState(null);
   const [feedback, setFeedback] = useState(null);
+  const [playback, setPlayback] = useState(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // Anchors the locally-projected position to the last poll's authoritative
+  // `playback.position_ms` -- a ref (not state) since updating it must never
+  // itself trigger a render; the `nowMs` ticker below does that instead.
+  const positionSyncRef = useRef({ baseMs: null, atMs: null });
 
   // Server is the source of truth on 403 (modAllowed flips false and hides
   // the controls); client-side this is just a UX shortcut, not an authz gate.
@@ -145,6 +180,12 @@ function MusicQueuePage() {
         setNowPlaying(payload.now_playing ?? null);
         setQueue(payload.queue ?? []);
         setNotFound(false);
+        const nextPlayback = payload.playback ?? null;
+        setPlayback(nextPlayback);
+        positionSyncRef.current = {
+          baseMs: typeof nextPlayback?.position_ms === 'number' ? nextPlayback.position_ms : null,
+          atMs: Date.now(),
+        };
         return POLL_INTERVAL_MS;
       } catch (err) {
         if (cancelled) return null;
@@ -188,6 +229,17 @@ function MusicQueuePage() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [communityId]);
+
+  // Ticks the displayed now-playing position forward between polls while
+  // playing; frozen (no ticker) while paused -- computeDisplayPositionMs
+  // then just returns the last synced position unchanged.
+  useEffect(() => {
+    if (!playback || playback.paused) return undefined;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [playback]);
+
+  const displayPositionMs = computeDisplayPositionMs(playback, positionSyncRef.current, nowMs);
 
   const handleRemove = useCallback(async (item) => {
     setRemovingId((current) => {
@@ -293,6 +345,8 @@ function MusicQueuePage() {
                 onRemove={handleRemove}
                 removing={removingId === nowPlaying.id}
                 testId="now-playing"
+                paused={playback?.paused ?? false}
+                positionMs={displayPositionMs}
               />
             </div>
           )}

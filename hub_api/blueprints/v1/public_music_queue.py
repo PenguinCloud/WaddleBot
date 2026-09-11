@@ -34,8 +34,10 @@ from typing import Any, cast
 from flask_core.api_utils import error_response
 from quart import Blueprint, Response, current_app, jsonify
 
+from config import HubAPIConfig
 from services import community_music_queue_service as svc
 from services.errors import ApiError, not_found
+from services.rate_limiting import RATE_LIMITER_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,44 @@ def _err(exc: ApiError) -> tuple[dict[str, object], int]:
     )
 
 
+#: `app.config` key a lazily-opened raw Valkey client is cached under --
+#: same rationale/duplicated helper as `blueprints/v1/community_music_
+#: queue.py::_redis_client()` (see that module's own docstring); this
+#: blueprint is deliberately independent (module docstring: own edit-scope
+#: boundary), so the helper is duplicated rather than imported.
+MUSIC_PLAYBACK_REDIS_CONFIG_KEY = "music_playback_redis"
+
+
+def _redis_client() -> Any:
+    """Resolve the async Valkey/Redis client used for `music:playback:*` state (gh-315).
+
+    See `blueprints/v1/community_music_queue.py::_redis_client()`'s own
+    docstring for the full reuse-vs-lazy-open rationale -- identical
+    logic, duplicated per this module's own independence precedent.
+    """
+    limiter = current_app.config.get(RATE_LIMITER_CONFIG_KEY)
+    existing = getattr(limiter, "_redis", None) if limiter is not None else None
+    if existing is not None:
+        return existing
+
+    cached = current_app.config.get(MUSIC_PLAYBACK_REDIS_CONFIG_KEY)
+    if cached is not None:
+        return cached
+
+    import redis.asyncio as redis_asyncio
+
+    cfg = cast(HubAPIConfig, current_app.config["HUB_API_CONFIG"])
+    client = redis_asyncio.from_url(
+        cfg.valkey_url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    current_app.config[MUSIC_PLAYBACK_REDIS_CONFIG_KEY] = client
+    return client
+
+
 @dataclass(slots=True, frozen=True)
 class PublicCommunitySummaryDTO:
     """Minimal community identity for the public queue page header."""
@@ -62,12 +102,26 @@ class PublicCommunitySummaryDTO:
 
 
 @dataclass(slots=True, frozen=True)
+class PublicPlaybackSnapshotDTO:
+    """`data.playback` wire shape (gh-315) -- see `community_music_queue.PlaybackSnapshotDTO`.
+
+    Duplicated (not imported) per this module's own independence
+    precedent -- identical 3-field shape.
+    """
+
+    paused: bool
+    paused_since: str | None
+    position_ms: int | None
+
+
+@dataclass(slots=True, frozen=True)
 class PublicQueueResponse:
     """`{status, data, meta}`-enveloped data payload for the public queue read."""
 
     community: PublicCommunitySummaryDTO
     now_playing: svc.LiveQueueItemDTO | None
     queue: list[svc.LiveQueueItemDTO]
+    playback: PublicPlaybackSnapshotDTO
 
 
 @public_music_queue_bp.route("/communities/<int:community_id>/music-station/queue", methods=["GET"])
@@ -95,8 +149,8 @@ async def get_public_queue(community_id: int) -> Any:
         if community_row is None:
             return _err(not_found("Community not found"))
 
-        now_playing, queue, _advanced = await svc.get_live_queue_state(
-            async_dal, dal, community_id=community_id, auto_advance=False
+        snapshot = await svc.get_live_queue_state(
+            async_dal, dal, _redis_client(), community_id=community_id, auto_advance=False
         )
     except ApiError as exc:
         return _err(exc)
@@ -109,8 +163,13 @@ async def get_public_queue(community_id: int) -> Any:
             id=int(community_row.id),
             name=community_row.display_name or community_row.name or "",
         ),
-        now_playing=now_playing,
-        queue=queue,
+        now_playing=snapshot.now_playing,
+        queue=snapshot.queue,
+        playback=PublicPlaybackSnapshotDTO(
+            paused=snapshot.paused,
+            paused_since=snapshot.paused_since,
+            position_ms=snapshot.position_ms,
+        ),
     )
     response: Response = jsonify(
         {"status": "success", "data": asdict(payload), "meta": {"version": 1}}

@@ -307,6 +307,8 @@ def render_music(
     #up-next-list li {{ padding: 4px 0; border-top: 1px solid rgba(255,255,255,0.08); }}
     #empty-state {{ font-size: 14px; color: #999; text-align: center; padding: 20px 0; }}
     #np-requested-by {{ font-size: 12px; color: #888; margin-top: 4px; }}
+    #np-paused-badge {{ font-size: 12px; font-weight: 600; margin-top: 4px;
+      color: var(--wb-primary, #1db954); }}
 </style>
 </head>
 <body data-community="{safe_community}" data-surface="music">
@@ -316,6 +318,7 @@ def render_music(
       <div class="title" id="np-title"></div>
       <div class="artist" id="np-artist"></div>
       <div id="np-requested-by"></div>
+      <div id="np-paused-badge" class="hidden">⏸ paused</div>
       <div id="progress-bar"><div id="progress-fill"></div></div>
     </div>
     <div id="empty-state">No tracks queued</div>
@@ -339,6 +342,10 @@ def render_music(
     // discrete end event, so this is a threshold, not an exact boundary.
     const END_THRESHOLD_MS = 500;
 
+    // How far (ms) the embed's actual position may drift from the server's
+    // `playback.position_ms` on resume before this client seeks to correct it.
+    const SEEK_DRIFT_THRESHOLD_MS = 2000;
+
     let currentQueueId = null;
     let trackStartedAtMs = null;
     let currentDurationMs = 0;
@@ -347,8 +354,13 @@ def render_music(
     let spotifyController = null;
     let spotifyApiReady = false;
     let spotifyIFrameAPI = null;
+    let spotifyPositionMs = 0;
     let endFallbackTimer = null;
     let advanceInFlight = false;
+    // Mirrors the server's last-seen `playback.paused` -- drives pause/
+    // resume/seek on the embed and gates the ended handlers below so a
+    // stale playback tick can never fire an advance while paused.
+    let isPaused = false;
 
     window.onYouTubeIframeAPIReady = () => {{ ytReady = true; }};
     // Spotify's iFrame API convention: this global is called once, ever,
@@ -386,13 +398,17 @@ def render_music(
     }}
 
     function onYouTubeStateChange(event) {{
-      if (window.YT && event.data === YT.PlayerState.ENDED) {{
+      // isPaused guard: a paused embed can still queue a stale ENDED event
+      // (e.g. a seek-to-end race) -- never advance while the server says
+      // paused, the next resumed poll is the only thing allowed to move on.
+      if (window.YT && event.data === YT.PlayerState.ENDED && !isPaused) {{
         advanceTrack(currentQueueId);
       }}
     }}
 
     function renderPlayer(track) {{
       clearEndFallbackTimer();
+      spotifyPositionMs = 0;
       const slot = document.getElementById('player-slot');
       if (track.provider === 'spotify' && track.external_id) {{
         slot.innerHTML = '<div id="spotify-target"></div>';
@@ -406,7 +422,12 @@ def render_music(
               spotifyController = controller;
               controller.addListener('playback_update', (e) => {{
                 const data = (e && e.data) || {{}};
+                if (typeof data.position === 'number') {{
+                  spotifyPositionMs = data.position;
+                }}
+                // isPaused guard: same rationale as onYouTubeStateChange above.
                 if (
+                  !isPaused &&
                   typeof data.position === 'number' &&
                   typeof data.duration === 'number' &&
                   data.duration > 0 &&
@@ -448,6 +469,56 @@ def render_music(
       }}
     }}
 
+    function resetPlaybackState() {{
+      isPaused = false;
+      const badge = document.getElementById('np-paused-badge');
+      if (badge) badge.classList.add('hidden');
+    }}
+
+    // Applies one poll's `playback` state to the live embed: pauses/resumes
+    // it, seeks it back in sync with the server's `position_ms` on resume
+    // (past `SEEK_DRIFT_THRESHOLD_MS`), toggles the paused badge, and
+    // pauses/resumes the Spotify end-detection fallback timer alongside it
+    // -- a paused track must never silently keep counting toward "ended".
+    function applyPlaybackState(playback) {{
+      const paused = !!(playback && playback.paused);
+      const positionMs = playback && typeof playback.position_ms === 'number'
+        ? playback.position_ms
+        : null;
+      const badge = document.getElementById('np-paused-badge');
+
+      if (paused && !isPaused) {{
+        if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+        if (spotifyController && spotifyController.pause) spotifyController.pause();
+        clearEndFallbackTimer();
+        if (badge) badge.classList.remove('hidden');
+      }} else if (!paused && isPaused) {{
+        const playerPositionMs = ytPlayer && ytPlayer.getCurrentTime
+          ? ytPlayer.getCurrentTime() * 1000
+          : spotifyPositionMs;
+        const driftMs = positionMs !== null ? Math.abs(playerPositionMs - positionMs) : 0;
+        if (positionMs !== null && driftMs > SEEK_DRIFT_THRESHOLD_MS) {{
+          if (ytPlayer && ytPlayer.seekTo) ytPlayer.seekTo(positionMs / 1000, true);
+          if (spotifyController && spotifyController.seek) {{
+            spotifyController.seek(positionMs / 1000);
+          }}
+        }}
+        if (ytPlayer && ytPlayer.playVideo) ytPlayer.playVideo();
+        if (spotifyController && spotifyController.resume) spotifyController.resume();
+        if (spotifyController && currentDurationMs) {{
+          const resumedAtMs = positionMs !== null ? positionMs : spotifyPositionMs;
+          clearEndFallbackTimer();
+          endFallbackTimer = setTimeout(
+            () => advanceTrack(currentQueueId),
+            Math.max(0, currentDurationMs - resumedAtMs) + END_THRESHOLD_MS
+          );
+        }}
+        trackStartedAtMs = Date.now() - (positionMs !== null ? positionMs : playerPositionMs);
+        if (badge) badge.classList.add('hidden');
+      }}
+      isPaused = paused;
+    }}
+
     function renderQueue(payload) {{
       const npEl = document.getElementById('now-playing');
       const emptyEl = document.getElementById('empty-state');
@@ -463,6 +534,7 @@ def render_music(
         list.innerHTML = '';
         currentQueueId = null;
         clearEndFallbackTimer();
+        resetPlaybackState();
         return;
       }}
 
@@ -476,6 +548,7 @@ def render_music(
         document.getElementById('player-slot').innerHTML = '';
         currentQueueId = null;
         clearEndFallbackTimer();
+        resetPlaybackState();
       }} else {{
         emptyEl.classList.add('hidden');
         npEl.classList.remove('hidden');
@@ -494,8 +567,10 @@ def render_music(
           currentQueueId = nowPlaying.queue_id;
           trackStartedAtMs = Date.now();
           currentDurationMs = nowPlaying.duration_ms || 0;
+          isPaused = false;
           renderPlayer(nowPlaying);
         }}
+        applyPlaybackState(payload.playback);
       }}
 
       list.innerHTML = '';
@@ -518,7 +593,7 @@ def render_music(
     }}
 
     setInterval(() => {{
-      if (!currentQueueId || !trackStartedAtMs || !currentDurationMs) return;
+      if (!currentQueueId || !trackStartedAtMs || !currentDurationMs || isPaused) return;
       const elapsed = Date.now() - trackStartedAtMs;
       const pct = Math.min(100, (elapsed / currentDurationMs) * 100);
       document.getElementById('progress-fill').style.width = pct + '%';
