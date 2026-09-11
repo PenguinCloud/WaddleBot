@@ -10,10 +10,23 @@ Accessing the database / shared state -- the runner binds the real,
 env-sourced DAL at startup via `set_bundle_dal()` (`core/svc_action/app.py`),
 same as every other action bundle (`community_announcements_action.py`,
 `social_quote_action.py`).
+
+`hub_channels`/`hub_forum_posts`/`hub_forum_replies` are never bound
+anywhere else on this service's `dal` (svc-action's own startup only
+binds `tenants`/`communities`/`app_catalog`/`action_dispatch_log`), so
+this bundle binds its own minimal stubs (`_ensure_forum_tables`,
+idempotent, `migrate=False` -- schema owned by `config/postgres/
+migrations/057_community_interaction.sql`), same convention
+`twitch_shoutout_action.py::_ensure_shoutout_tables` establishes.
+`select_async` runs `query.select()`/`query.db.commit()` directly
+(`flask_core/database.py`) -- it requires a pydal `Set`
+(`dal.dal(query)`), not a bare `Query` (gh #298); a bare `Query` has no
+`.select()`/`.db` in this pydal version.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -21,6 +34,61 @@ from typing import Any
 import httpx
 from flask_core import StageEnvelope, get_bundle_dal
 from waddle_transports import NonRetryableTransportError, TransportResult
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_forum_tables(dal: Any) -> None:
+    """Idempotently bind `hub_channels`/`hub_forum_posts`/`hub_forum_replies`.
+
+    Only the columns this bundle actually touches -- mirrors
+    `twitch_shoutout_action.py::_ensure_shoutout_tables`'s own
+    "minimal stub, no DDL" convention, `migrate=False` throughout.
+    Must run on a `dal` that already has `communities` defined
+    (svc-action's own `app.py` startup binds it before
+    `set_bundle_dal()`).
+    """
+    if "hub_channels" not in dal.tables:
+        dal.define_table(
+            "hub_channels",
+            dal.Field("community_id", "reference communities", notnull=True),
+            # Plain integer, not "reference community_server_channels" --
+            # that table is never bound here, only this column's presence
+            # (relay target) is ever read.
+            dal.Field("community_server_channel_id", "integer"),
+            migrate=False,
+        )
+    if "hub_forum_posts" not in dal.tables:
+        dal.define_table(
+            "hub_forum_posts",
+            dal.Field("hub_channel_id", "integer"),
+            dal.Field("community_id", "reference communities", notnull=True),
+            dal.Field("title", "string", notnull=True),
+            dal.Field("body", "text"),
+            dal.Field("tags", "json", default=[]),
+            dal.Field("author_hub_user_id", "integer"),
+            dal.Field("author_platform", "string"),
+            dal.Field("author_username", "string"),
+            dal.Field("author_avatar_url", "string"),
+            dal.Field("is_locked", "boolean", default=False),
+            dal.Field("reply_count", "integer", default=0),
+            dal.Field("last_reply_at", "datetime"),
+            dal.Field("created_at", "datetime", default=lambda: datetime.now(UTC)),
+            dal.Field("updated_at", "datetime", default=lambda: datetime.now(UTC)),
+            migrate=False,
+        )
+    if "hub_forum_replies" not in dal.tables:
+        dal.define_table(
+            "hub_forum_replies",
+            dal.Field("post_id", "reference hub_forum_posts", notnull=True),
+            dal.Field("author_hub_user_id", "integer"),
+            dal.Field("author_platform", "string"),
+            dal.Field("author_username", "string"),
+            dal.Field("author_avatar_url", "string"),
+            dal.Field("content", "text", notnull=True),
+            dal.Field("created_at", "datetime", default=lambda: datetime.now(UTC)),
+            migrate=False,
+        )
 
 
 def _resolve_channel_id(config: Mapping[str, Any]) -> int | None:
@@ -76,13 +144,16 @@ async def create_forum_post(
     channel_id_int = _resolve_channel_id(config)
 
     dal = get_bundle_dal()
+    _ensure_forum_tables(dal)
     try:
         # Fetch the channel to verify it exists and get relay info -- only
         # when a channel was actually configured for this activation.
         channel = None
         if channel_id_int is not None:
             channel_query = dal.hub_channels.id == channel_id_int
-            channels = await dal.select_async(channel_query)
+            # select_async requires a pydal Set (dal.dal(query)), not a
+            # bare Query -- see module docstring.
+            channels = await dal.select_async(dal.dal(channel_query))
             channel = channels[0] if channels else None
             if not channel:
                 raise NonRetryableTransportError(f"channel {channel_id_int} not found")
@@ -105,13 +176,14 @@ async def create_forum_post(
 
         # Relay to bridged channels if configured -- no relay target when
         # this activation has no channel configured (channel is None).
+        # FLAG: relay_message async helper not yet implemented -- logged so
+        # the gap is visible, never raised (best-effort, don't fail dispatch).
         if channel is not None and channel.community_server_channel_id:
-            # Best-effort relay -- don't fail if relay doesn't work
-            try:
-                # In production, would call relay_message async helper
-                pass
-            except Exception:  # noqa: BLE001 -- best-effort relay, don't fail dispatch
-                pass
+            logger.debug(
+                "community_forums_action.relay_not_implemented "
+                "community_server_channel_id=%s",
+                channel.community_server_channel_id,
+            )
 
         return TransportResult(
             transport="bundle",
@@ -148,10 +220,13 @@ async def create_forum_reply(
         raise NonRetryableTransportError("forum reply requires 'forum_content'")
 
     dal = get_bundle_dal()
+    _ensure_forum_tables(dal)
     try:
         # Verify post exists and check if locked
         post_query = dal.hub_forum_posts.id == post_id
-        posts = await dal.select_async(post_query)
+        # select_async requires a pydal Set (dal.dal(query)), not a bare
+        # Query -- see module docstring.
+        posts = await dal.select_async(dal.dal(post_query))
         post = posts[0] if posts else None
         if not post:
             raise NonRetryableTransportError(f"post {post_id} not found")
@@ -181,15 +256,18 @@ async def create_forum_reply(
 
         # Relay to bridged channels if configured
         channel_query = dal.hub_channels.id == post.hub_channel_id
-        channels = await dal.select_async(channel_query)
+        # select_async requires a pydal Set (dal.dal(query)), not a bare
+        # Query -- see module docstring.
+        channels = await dal.select_async(dal.dal(channel_query))
         channel = channels[0] if channels else None
+        # FLAG: relay_message async helper not yet implemented -- logged so
+        # the gap is visible, never raised (best-effort, don't fail dispatch).
         if channel and channel.community_server_channel_id:
-            # Best-effort relay -- don't fail if relay doesn't work
-            try:
-                # In production, would call relay_message async helper
-                pass
-            except Exception:  # noqa: BLE001 -- best-effort relay, don't fail dispatch
-                pass
+            logger.debug(
+                "community_forums_action.relay_not_implemented "
+                "community_server_channel_id=%s",
+                channel.community_server_channel_id,
+            )
 
         return TransportResult(
             transport="bundle",

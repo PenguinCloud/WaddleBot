@@ -1011,6 +1011,212 @@ class TestModerationGateWiring:
         assert processed == 0
 
 
+class TestModerationEnforcementRouting:
+    """gh-304 P4 (final wiring step): `_transform_and_enqueue` routing hook.
+
+    Routes a gate-stamped `moderation_enforcement` payload onto its own
+    action envelope right after `run_moderation_gate` runs -- independent
+    of whatever `transform_fn` itself returns. Monkeypatches `runner.
+    run_moderation_gate` to stamp the event directly (the gate's own
+    classification logic is covered by `test_moderation_gate.py`) and
+    `runner.feature_enabled` to control the routing flag.
+    """
+
+    MODERATION_APP_ID = "waddles.community.moderation.default"
+
+    _ENFORCEMENT = {
+        "category": "hate_speech",
+        "score": 0.92,
+        "timeout_s": 600,
+        "warn_text": "Your message was removed for hate_speech. Please keep it friendly.",
+        "action": "timeout+warn",
+    }
+
+    def _identity_envelope(self, *, community: str | None) -> StageEnvelope:
+        """A `message` envelope carrying every identity field the enforce bundle reads."""
+        return StageEnvelope(
+            tenant=TENANT,
+            community=community,
+            app_id=APP_ID,
+            stage="process",
+            event=PlatformEvent(
+                platform="discord",
+                event_type="message",
+                actor="penguin",
+                payload={
+                    "text": "you are trash",
+                    "author_id": "user-1",
+                    "user_id": "999",
+                    "channel_id": "chan-1",
+                    "guild_id": "guild-1",
+                    "channel_name": "general",
+                    "broadcaster_id": "bcast-1",
+                    "room_id": "room-1",
+                    "message_id": "msg-1",
+                },
+                occurred_at="2026-01-01T00:00:00+00:00",
+            ),
+            ts="2026-01-01T00:00:00+00:00",
+        )
+
+    async def _stamping_gate(self, event: PlatformEvent, *, redis_client: Any) -> None:
+        """Mimics `moderation_gate._emit_enforcement_if_filter_on`'s own in-place mutation."""
+        event.payload["moderation_enforcement"] = dict(self._ENFORCEMENT)
+
+    async def _noop_gate(self, event: PlatformEvent, *, redis_client: Any) -> None:
+        """No match -- the event is left untouched, same as a real non-matching gate run."""
+
+    def _poller_for_echo(self, http_client_factory: Any) -> BundlePoller:
+        return _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.echo_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+
+    async def test_stamped_event_enqueues_one_enforcement_envelope(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "run_moderation_gate", self._stamping_gate)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+
+        runner = ProcessRunner(
+            poller=self._poller_for_echo(http_client_factory),
+            redis_client=redis_client,
+            tenant_slug=TENANT,
+        )
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(self._identity_envelope(community="42").to_dict())
+        )
+
+        processed = await runner.run_once()
+        assert processed == 1  # normal transform+enqueue still happens, unaffected
+
+        own_action_key = bundle_stream_key(TENANT, "42", APP_ID, "action")
+        assert await redis_client.rpop(own_action_key) is not None
+
+        enforcement_key = bundle_stream_key(TENANT, "42", self.MODERATION_APP_ID, "action")
+        raw_out = await redis_client.rpop(enforcement_key)
+        assert raw_out is not None
+        assert await redis_client.rpop(enforcement_key) is None  # exactly one extra envelope
+
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.app_id == self.MODERATION_APP_ID
+        assert env_out.stage == "action"
+        assert env_out.tenant == TENANT
+        assert env_out.community == "42"
+        assert env_out.event.platform == "discord"
+        assert env_out.event.payload["moderation_enforcement"] == self._ENFORCEMENT
+        assert env_out.event.payload["author_id"] == "user-1"
+        assert env_out.event.payload["user_id"] == "999"
+        assert env_out.event.payload["channel_id"] == "chan-1"
+        assert env_out.event.payload["guild_id"] == "guild-1"
+        assert env_out.event.payload["channel_name"] == "general"
+        assert env_out.event.payload["broadcaster_id"] == "bcast-1"
+        assert env_out.event.payload["room_id"] == "room-1"
+        assert env_out.event.payload["message_id"] == "msg-1"
+        assert "text" not in env_out.event.payload
+
+    async def test_unstamped_event_enqueues_nothing_extra(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "run_moderation_gate", self._noop_gate)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+
+        runner = ProcessRunner(
+            poller=self._poller_for_echo(http_client_factory),
+            redis_client=redis_client,
+            tenant_slug=TENANT,
+        )
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(self._identity_envelope(community="42").to_dict())
+        )
+
+        processed = await runner.run_once()
+        assert processed == 1
+
+        enforcement_key = bundle_stream_key(TENANT, "42", self.MODERATION_APP_ID, "action")
+        assert await redis_client.rpop(enforcement_key) is None
+
+    async def test_flag_off_skips_routing_entirely(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        async def _flag_off(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(runner_module, "run_moderation_gate", self._stamping_gate)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_off)
+
+        runner = ProcessRunner(
+            poller=self._poller_for_echo(http_client_factory),
+            redis_client=redis_client,
+            tenant_slug=TENANT,
+        )
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(self._identity_envelope(community="42").to_dict())
+        )
+
+        processed = await runner.run_once()
+        assert processed == 1  # main path unaffected by the flag being off
+
+        enforcement_key = bundle_stream_key(TENANT, "42", self.MODERATION_APP_ID, "action")
+        assert await redis_client.rpop(enforcement_key) is None
+
+    async def test_routing_exception_never_breaks_the_main_path(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A flag-check/LPUSH failure inside the routing hook must not drop the whole message."""
+        import runner as runner_module
+
+        async def _raising_flag(*args: Any, **kwargs: Any) -> bool:
+            raise RuntimeError("simulated PostHog outage")
+
+        monkeypatch.setattr(runner_module, "run_moderation_gate", self._stamping_gate)
+        monkeypatch.setattr(runner_module, "feature_enabled", _raising_flag)
+
+        runner = ProcessRunner(
+            poller=self._poller_for_echo(http_client_factory),
+            redis_client=redis_client,
+            tenant_slug=TENANT,
+        )
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(self._identity_envelope(community="42").to_dict())
+        )
+
+        # Must not raise/crash the drain loop despite the routing hook blowing up --
+        # the original event still reaches transform_fn and gets enqueued normally.
+        processed = await runner.run_once()
+        assert processed == 1
+
+        own_action_key = bundle_stream_key(TENANT, "42", APP_ID, "action")
+        assert await redis_client.rpop(own_action_key) is not None
+
+        enforcement_key = bundle_stream_key(TENANT, "42", self.MODERATION_APP_ID, "action")
+        assert await redis_client.rpop(enforcement_key) is None
+
+
 class TestRunForeverLifecycle:
     async def test_stop_ends_run_forever(self, redis_client: Any, http_client_factory: Any) -> None:
         import asyncio
@@ -1510,3 +1716,388 @@ class TestActivityAccrualHook:
         processed = await runner.run_once()
         assert processed == 0
         assert calls == []
+
+
+def _raid_envelope(
+    *, community: str | None, user_login: str = "raiderlogin", viewers: int = 50
+) -> StageEnvelope:
+    """A `channel.raid` `StageEnvelope`, shaped like `twitch_eventsub_ingest.normalize`'s output."""
+    return StageEnvelope(
+        tenant=TENANT,
+        community=community,
+        app_id=APP_ID,
+        stage="process",
+        event=PlatformEvent(
+            platform="twitch",
+            event_type="channel.raid",
+            actor=None,
+            payload={
+                "broadcaster_id": "111",
+                "broadcaster_login": "targetchannel",
+                "user_id": "999",
+                "user_login": user_login,
+                "user_display_name": "RaiderLogin",
+                "metadata": {"viewers": viewers},
+            },
+            occurred_at="2026-01-01T00:00:00+00:00",
+        ),
+        ts="2026-01-01T00:00:00+00:00",
+    )
+
+
+class TestRaidAutoShoutout:
+    """gh #316: `_transform_and_enqueue` calls `services.raid_shoutout.maybe_auto_shoutout`.
+
+    Wiring-only coverage -- the decision matrix itself (disabled/list_only/
+    all_creators/role_based/errors) is covered by `test_raid_shoutout.py`.
+    These monkeypatch `runner.maybe_auto_shoutout`/`runner.feature_enabled`
+    (the names imported into `runner.py`'s own namespace) to control the
+    decision directly, and assert the runner enqueues the right envelope to
+    the right key at the right time -- alongside, never in place of, the
+    chat-command path and the activity/accrual hooks above it.
+    """
+
+    SHOUTOUT_APP_ID = "waddles.bot.shoutout.default"
+
+    async def _stub_transform(self, event: PlatformEvent) -> PlatformEvent | None:
+        """Every chat-command bundle returns `None` for a raid (no `payload['text']`)."""
+        return None
+
+    async def test_emit_true_enqueues_shoutout_action_envelope(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+        from services.raid_shoutout import ShoutoutDecision
+
+        captured: dict[str, Any] = {}
+
+        async def _stub_decision(
+            event: PlatformEvent, *, community: str | None
+        ) -> ShoutoutDecision:
+            captured["event"] = event
+            captured["community"] = community
+            return ShoutoutDecision(emit=True, kind="video", target="raiderlogin", reason="ok")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _stub_decision)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(process_key, json.dumps(_raid_envelope(community="42").to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 0  # no chat-command reply -- nothing on the bot's own action key
+
+        own_action_key = bundle_stream_key(TENANT, "42", APP_ID, "action")
+        assert await redis_client.rpop(own_action_key) is None
+
+        shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+        raw_out = await redis_client.rpop(shoutout_action_key)
+        assert raw_out is not None
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.app_id == self.SHOUTOUT_APP_ID
+        assert env_out.stage == "action"
+        assert env_out.tenant == TENANT
+        assert env_out.community == "42"
+        assert env_out.target_app_id is None
+        assert env_out.event.payload["subcommand"] == "shoutout"
+        assert env_out.event.payload["kind"] == "video"
+        assert env_out.event.payload["target"] == "raiderlogin"
+        # Original raid payload fields survive alongside the new ones.
+        assert env_out.event.payload["broadcaster_login"] == "targetchannel"
+        assert env_out.event.payload["metadata"] == {"viewers": 50}
+        assert env_out.event.platform == "twitch"
+        assert env_out.event.event_type == "channel.raid"
+
+        assert captured["community"] == "42"
+        assert captured["event"].event_type == "channel.raid"
+
+    async def test_emit_false_enqueues_nothing(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+        from services.raid_shoutout import ShoutoutDecision
+
+        async def _stub_decision(
+            event: PlatformEvent, *, community: str | None
+        ) -> ShoutoutDecision:
+            return ShoutoutDecision(emit=False, kind=None, target="raiderlogin", reason="disabled")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _stub_decision)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(process_key, json.dumps(_raid_envelope(community="42").to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 0
+
+        shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+        assert await redis_client.rpop(shoutout_action_key) is None
+
+    async def test_non_raid_event_never_calls_decision(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-`channel.raid` event (e.g. an ordinary chat message) is untouched by this hook."""
+        import runner as runner_module
+
+        calls: list[PlatformEvent] = []
+
+        async def _stub_decision(event: PlatformEvent, *, community: str | None) -> Any:
+            calls.append(event)
+            raise AssertionError("must never be called for a non-raid event")
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _stub_decision)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.echo_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        env_in = _envelope(community="42", stage="process", text="hello there")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1  # the ordinary chat-echo path is entirely unaffected
+        assert calls == []
+
+        shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+        assert await redis_client.rpop(shoutout_action_key) is None
+
+    async def test_flag_off_skips_decision_entirely(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        decision_called = False
+
+        async def _stub_decision(event: PlatformEvent, *, community: str | None) -> Any:
+            nonlocal decision_called
+            decision_called = True
+            raise AssertionError("must never be called while the flag is off")
+
+        async def _flag_off(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _stub_decision)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_off)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(process_key, json.dumps(_raid_envelope(community="42").to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 0
+        assert decision_called is False
+
+        shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+        assert await redis_client.rpop(shoutout_action_key) is None
+
+    async def test_decision_failure_never_breaks_the_pipeline(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        async def _raising_decision(event: PlatformEvent, *, community: str | None) -> Any:
+            raise RuntimeError("simulated raid_shoutout outage")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _raising_decision)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(process_key, json.dumps(_raid_envelope(community="42").to_dict()))
+
+        # Must not raise/crash the drain loop despite the decision blowing up.
+        processed = await runner.run_once()
+        assert processed == 0
+
+        shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+        assert await redis_client.rpop(shoutout_action_key) is None
+
+    async def test_tenant_wide_activation_carries_resolved_community_on_envelope(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`community=None` on the envelope: destination KEY stays tenant-wide.
+
+        The envelope's own `community` field carries the resolved
+        (demo-shim) value instead -- same split `_transform_and_enqueue`
+        already uses for its own primary envelope/destination_key.
+        """
+        import runner as runner_module
+        from services.raid_shoutout import ShoutoutDecision
+
+        async def _stub_decision(
+            event: PlatformEvent, *, community: str | None
+        ) -> ShoutoutDecision:
+            return ShoutoutDecision(emit=True, kind="text", target="raiderlogin", reason="ok")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "maybe_auto_shoutout", _stub_decision)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": None,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, None, APP_ID, "process")
+        await redis_client.lpush(process_key, json.dumps(_raid_envelope(community=None).to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 0
+
+        shoutout_action_key = bundle_stream_key(TENANT, None, self.SHOUTOUT_APP_ID, "action")
+        raw_out = await redis_client.rpop(shoutout_action_key)
+        assert raw_out is not None
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.community == str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
+
+    async def test_real_decision_end_to_end_with_bound_dal(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No monkeypatched decision -- the real `raid_shoutout.maybe_auto_shoutout` runs.
+
+        Uses the real `bot_process` entrypoint (returns `None` for a raid --
+        no `payload['text']`) plus a bound fake DAL so `maybe_auto_shoutout`'s
+        own `shoutout_config` read resolves to a real (`all_creators`,
+        `vso_enabled=False`) row -- proving the full wiring end to end, not
+        just the monkeypatched seams above.
+        """
+        from flask_core import reset_bundle_dal_for_tests, set_bundle_dal
+
+        import runner as runner_module
+        from services import raid_shoutout as raid_shoutout_module
+
+        class _FakeDal:
+            async def execute(self, sql: str, params: list[Any] | None = None) -> list[Any]:
+                if "FROM shoutout_config" in sql:
+                    return [
+                        {
+                            "auto_shoutout_mode": "all_creators",
+                            "trigger_raid_host": True,
+                            "vso_enabled": False,
+                        }
+                    ]
+                raise AssertionError(f"unexpected SQL: {sql}")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        set_bundle_dal(_FakeDal())
+        raid_shoutout_module.reset_redis_client_for_tests()
+        monkeypatch.setattr(raid_shoutout_module, "_get_redis_client", lambda: redis_client)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        try:
+            poller = _make_poller(
+                http_client_factory,
+                [
+                    {
+                        "appId": APP_ID,
+                        "communityId": 42,
+                        "entrypoint": "bundles.bot_process:transform",
+                        "spec": {},
+                        "config": {},
+                    }
+                ],
+            )
+            runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+            process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+            await redis_client.lpush(
+                process_key, json.dumps(_raid_envelope(community="42").to_dict())
+            )
+
+            processed = await runner.run_once()
+            assert processed == 0  # bot_process itself never replies to a raid
+
+            shoutout_action_key = bundle_stream_key(TENANT, "42", self.SHOUTOUT_APP_ID, "action")
+            raw_out = await redis_client.rpop(shoutout_action_key)
+            assert raw_out is not None
+            env_out = StageEnvelope.from_dict(json.loads(raw_out))
+            assert env_out.event.payload["kind"] == "text"  # vso_enabled=False
+            assert env_out.event.payload["target"] == "raiderlogin"
+        finally:
+            reset_bundle_dal_for_tests()
+            raid_shoutout_module.reset_redis_client_for_tests()

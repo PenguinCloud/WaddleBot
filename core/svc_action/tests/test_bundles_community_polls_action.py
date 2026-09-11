@@ -101,7 +101,13 @@ class TestSendPollReply:
         with bundle_context(tenant="t1", community="c1", app_id="waddles.community.polls.default"):
             async with _client(lambda r: httpx.Response(200)) as client:
                 result = await send_poll_reply(
-                    _envelope(payload={"text": "hello", "channel_id": None, "channel_name": "waddles_tv"}),
+                    _envelope(
+                        payload={
+                            "text": "hello",
+                            "channel_id": None,
+                            "channel_name": "waddles_tv",
+                        }
+                    ),
                     _config(),
                     http_client=client,
                 )

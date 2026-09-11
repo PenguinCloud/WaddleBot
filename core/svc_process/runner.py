@@ -71,6 +71,21 @@ carries a real community is never looked up. Landing on the demo-shim
 source logs one WARN per process lifetime (`_warn_demo_shim_once`), not
 per event.
 
+Moderation enforcement routing (gh-304 P4, final wiring step): right after
+`run_moderation_gate` runs (still inside the same `bundle_context()`
+block), `_maybe_route_moderation_enforcement` checks `event_in.payload`
+for the gate's own `moderation_enforcement` stamp (mutated in place by
+`services.moderation_gate._emit_enforcement_if_filter_on`) and, if
+present, LPUSHes a SEPARATE action-stage envelope directly onto
+`waddles.community.moderation.default`'s own `:action` key -- reading the
+stamp off `event_in` rather than depending on whatever event `transform_fn`
+happens to return (most bundles build a fresh outgoing event, silently
+dropping any stamp that only rode on the inbound one). The synthetic
+event's payload carries the enforcement dict plus a fixed set of identity
+fields (never the original message text); normal processing of the
+inbound event is otherwise unaffected. Feature-gated (`waddles.moderation.
+enforce`, default ON); never raises into `_transform_and_enqueue`.
+
 Ordinary-activity reputation accrual (gh #310): after a successful
 (non-raising) transform of an INBOUND `event_type == "message"` event,
 `services.activity_accrual.record_activity` (imported here as
@@ -102,6 +117,7 @@ from flask_core import (
     bundle_context,
     get_bundle_dal,
 )
+from flask_core.feature_flags import feature_enabled
 from flask_core.stage_runner import (
     BundleDistribution,
     BundlePoller,
@@ -116,8 +132,54 @@ from services.activity_accrual import record_activity as accrue_activity
 from services.activity_feed import record_activity
 from services.community_resolver import resolve_community
 from services.moderation_gate import run_moderation_gate
+from services.raid_shoutout import RAID_EVENT_TYPE, SHOUTOUT_APP_ID, maybe_auto_shoutout
 
 logger = logging.getLogger(__name__)
+
+#: PostHog flag gating the raid auto-shoutout hook entirely (gh #316) --
+#: same flag key `bundles/social_shoutout_process.py`'s own `_FEATURE_FLAG`
+#: uses for the manual `!so`/`!vso` path (not imported -- that module is a
+#: process-stage bundle, this is the runner itself). Default ON: disabling
+#: this flag skips the hook (and its DB/Redis round trip) entirely, whereas
+#: a community's own `shoutout_config.auto_shoutout_mode == 'disabled'`
+#: (checked inside `maybe_auto_shoutout`) only disables that one community.
+_RAID_SHOUTOUT_FEATURE_FLAG = "waddles.bot.shoutout"
+
+#: gh-304 P4 wiring: PostHog flag gating THIS runner-level routing hook (get
+#: an already-stamped `moderation_enforcement` payload onto its own action
+#: envelope) -- independent of `services.moderation_gate`'s own
+#: `_MODERATION_FLAG_KEY` master switch (that flag gates whether the STAMP
+#: is ever produced at all; this one gates whether an already-produced
+#: stamp is ACTED on). Default ON, mirroring `_RAID_SHOUTOUT_FEATURE_FLAG`'s
+#: own default-on convention for a runner-level hook layered on top of an
+#: upstream opt-in.
+_MODERATION_ENFORCE_FEATURE_FLAG = "waddles.moderation.enforce"
+
+#: `app_catalog.app_id` this hook routes a stamped enforcement event to --
+#: MUST stay in sync with `services.moderation_gate._MODERATION_ENFORCE_
+#: APP_ID` (that module's own identical, module-private constant;
+#: duplicated here rather than imported since it is genuinely private
+#: there and this task's scope is `runner.py`/`test_runner.py` only).
+_MODERATION_ENFORCE_APP_ID = "waddles.community.moderation.default"
+
+#: Identity payload keys copied verbatim from the inbound event onto the
+#: synthetic enforcement envelope's own event payload -- exactly the field
+#: names `core/svc_action/bundles/moderation_enforce_action.py` reads to
+#: resolve its target user/channel/guild/broadcaster (`_resolve_target_
+#: user_id`, `_enforce_discord`, `_enforce_twitch`), plus `message_id`/
+#: `room_id` for audit/future use. Deliberately excludes `text` -- the
+#: whole point of this synthetic envelope is NOT re-transmitting the
+#: original message body to the enforcement action.
+_ENFORCEMENT_IDENTITY_PAYLOAD_KEYS: tuple[str, ...] = (
+    "author_id",
+    "user_id",
+    "channel_id",
+    "guild_id",
+    "channel_name",
+    "broadcaster_id",
+    "room_id",
+    "message_id",
+)
 
 _DEMO_SHIM_WARNED = False
 
@@ -177,6 +239,22 @@ def _resolve_platform_entity_id(event: PlatformEvent) -> str | None:
     if isinstance(raw, str) and raw:
         return raw
     return None
+
+
+def _community_id_or_none(community: str | None) -> int | None:
+    """Best-effort `int(community)` for `feature_enabled()`'s own `int | None` param, or `None`.
+
+    Same conversion `bundles/social_shoutout_process.py::_community_id`
+    performs locally for the identical `feature_enabled()` call shape --
+    replicated here rather than imported (that module is a process-stage
+    bundle, this is the runner itself).
+    """
+    if community is None:
+        return None
+    try:
+        return int(community)
+    except ValueError:
+        return None
 
 
 class ProcessRunner:
@@ -307,6 +385,13 @@ class ProcessRunner:
                 app_id=envelope_in.app_id,
             ):
                 await run_moderation_gate(event_in, redis_client=self._redis)
+                await self._maybe_route_moderation_enforcement(
+                    envelope_in,
+                    event_in,
+                    community_str=community_str,
+                    community_for_context=community_for_context,
+                    bundle=bundle,
+                )
                 event_out: PlatformEvent | None = await transform_fn(event_in)
         except Exception as exc:  # noqa: BLE001 - one bad event must never kill the loop
             logger.error("process.transform_failed app_id=%s error=%s", bundle.app_id, exc)
@@ -329,6 +414,13 @@ class ProcessRunner:
 
         await self._emit_activity(envelope_in, event_in, event_out)
         await self._accrue_activity(envelope_in, event_in, community_for_context, bundle)
+        await self._maybe_shoutout_raid(
+            envelope_in,
+            event_in,
+            community_str=community_str,
+            community_for_context=community_for_context,
+            bundle=bundle,
+        )
 
         if event_out is None:
             logger.info("process.no_reply app_id=%s", bundle.app_id)
@@ -481,3 +573,193 @@ class ProcessRunner:
             result.event_type,
             result.reason,
         )
+
+    async def _maybe_route_moderation_enforcement(
+        self,
+        envelope_in: StageEnvelope,
+        event_in: PlatformEvent,
+        *,
+        community_str: str | None,
+        community_for_context: str | None,
+        bundle: BundleDistribution,
+    ) -> None:
+        """gh-304 P4 wiring: route a gate-stamped enforcement onto its own action envelope.
+
+        `services.moderation_gate._emit_enforcement_if_filter_on` stamps
+        `event_in.payload["moderation_enforcement"]` IN PLACE on the same
+        `PlatformEvent` this method receives (see that module's docstring)
+        -- but the stamp only survives on the event a bundle's
+        `transform_fn` actually RETURNS, and most bundles (`bot_process.
+        transform` included) build a fresh outgoing event rather than
+        echoing the inbound one back, silently dropping it. This hook
+        reads the stamp directly off `event_in` right after the gate runs
+        -- never the bundle's own return value -- and, on a match, LPUSHes
+        a SEPARATE action-stage `StageEnvelope` straight onto the
+        moderation-enforce app's own `:action` key, same direct-build-and-
+        enqueue mechanism `_maybe_shoutout_raid` below already uses for
+        raid auto-shoutout. Normal processing (the original event still
+        flowing to `transform_fn`) is entirely unaffected either way -- a
+        pure side-additive enqueue, never a replacement.
+
+        The synthetic event's payload carries ONLY the enforcement dict
+        plus the identity fields `moderation_enforce_action.py::enforce()`
+        itself reads (`_ENFORCEMENT_IDENTITY_PAYLOAD_KEYS`) -- never
+        `text`, so the original message body never reaches the enforcement
+        action. `platform`/`actor` ride on the synthetic `PlatformEvent`'s
+        own top-level fields, matching how `enforce()` reads them.
+
+        Feature-gated (`_MODERATION_ENFORCE_FEATURE_FLAG`, default ON)
+        after the cheap stamp-presence check. Never raises: the whole body
+        below the presence check is wrapped, so a Valkey hiccup or a
+        malformed stamp can never turn a successful classification into a
+        dropped/failed transform -- the surrounding `_transform_and_
+        enqueue` caller's own broad `except Exception` (which WOULD drop
+        the whole message) must never see an exception from here.
+        """
+        enforcement = event_in.payload.get("moderation_enforcement")
+        if not isinstance(enforcement, dict):
+            return
+
+        try:
+            enabled = await feature_enabled(
+                _MODERATION_ENFORCE_FEATURE_FLAG,
+                tenant=envelope_in.tenant,
+                community=_community_id_or_none(community_for_context),
+                default=True,
+            )
+            if not enabled:
+                logger.debug("process.moderation_enforce_flag_disabled app_id=%s", bundle.app_id)
+                return
+
+            enforcement_payload: dict[str, Any] = {"moderation_enforcement": enforcement}
+            for key in _ENFORCEMENT_IDENTITY_PAYLOAD_KEYS:
+                value = event_in.payload.get(key)
+                if value is not None:
+                    enforcement_payload[key] = value
+
+            enforcement_event = PlatformEvent(
+                platform=event_in.platform,
+                event_type=event_in.event_type,
+                actor=event_in.actor,
+                payload=enforcement_payload,
+                occurred_at=datetime.now(UTC).isoformat(),
+            )
+            envelope_out = StageEnvelope(
+                tenant=envelope_in.tenant,
+                community=community_for_context,
+                app_id=_MODERATION_ENFORCE_APP_ID,
+                stage="action",
+                event=enforcement_event,
+                ts=datetime.now(UTC).isoformat(),
+            )
+            destination_key = bundle_stream_key(
+                self._tenant_slug, community_str, _MODERATION_ENFORCE_APP_ID, "action"
+            )
+            await self._redis.lpush(destination_key, json.dumps(envelope_out.to_dict()))
+            logger.debug(
+                "runner.enforcement_routed category=%s app=%s",
+                enforcement.get("category"),
+                _MODERATION_ENFORCE_APP_ID,
+            )
+        except Exception as exc:  # noqa: BLE001 - routing must never break the main path
+            logger.warning(
+                "process.moderation_enforce_routing_failed app_id=%s error=%s",
+                bundle.app_id,
+                exc,
+            )
+
+    async def _maybe_shoutout_raid(
+        self,
+        envelope_in: StageEnvelope,
+        event_in: PlatformEvent,
+        *,
+        community_str: str | None,
+        community_for_context: str | None,
+        bundle: BundleDistribution,
+    ) -> None:
+        """Best-effort raid auto-shoutout hook (gh #316) -- alongside the chat-command path.
+
+        Fires for every inbound `channel.raid` event, independent of
+        `transform_fn`'s own result: `bundles.bot_process.transform()`
+        (this pipeline's chat-command router) returns `None` for any event
+        with no `payload['text']` key, so a raid event never reaches the
+        chat-command path at all -- this hook is the ONLY consumer that
+        acts on a raid. The raid event's own normal flow (activity feed,
+        reputation accrual, and whatever `event_out` `transform_fn` did
+        produce) is entirely unaffected either way -- this is a pure
+        side-additive enqueue, never a replacement, and never reorders the
+        existing moderation-gate/`transform_fn`/accrual calls above it.
+
+        On a `True` decision (`services.raid_shoutout.maybe_auto_shoutout`),
+        builds and LPUSHes a NEW action-stage `StageEnvelope` directly onto
+        `SHOUTOUT_APP_ID`'s own `:action` key -- same destination-key
+        mechanism (`bundle_stream_key(tenant, community_str, app_id,
+        "action")`) `_transform_and_enqueue` already uses for
+        `PROCESS_TARGET_APP_ID_KEY` cross-app routing above, except this
+        envelope is built here directly rather than returned from
+        `transform_fn` (a raid event has no chat-command reply to
+        piggyback on). `envelope.community` carries the RESOLVED
+        `community_for_context` (required by `twitch_shoutout_action.
+        shoutout()`, which raises on a `None` community) while the
+        destination KEY is computed from the bundle-level `community_str`
+        -- same split `_transform_and_enqueue`'s own envelope_out/
+        destination_key already use, see that method's docstring.
+
+        Feature-gated (`_RAID_SHOUTOUT_FEATURE_FLAG`, default ON) -- OFF
+        skips the hook (and its DB/Redis round trip) entirely, before
+        `maybe_auto_shoutout` is even called. Never raises: both the
+        decision call and the LPUSH are wrapped, so a Valkey hiccup or an
+        unexpected error here can never break the rest of the pipeline.
+        """
+        if event_in.event_type != RAID_EVENT_TYPE:
+            return
+
+        enabled = await feature_enabled(
+            _RAID_SHOUTOUT_FEATURE_FLAG,
+            tenant=envelope_in.tenant,
+            community=_community_id_or_none(community_for_context),
+            default=True,
+        )
+        if not enabled:
+            logger.debug("process.raid_shoutout_flag_disabled app_id=%s", bundle.app_id)
+            return
+
+        try:
+            decision = await maybe_auto_shoutout(event_in, community=community_for_context)
+            if not decision.emit:
+                logger.debug(
+                    "process.raid_shoutout_skipped app_id=%s reason=%s",
+                    bundle.app_id,
+                    decision.reason,
+                )
+                return
+
+            shoutout_event = dataclasses.replace(
+                event_in,
+                payload={
+                    **event_in.payload,
+                    "subcommand": "shoutout",
+                    "kind": decision.kind,
+                    "target": decision.target,
+                },
+            )
+            envelope_out = StageEnvelope(
+                tenant=envelope_in.tenant,
+                community=community_for_context,
+                app_id=SHOUTOUT_APP_ID,
+                stage="action",
+                event=shoutout_event,
+                ts=datetime.now(UTC).isoformat(),
+            )
+            destination_key = bundle_stream_key(
+                self._tenant_slug, community_str, SHOUTOUT_APP_ID, "action"
+            )
+            await self._redis.lpush(destination_key, json.dumps(envelope_out.to_dict()))
+            logger.info(
+                "process.raid_shoutout_enqueued app_id=%s target=%s kind=%s",
+                bundle.app_id,
+                decision.target,
+                decision.kind,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort hook, must never break the pipeline
+            logger.warning("process.raid_shoutout_failed app_id=%s error=%s", bundle.app_id, exc)

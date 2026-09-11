@@ -11,6 +11,7 @@ every `libs/flask_core` DB fixture) stands in for the real Postgres
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from quart import Quart
@@ -71,10 +72,43 @@ class TestHealthEndpoint:
             assert body["status"] == "healthy"
 
     async def test_healthz_returns_200(self, app: Quart) -> None:
-        async with app.test_app():
-            client = app.test_client()
-            response = await client.get("/healthz")
-            assert response.status_code == 200
+        """Assert `/healthz` returns 200 with mocked, deterministic `psutil` readings.
+
+        `/healthz` (`flask_core.api_utils`) derives from real host CPU/memory via
+        `psutil` -- mock both so this assertion is deterministic regardless of host
+        load. Without this, `psutil.cpu_percent` reading a transient spike (e.g. a
+        heavily loaded shared dev/CI host with unrelated concurrent processes) trips
+        the >95% threshold and flips this test to a flaky, intermittent 503 with no
+        relation to hub-api's own health. regression: gh-314
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 10.0
+            async with app.test_app():
+                client = app.test_client()
+                response = await client.get("/healthz")
+                assert response.status_code == 200
+
+    async def test_healthz_reports_503_when_resources_degraded(self, app: Quart) -> None:
+        """Regression: the degraded-resource branch of `/healthz` must still 503.
+
+        Pinned via mocked `psutil` (independent of real host state) so this can't
+        silently bitrot into an always-200 endpoint while `test_healthz_returns_200`
+        above is also mocked healthy. regression: gh-314
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 95.0
+            async with app.test_app():
+                client = app.test_client()
+                response = await client.get("/healthz")
+                assert response.status_code == 503
+                body: dict[str, Any] = await response.get_json()
+                assert body["status"] == "degraded"
 
 
 class TestVersionedRoutersMounted:

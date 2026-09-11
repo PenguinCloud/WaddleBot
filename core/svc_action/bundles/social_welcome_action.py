@@ -51,7 +51,9 @@ async def send_welcome(
     channel_id = (
         payload_channel_id
         if isinstance(payload_channel_id, str) and payload_channel_id
-        else (config_channel_id if isinstance(config_channel_id, str) and config_channel_id else None)
+        else (
+            config_channel_id if isinstance(config_channel_id, str) and config_channel_id else None
+        )
     )
     if channel_id is None:
         raise NonRetryableTransportError(

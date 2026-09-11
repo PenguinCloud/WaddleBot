@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import httpx
 import pytest
-from flask_core import PlatformEvent, StageEnvelope, reset_bundle_dal_for_tests, set_bundle_dal
+from flask_core import (
+    AsyncDAL,
+    PlatformEvent,
+    StageEnvelope,
+    reset_bundle_dal_for_tests,
+    set_bundle_dal,
+)
 from waddle_transports import NonRetryableTransportError, RetryableTransportError
 
 from bundles.community_announcements_action import broadcast_announcement
@@ -150,6 +158,12 @@ class _FakeDal:
         self._query_platforms: list[str] | None = None
         self.community_servers = _FakeDalTable(self)
         self.announcement_broadcasts = self
+        # `dal.dal(query)` (the real `AsyncDAL.dal` raw-pydal-DAL attribute)
+        # resolves to this same fake's own `__call__` -- and `.tables`
+        # pre-populated so `_ensure_announcement_tables`'s idempotent
+        # `"x" not in dal.tables` guard is a no-op against this fake.
+        self.dal = self
+        self.tables = ("community_servers", "announcement_broadcasts")
 
     def __call__(self, query: Any) -> Any:
         """Support the query pattern dal(dal.community_servers.community_id == id)."""
@@ -513,3 +527,87 @@ class TestEdgeCases:
 
         assert result[0] is False
         assert "Unexpected error" in result[1]
+
+
+@pytest.fixture
+async def real_dal(tmp_path: Path) -> AsyncIterator[AsyncDAL]:
+    """Real sqlite `AsyncDAL` -- `tenants`/`communities`/`community_servers` physically created.
+
+    `_ensure_announcement_tables` always binds `community_servers`/
+    `announcement_broadcasts` with `migrate=False` (schema owned by
+    `000_create_base_schema.sql`, assumed to already exist against real
+    Postgres) -- a throwaway sqlite file has no such table until
+    something actually creates it, so this fixture defines the
+    identical column set with `migrate=True` first (same two-tier
+    convention `test_bundles_twitch_shoutout_action.py`'s own `dal`
+    fixture uses). `_ensure_announcement_tables`'s own `if "community_
+    servers" not in dal.tables` guard then finds both tables already
+    registered and is a no-op when the bundle runs.
+    """
+    async_dal = AsyncDAL(f"sqlite://{tmp_path}/announcements_test.db", pool_size=1, migrate=True)
+    d = async_dal.dal
+    d.define_table("tenants", migrate=True)
+    d.define_table("communities", d.Field("tenant_id", "reference tenants"), migrate=True)
+    d.define_table(
+        "community_servers",
+        d.Field("community_id", "reference communities", notnull=True),
+        d.Field("platform", "string", notnull=True),
+        migrate=True,
+    )
+    d.define_table(
+        "announcement_broadcasts",
+        d.Field("announcement_id", "integer", notnull=True),
+        d.Field("community_server_id", "integer"),
+        d.Field("platform", "string", notnull=True),
+        d.Field("status", "string", default="pending"),
+        d.Field("error_message", "string"),
+        d.Field("broadcasted_at", "datetime"),
+        d.Field("created_at", "datetime"),
+        migrate=True,
+    )
+    d.tenants.insert()
+    d.communities.insert(tenant_id=1)
+    d.commit()
+    set_bundle_dal(async_dal)
+    try:
+        yield async_dal
+    finally:
+        reset_bundle_dal_for_tests()
+        try:
+            await async_dal.close_async()
+        except Exception:  # noqa: BLE001, S110 -- known pydal cross-thread close gotcha
+            pass  # nosec B110
+
+
+class TestRealPydal:
+    """Real-DB smoke (gh-298): exercises the actual pydal query path, not a fake/mock."""
+
+    async def test_broadcast_against_real_sqlite_inserts_and_records(
+        self, real_dal: AsyncDAL
+    ) -> None:
+        # regression: gh-298 real-pydal
+        """`dal.dal(query)` fix: insert one community_server, broadcast, read back the audit row."""
+        d = real_dal.dal
+        server_id = d.community_servers.insert(community_id=1, platform="discord")
+        d.commit()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"success": True})
+
+        async with _client(handler) as client:
+            with mock.patch("bundles.community_announcements_action._PLATFORM_ENDPOINTS", {
+                "discord": "http://8.8.8.8:8070",
+                "slack": "http://8.8.8.8:8071",
+                "twitch": "http://8.8.8.8:8072",
+                "youtube": "http://8.8.8.8:8073",
+            }):
+                result = await broadcast_announcement(_envelope(), _config(), http_client=client)
+
+        assert result.transport == "bundle"
+        assert "1/1" in result.detail
+
+        broadcasts = d(d.announcement_broadcasts.community_server_id == server_id).select()
+        assert len(broadcasts) == 1
+        assert broadcasts[0].platform == "discord"
+        assert broadcasts[0].status == "sent"
+        assert broadcasts[0].announcement_id == 42

@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from flask_core import PlatformEvent, StageEnvelope, bundle_context, reset_bundle_dal_for_tests, set_bundle_dal
+from flask_core import (
+    PlatformEvent,
+    StageEnvelope,
+    bundle_context,
+    reset_bundle_dal_for_tests,
+    set_bundle_dal,
+)
 from waddle_transports import NonRetryableTransportError, RetryableTransportError
 
 from bundles.social_quote_action import send_message
@@ -103,7 +109,9 @@ class TestSendMessage:
         assert captured["auth"] == "Bot s3cr3t"
         assert result.transport == "bundle"
 
-    async def test_resolves_channel_id_from_payload_discord(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_resolves_channel_id_from_payload_discord(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Reply-in-place: payload channel_id takes precedence (Discord)."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
         captured = {}
@@ -122,7 +130,9 @@ class TestSendMessage:
         assert "payload-chan" in captured["url"]
         assert result.http_status == 200
 
-    async def test_fallback_to_config_channel_id_discord(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_fallback_to_config_channel_id_discord(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Uses config channel_id when payload has none (Discord)."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
         captured = {}
@@ -132,7 +142,7 @@ class TestSendMessage:
             return httpx.Response(200)
 
         async with _client(handler) as client:
-            result = await send_message(
+            await send_message(
                 _envelope({"text": "hi"}),  # no channel_id in payload
                 _config(channel_id="config-chan"),
                 http_client=client,
@@ -217,7 +227,9 @@ class TestSendMessage:
 
 
 class TestQuoteAddIntent:
-    async def test_add_quote_intent_executes_db_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_add_quote_intent_executes_db_insert(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Quote add intent from process stage is executed in action stage."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
 
@@ -241,7 +253,9 @@ class TestQuoteAddIntent:
         # Verify response was successful
         assert result.http_status == 200
 
-    async def test_add_quote_db_failure_returns_error_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_add_quote_db_failure_returns_error_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Database error on quote add returns error message."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
         mock_dal = AsyncMock()
@@ -285,7 +299,7 @@ class TestTwitchPlatform:
                 "bundles.social_quote_action.RelayOutboundIrcTransport",
                 return_value=mock_transport,
             ):
-                result = await send_message(
+                await send_message(
                     _envelope({"text": "hi", "channel_name": "testchannel"}, platform="twitch"),
                     _config(channel=None, channel_id=None),
                     http_client=client,
@@ -329,7 +343,9 @@ class TestEdgeCases:
                 http_client=client,
             )
 
-    async def test_missing_bot_token_ref_is_non_retryable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_missing_bot_token_ref_is_non_retryable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Missing bot_token_ref in config raises NonRetryableTransportError."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
 
@@ -341,14 +357,18 @@ class TestEdgeCases:
                     http_client=client,
                 )
 
-    async def test_ssrf_guard_rejection_is_non_retryable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_ssrf_guard_rejection_is_non_retryable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """SSRF guard rejection raises NonRetryableTransportError."""
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
 
         from waddle_transports.url_guard import SSRFError
 
         async with _client(lambda r: httpx.Response(200)) as client:
-            with patch("waddle_transports.url_guard.guarded_request", side_effect=SSRFError("blocked")):
+            with patch(
+                "waddle_transports.url_guard.guarded_request", side_effect=SSRFError("blocked")
+            ):
                 with pytest.raises(NonRetryableTransportError, match="SSRF"):
                     await send_message(
                         _envelope({"text": "hi", "channel_id": "123"}),

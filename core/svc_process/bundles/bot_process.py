@@ -101,8 +101,6 @@ _BOT_COMMANDS = frozenset(
         "hug",
         "love",
         "lurk",
-        "so",
-        "shoutout",
         "followage",
         "uptime",
         "time",
@@ -137,11 +135,18 @@ _FEATURE_MODULES: dict[str, str] = {
     "reputation": "bundles.community_reputation_process",
     "rep": "bundles.community_reputation_process",
     "inventory": "bundles.inventory_process",
+    "so": "bundles.social_shoutout_process",
+    "shoutout": "bundles.social_shoutout_process",
+    "vso": "bundles.social_shoutout_process",
     "sr": "bundles.social_music_process",
     "songrequest": "bundles.social_music_process",
     "sq": "bundles.social_music_process",
     "songqueue": "bundles.social_music_process",
     "cc": "bundles.community_context_process",
+    "points": "bundles.community_loyalty_process",
+    "top": "bundles.community_loyalty_process",
+    "shop": "bundles.community_loyalty_process",
+    "redeem": "bundles.community_loyalty_process",
 }
 
 
@@ -297,13 +302,6 @@ def _handle_command(command: str, rest: str, *, actor: str | None, platform: str
         return f"\U0001f495 {who} + {target} = {_love_percent()}% love match!"
     if command == "lurk":
         return f"{who} slips into the shadows to lurk \U0001f440"
-    if command in ("so", "shoutout"):
-        target = rest.strip()
-        return (
-            f"\U0001f3c6 Go check out {target}! They're awesome \U0001f389"
-            if target
-            else f"Usage: !{command} <user>"
-        )
     if command == "followage":
         return f"Followage tracking is coming soon, {who}! \U0001f427"
     if command == "uptime":

@@ -107,7 +107,9 @@ async def send_message(
         )
 
     if not isinstance(text, str) or not text:
-        raise NonRetryableTransportError("action envelope event.payload missing required 'text' string")
+        raise NonRetryableTransportError(
+            "action envelope event.payload missing required 'text' string"
+        )
 
     # Send via platform-specific transport
     if platform == "twitch":
@@ -122,7 +124,9 @@ async def send_message(
 
     token_ref = config.get("bot_token_ref")
     if not isinstance(token_ref, str) or not token_ref:
-        raise NonRetryableTransportError("social quote bundle config missing required 'bot_token_ref'")
+        raise NonRetryableTransportError(
+            "social quote bundle config missing required 'bot_token_ref'"
+        )
 
     try:
         token = resolve_secret(token_ref)
@@ -197,8 +201,10 @@ async def _add_quote_to_db(quote_text: str, actor: str | None) -> int | None:
         """
         now = datetime.now(UTC).isoformat()
         result = await dal.execute(sql, [quote_text, actor or "unknown", now, now])
-        if result:
-            return result[0].get("id")
-        return None
+        if not result:
+            return None
+        row = result[0]
+        raw_id = row.get("id") if isinstance(row, dict) else None
+        return raw_id if isinstance(raw_id, int) else None
     except Exception:
         return None

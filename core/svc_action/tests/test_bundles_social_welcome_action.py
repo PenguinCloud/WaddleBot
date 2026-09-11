@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -126,7 +126,11 @@ class TestSendWelcome:
     async def test_http_timeout_is_retryable(self) -> None:
         """Network timeout raises RetryableTransportError."""
         envelope = _envelope()
-        async with _client(lambda r: (_ for _ in ()).throw(httpx.TimeoutException("timeout"))) as client:
+
+        def timeout_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException("timeout")
+
+        async with _client(timeout_handler) as client:
             with patch("bundles.social_welcome_action.resolve_secret", return_value="secret"):
                 with pytest.raises(RetryableTransportError):
                     await send_welcome(envelope, _config(), http_client=client)
@@ -208,7 +212,9 @@ class TestSendWelcome:
             return httpx.Response(200, json={"id": "msg-1"})
 
         async with _client(handler) as client:
-            with patch("bundles.social_welcome_action.resolve_secret", return_value="bot-token-secret"):
+            with patch(
+                "bundles.social_welcome_action.resolve_secret", return_value="bot-token-secret"
+            ):
                 await send_welcome(envelope, _config(), http_client=client)
                 assert captured["auth"] == "Bot bot-token-secret"
                 assert captured["content_type"] == "application/json"

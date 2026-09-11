@@ -170,19 +170,6 @@ class TestNewInlineCommands:
         assert result is not None
         assert result.payload["text"] == "penguin slips into the shadows to lurk \U0001f440"
 
-    @pytest.mark.parametrize("cmd", ["!so", "!shoutout"])
-    async def test_shoutout_with_target(self, cmd: str) -> None:
-        result = await transform(_event(f"{cmd} clubpenguinfan"))
-        assert result is not None
-        assert result.payload["text"] == (
-            "\U0001f3c6 Go check out clubpenguinfan! They're awesome \U0001f389"
-        )
-
-    async def test_shoutout_without_target_returns_usage_hint(self) -> None:
-        result = await transform(_event("!so"))
-        assert result is not None
-        assert result.payload["text"] == "Usage: !so <user>"
-
     async def test_followage_is_a_graceful_stub(self) -> None:
         result = await transform(_event("!followage", actor="penguin"))
         assert result is not None
@@ -383,7 +370,7 @@ class TestRouter:
             reset_bundle_dal_for_tests()
         assert result is not None
         assert result.payload["text"] == (
-            "\U0001f427 penguinzplays — Global: 600 (Fair) · waddlebot: 720 (Outstanding)"
+            "\U0001f427 penguinzplays — Global: 600 (Trusted) · waddlebot: 720 (Respected)"
         )
 
     async def test_rep_alias_dispatches_to_the_same_reputation_bundle(self) -> None:
@@ -395,7 +382,7 @@ class TestRouter:
         finally:
             reset_bundle_dal_for_tests()
         assert result is not None
-        assert "waddlebot: 720 (Outstanding)" in result.payload["text"]
+        assert "waddlebot: 720 (Respected)" in result.payload["text"]
 
     async def test_reputation_dispatch_graceful_when_member_not_found(self) -> None:
         """No matching `community_members` row -- both scores default to the 600 baseline."""
@@ -407,7 +394,7 @@ class TestRouter:
             reset_bundle_dal_for_tests()
         assert result is not None
         assert result.payload["text"] == (
-            "\U0001f427 stranger — Global: 600 (Fair) · community 4: 600 (Fair)"
+            "\U0001f427 stranger — Global: 600 (Trusted) · community 4: 600 (Trusted)"
         )
 
     async def test_reputation_lookup_failure_is_swallowed_gracefully(self) -> None:

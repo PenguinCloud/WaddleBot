@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 from flask_core import (
+    AsyncDAL,
     PlatformEvent,
     bundle_context,
     reset_bundle_dal_for_tests,
@@ -96,6 +99,12 @@ class _FakeDal:
         self._query_community_id: int | None = None
         self._raise_on_query: Exception | None = None
         self.announcements = _FakeDalTable(self)
+        # `dal.dal(query)` (the real `AsyncDAL.dal` raw-pydal-DAL
+        # attribute) resolves to this same fake's own `__call__` --
+        # and `.tables` pre-populated so `_ensure_announcements_table`'s
+        # idempotent `"x" not in dal.tables` guard is a no-op.
+        self.dal = self
+        self.tables = ("announcements",)
 
     def __call__(self, query: Any) -> Any:
         """Support the query pattern dal(dal.announcements.id == id)."""
@@ -106,6 +115,10 @@ class _FakeDal:
             # This is a query object, extract any community_id filter
             pass
         return query if hasattr(query, "first") else self
+
+    async def select_async(self, query: Any, *args: object, **kwargs: object) -> Any:
+        """Async version of select -- delegates to the fake query's own `.select()`."""
+        return query.select() if hasattr(query, "select") else query
 
     def add_announcement(self, id: int, title: str, content: str, **kwargs: object) -> None:
         """Add a test announcement."""
@@ -397,3 +410,72 @@ class TestTransform:
             result = await transform(_event("!announce publish 1"))
 
         assert result is None
+
+
+@pytest.fixture
+async def real_dal(tmp_path: Path) -> AsyncIterator[AsyncDAL]:
+    """Real sqlite `AsyncDAL` -- `tenants`/`communities`/`announcements` physically created.
+
+    Same two-tier convention as `svc_action/tests/test_bundles_twitch_
+    shoutout_action.py`'s own `dal` fixture: `_ensure_announcements_table`
+    always binds with `migrate=False`, so this fixture defines the
+    identical column set with `migrate=True` first; the bundle's own
+    guard then finds the table already registered and is a no-op.
+    """
+    async_dal = AsyncDAL(f"sqlite://{tmp_path}/announce_process_test.db", pool_size=1, migrate=True)
+    d = async_dal.dal
+    d.define_table("tenants", migrate=True)
+    d.define_table("communities", d.Field("tenant_id", "reference tenants"), migrate=True)
+    d.define_table(
+        "announcements",
+        d.Field("community_id", "reference communities", notnull=True),
+        d.Field("title", "string", notnull=True),
+        d.Field("content", "text", notnull=True),
+        d.Field("announcement_type", "string", default="general"),
+        d.Field("status", "string", default="published"),
+        d.Field("broadcasted_platforms", "json", default=[]),
+        migrate=True,
+    )
+    d.tenants.insert()
+    d.communities.insert(tenant_id=1)
+    d.commit()
+    set_bundle_dal(async_dal)
+    try:
+        yield async_dal
+    finally:
+        reset_bundle_dal_for_tests()
+        try:
+            await async_dal.close_async()
+        except Exception:  # noqa: BLE001, S110 -- known pydal cross-thread close gotcha
+            pass  # nosec B110
+
+
+class TestRealPydal:
+    """Real-DB smoke (gh-298): exercises the actual pydal query path, not a fake."""
+
+    async def test_announce_publish_against_real_sqlite(self, real_dal: AsyncDAL) -> None:
+        # regression: gh-298 real-pydal
+        """`dal.dal(query)` fix: insert one announcement, enrich via `transform`, read back."""
+        d = real_dal.dal
+        community_id = d.communities.insert(tenant_id=1)
+        announcement_id = d.announcements.insert(
+            community_id=community_id,
+            title="Real Announcement",
+            content="Real content",
+            announcement_type="general",
+            status="published",
+            broadcasted_platforms=["discord"],
+        )
+        d.commit()
+
+        with bundle_context(
+            tenant="acme-corp",
+            community=str(community_id),
+            app_id="waddles.community.announcements.default",
+        ):
+            result = await transform(_event(f"!announce publish {announcement_id}"))
+
+        assert result is not None
+        assert result.payload["announcement_id"] == announcement_id
+        assert result.payload["announcement"]["title"] == "Real Announcement"
+        assert result.payload["target_platforms"] == ["discord"]

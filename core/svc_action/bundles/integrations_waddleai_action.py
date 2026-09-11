@@ -105,7 +105,7 @@ async def waddleai_completion(
     # Handle 503 (AI disabled or flag off) as retryable -- may become available
     if response.status_code == 503:
         raise RetryableTransportError(
-            f"waddleai API returned 503 (AI service may be disabled or unavailable)",
+            "waddleai API returned 503 (AI service may be disabled or unavailable)",
             http_status=503,
         )
     # Handle auth failures
@@ -143,11 +143,14 @@ async def waddleai_completion(
     ai_text = data.get("text")
     if not isinstance(ai_text, str):
         raise NonRetryableTransportError(
-            f"waddleai API response missing 'text' field or not a string"
+            "waddleai API response missing 'text' field or not a string"
         )
 
     return TransportResult(
         transport="bundle",
-        detail=f"waddleai completion sent, community={community_id} tokens={data.get('output_tokens', 0)}",
+        detail=(
+            f"waddleai completion sent, community={community_id} "
+            f"tokens={data.get('output_tokens', 0)}"
+        ),
         http_status=response.status_code,
     )

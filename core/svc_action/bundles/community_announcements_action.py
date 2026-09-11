@@ -20,10 +20,26 @@ backoff` in `runner.py::_handle_envelope` owns all backoff timing on
 `RetryableTransportError`. Similarly, this bundle records DB audit
 results independently; the runner's own `action_dispatch_log` provides
 a parallel record of transport-level outcomes.
+
+`community_servers`/`announcement_broadcasts` are never bound anywhere
+else on this service's `dal` (svc-action's own startup only binds
+`tenants`/`communities`/`app_catalog`/`action_dispatch_log` --
+`reference_tables.py`, `flask_core.app_bundle_tables`,
+`services/dispatch_log.py`), so this bundle binds its own minimal
+stubs (`_ensure_announcement_tables`, idempotent, `migrate=False` --
+schema owned by `config/postgres/migrations/000_create_base_schema.sql`),
+same "bind only the columns this bundle actually touches" convention
+`twitch_shoutout_action.py::_ensure_shoutout_tables` already
+establishes. `select_async` runs `query.select()`/`query.db.commit()`
+directly (`flask_core/database.py`) -- it requires a pydal `Set`
+(`dal.dal(query)`), not a bare `Query` (gh #298, matching
+`runner.py::_resolve_tenant_id`'s own `dal.dal(query)` call shape); a
+bare `Query` has no `.select()`/`.db` in this pydal version.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -33,6 +49,39 @@ import httpx
 from flask_core import StageEnvelope, get_bundle_dal
 from waddle_transports import NonRetryableTransportError, RetryableTransportError, TransportResult
 from waddle_transports.url_guard import SSRFError, guarded_request
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_announcement_tables(dal: Any) -> None:
+    """Idempotently bind `community_servers`/`announcement_broadcasts` -- only the columns used.
+
+    Mirrors `twitch_shoutout_action.py::_ensure_shoutout_tables`'s own
+    "minimal stub, no DDL" convention -- `migrate=False` throughout,
+    schema owned by `000_create_base_schema.sql`. Must run on a `dal`
+    that already has `communities` defined (svc-action's own `app.py`
+    startup binds it via `bind_minimal_reference_tables` before
+    `set_bundle_dal()`).
+    """
+    if "community_servers" not in dal.tables:
+        dal.define_table(
+            "community_servers",
+            dal.Field("community_id", "reference communities", notnull=True),
+            dal.Field("platform", "string", notnull=True),
+            migrate=False,
+        )
+    if "announcement_broadcasts" not in dal.tables:
+        dal.define_table(
+            "announcement_broadcasts",
+            dal.Field("announcement_id", "integer", notnull=True),
+            dal.Field("community_server_id", "integer"),
+            dal.Field("platform", "string", notnull=True),
+            dal.Field("status", "string", default="pending"),
+            dal.Field("error_message", "string"),
+            dal.Field("broadcasted_at", "datetime"),
+            dal.Field("created_at", "datetime", default=lambda: datetime.now(UTC)),
+            migrate=False,
+        )
 
 
 #: Per-platform action service base URLs, fallback defaults from env vars
@@ -119,6 +168,7 @@ async def broadcast_announcement(
         raise NonRetryableTransportError("envelope event.payload missing 'announcement_id' int")
 
     dal = get_bundle_dal()
+    _ensure_announcement_tables(dal)
 
     # Look up community_servers matching the target platforms
     community_id = envelope.community
@@ -130,11 +180,14 @@ async def broadcast_announcement(
             (dal.community_servers.community_id == int(community_id))
             & (dal.community_servers.platform.belongs(target_platforms))
         )
-        servers = await dal.select_async(query)
+        # select_async runs query.select()/query.db.commit() directly --
+        # requires a pydal Set (dal.dal(query)), not a bare Query.
+        servers = await dal.select_async(dal.dal(query))
 
         if not servers:
             raise NonRetryableTransportError(
-                f"no active servers found for community_id={community_id} platforms={target_platforms}"
+                f"no active servers found for community_id={community_id} "
+                f"platforms={target_platforms}"
             )
 
         # Fan out to each server, collecting results
@@ -157,10 +210,15 @@ async def broadcast_announcement(
                     broadcasted_at=datetime.now(UTC),
                     created_at=datetime.now(UTC),
                 )
-            except Exception as exc:  # noqa: BLE001
-                # Log but don't fail the entire broadcast if audit recording fails
-                # The action_dispatch_log (runner's own audit) still records the outcome
-                pass  # nosec B110
+            except Exception as exc:  # noqa: BLE001 -- audit write failure must never fail the broadcast
+                # The action_dispatch_log (runner's own audit) still records the outcome.
+                logger.warning(
+                    "community_announcements_action.broadcast_audit_write_failed "
+                    "announcement_id=%s platform=%s error=%s",
+                    announcement_id,
+                    platform,
+                    exc,
+                )
 
             results.append(
                 {

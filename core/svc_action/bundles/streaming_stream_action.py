@@ -10,6 +10,15 @@ Receives an event with payload `{"query": "get_live_streams|featured|details",
 formatted live-stream DTOs via the `detail` field of TransportResult.
 Raises `NonRetryableTransportError` for invalid queries or missing data
 (no matching community or stream).
+
+`community_servers`/`coordination` are never bound anywhere else on this
+service's `dal` (svc-action's own startup only binds `tenants`/
+`communities`/`app_catalog`/`action_dispatch_log`), so this bundle binds
+its own minimal stubs (`_ensure_streaming_tables`, idempotent,
+`migrate=False` -- schema owned by `config/postgres/migrations/
+000_create_base_schema.sql`/`004_add_missing_tables.sql`), same "bind
+only the columns this bundle actually touches" convention
+`twitch_shoutout_action.py::_ensure_shoutout_tables` establishes.
 """
 
 from __future__ import annotations
@@ -29,6 +38,42 @@ if TYPE_CHECKING:
 
 #: Live streams platform filter -- node hardcoded this; port verbatim.
 _LIVE_PLATFORM = "twitch"
+
+
+def _ensure_streaming_tables(async_dal: Any) -> None:
+    """Idempotently bind `community_servers`/`coordination` -- only the columns this bundle reads.
+
+    Mirrors `twitch_shoutout_action.py::_ensure_shoutout_tables`'s own
+    "minimal stub, no DDL" convention, `migrate=False` throughout. Must
+    run on a `dal` that already has `communities` defined (svc-action's
+    own `app.py` startup binds it before `set_bundle_dal()`).
+    """
+    if "community_servers" not in async_dal.tables:
+        async_dal.define_table(
+            "community_servers",
+            async_dal.Field("community_id", "reference communities", notnull=True),
+            async_dal.Field("platform", "string", notnull=True),
+            async_dal.Field("platform_server_id", "string", notnull=True),
+            async_dal.Field("status", "string", default="pending"),
+            migrate=False,
+        )
+    if "coordination" not in async_dal.tables:
+        async_dal.define_table(
+            "coordination",
+            async_dal.Field("entity_id", "string", notnull=True),
+            async_dal.Field("platform", "string", notnull=True),
+            async_dal.Field("server_id", "string"),
+            async_dal.Field("channel_id", "string"),
+            async_dal.Field("channel_name", "string"),
+            async_dal.Field("is_live", "boolean", default=False),
+            async_dal.Field("viewer_count", "integer", default=0),
+            async_dal.Field("live_since", "datetime"),
+            async_dal.Field("stream_title", "string"),
+            async_dal.Field("game_name", "string"),
+            async_dal.Field("thumbnail_url", "string"),
+            async_dal.Field("last_updated", "datetime"),
+            migrate=False,
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -89,6 +134,7 @@ async def list_streams(
     # Get tenant/community from the frozen API (per APP_BUNDLE_AUTHORING.md §5).
     # Never read from payload -- context comes from the envelope's isolation boundary.
     async_dal = get_bundle_dal()
+    _ensure_streaming_tables(async_dal)
     ctx = get_bundle_context()
 
     # Reject if payload supplies a community_id that differs from context (IDOR guard).
