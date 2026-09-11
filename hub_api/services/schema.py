@@ -2655,6 +2655,10 @@ def bind_music_tables(dal: Any, *, migrate: bool = False) -> None:
         Field("community_id", "integer", notnull=True, unique=True),
         Field("song_requests_allowed", "boolean", notnull=True, default=True),
         Field("requests_category_restricted", "boolean", notnull=True, default=False),
+        # gh-313: JSON-encoded list of lowercase YouTube content labels
+        # allowed for song requests; NULL/empty = unrestricted. Added by
+        # 0013_music_policy_yt_labels.
+        Field("youtube_allowed_labels", "text"),
         Field("updated_by", "integer"),
         Field("updated_at", "datetime"),
         migrate=migrate,

@@ -11,10 +11,11 @@ sqlite DB (`tmp_path`-scoped -- `AsyncDAL`'s `ThreadPoolExecutor` opens a
 connection per worker thread; `sqlite:memory` is connection-scoped and a
 worker thread would see a blank DB, the exact gotcha
 `hub_api/tests/conftest.py`'s `auth_db` fixture documents) with
-`db_migrate=True` so `bind_presentation_tables()` issues real DDL, and no
-Valkey URL configured -- every test runs `PresentationHub`/
-`MusicQueueReader` in fallback (pure in-process) mode unless a test
-explicitly injects a fake Valkey client.
+`db_migrate=True` so `bind_presentation_tables()` issues real DDL, no
+Valkey URL configured (`PresentationHub` runs in fallback, pure in-process
+mode unless a test explicitly injects a fake Valkey client), and no
+`SERVICE_API_KEY` configured (`MusicQueueReader.connected` stays `False`)
+unless a test explicitly injects a fake HTTP client.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def test_config(tmp_path: Path) -> Config:
         hub_api_url="http://hub-api:8204",
         hub_api_poll_interval_seconds=30,
         push_token="",
-        music_queue_namespace="music_queue_test",
+        service_api_key="",
     )
 
 

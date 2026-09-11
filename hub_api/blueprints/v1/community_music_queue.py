@@ -23,10 +23,12 @@ True`, policy + all moderation actions) scope is required.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from flask_core.api_utils import error_response
+from flask_core.feature_flags import feature_enabled
 from flask_core.tenancy import get_tenant_context, tenant_middleware
 from quart import Blueprint, current_app, jsonify, request
 from quart_schema import validate_request, validate_response
@@ -40,6 +42,12 @@ from services.errors import ApiError, bad_request, not_found
 from services.music_status_service import check_spotify_health
 
 logger = logging.getLogger(__name__)
+
+#: gh-313 -- gates the `youtube_allowed_labels` community allowlist check in
+#: `enqueue_request()`; defaults ON (`default=True` at every call site
+#: below) so the label gate is the normal behavior and this flag is purely
+#: a kill switch, not an opt-in.
+FEATURE_MUSIC_YOUTUBE_LABELS = "waddles.social.music.youtube_labels"
 
 music_queue_bp = Blueprint("v1_community_music_queue", __name__, url_prefix="/api/v1/admin")
 
@@ -65,6 +73,12 @@ def _tenant_id() -> int:
     return cast(int, ctx.tenant_id)
 
 
+def _tenant_slug() -> str:
+    ctx = get_tenant_context(request)
+    assert ctx is not None  # nosec B101 - tenant_middleware always runs first
+    return cast(str, ctx.tenant_slug)
+
+
 def _err(exc: ApiError) -> tuple[dict[str, object], int]:
     return cast(
         tuple[dict[str, object], int], error_response(exc.message, exc.status_code, exc.code)
@@ -80,10 +94,15 @@ def _err(exc: ApiError) -> tuple[dict[str, object], int]:
 
 @dataclass(slots=True, frozen=True)
 class SetPolicyRequest:
-    """Request DTO for `PUT .../music-station/policy` -- both fields optional (partial update)."""
+    """Request DTO for `PUT .../music-station/policy` -- all fields optional (partial update).
+
+    `youtubeAllowedLabels`: `None` leaves the allowlist unchanged; `[]`
+    explicitly clears it back to unrestricted (gh-313).
+    """
 
     songRequestsAllowed: bool | None = None
     requestsCategoryRestricted: bool | None = None
+    youtubeAllowedLabels: list[str] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -203,6 +222,7 @@ async def set_policy(data: SetPolicyRequest, community_id: int) -> Any:
             community_id=community_id,
             song_requests_allowed=data.songRequestsAllowed,
             requests_category_restricted=data.requestsCategoryRestricted,
+            youtube_allowed_labels=data.youtubeAllowedLabels,
             updated_by=actor_id,
         )
     except ApiError as exc:
@@ -230,6 +250,12 @@ async def enqueue_song_request(data: EnqueueRequestRequest, community_id: int) -
             admin=data.overrideCategoryRestriction,
         )
         requester_id = get_current_user_id(request)
+        enforce_youtube_labels = await feature_enabled(
+            FEATURE_MUSIC_YOUTUBE_LABELS,
+            tenant=_tenant_slug(),
+            community=community_id,
+            default=True,
+        )
         item = await svc.enqueue_request(
             async_dal,
             dal,
@@ -239,6 +265,7 @@ async def enqueue_song_request(data: EnqueueRequestRequest, community_id: int) -
             provider=data.provider,
             requested_by=requester_id,
             is_admin_override=data.overrideCategoryRestriction,
+            enforce_youtube_labels=enforce_youtube_labels,
         )
     except ApiError as exc:
         return _err(exc)
@@ -478,6 +505,16 @@ async def internal_enqueue_song_request() -> Any:
             return _err(not_found("Community not found"))
         tenant_id = int(community_row.tenant_id)
 
+        # No JWT/`TenantContext` on this service-key route (see module
+        # docstring) -- the slug `feature_enabled()` needs is looked up
+        # straight from the tenant row it was just derived from, "global"
+        # fallback only for the practically-unreachable dangling-FK case.
+        tenant_row = dal(dal.tenants.id == tenant_id).select(dal.tenants.slug).first()
+        tenant_slug = tenant_row.slug if tenant_row is not None else "global"
+        enforce_youtube_labels = await feature_enabled(
+            FEATURE_MUSIC_YOUTUBE_LABELS, tenant=tenant_slug, community=community_id, default=True
+        )
+
         platform = body.get("platform")
         platform_user_id = body.get("platformUserId")
         requested_by = await _resolve_requester(
@@ -496,6 +533,7 @@ async def internal_enqueue_song_request() -> Any:
             provider=body.get("provider"),
             requested_by=requested_by,
             is_admin_override=False,
+            enforce_youtube_labels=enforce_youtube_labels,
         )
     except ApiError as exc:
         return _err(exc)
@@ -506,6 +544,77 @@ async def internal_enqueue_song_request() -> Any:
         )
         return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
     return jsonify_dto(QueueItemResponse(success=True, item=item), 201)
+
+
+@music_internal_bp.route("/music/policy", methods=["PUT"])
+async def internal_set_music_policy() -> Any:
+    """`PUT /api/v1/internal/music/policy` -- service-to-service only (gh-313).
+
+    Lets a chat-side moderation command (no user JWT) update a
+    community's `youtube_allowed_labels` allowlist without going through
+    the admin-JWT-scoped `music_queue_bp.set_policy` route above. Body:
+    `{"community_id": int, "youtube_allowed_labels": [str, ...]}` --
+    `tenant_id` is deliberately NOT accepted from the caller, same trust
+    boundary reasoning as `internal_enqueue_song_request()`'s own
+    docstring: derived from the community row itself, never the caller.
+    Validation (bounds/shape) is `services.community_music_queue_service.
+    set_policy()`'s own `_normalize_youtube_allowed_labels()` -- one
+    validator for both the admin and internal write paths.
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    body = await request.get_json(force=True, silent=True) or {}
+    community_id = body.get("community_id")
+    youtube_allowed_labels = body.get("youtube_allowed_labels")
+    if not isinstance(community_id, int) or not isinstance(youtube_allowed_labels, list):
+        return {
+            "success": False,
+            "error": "community_id and youtube_allowed_labels are required",
+        }, 400
+
+    async_dal, dal = _dal()
+    try:
+        community_row = (
+            dal(dal.communities.id == community_id)
+            .select(dal.communities.id, dal.communities.tenant_id)
+            .first()
+        )
+        if community_row is None:
+            return _err(not_found("Community not found"))
+        tenant_id = int(community_row.tenant_id)
+
+        policy = await svc.set_policy(
+            async_dal,
+            dal,
+            tenant_id=tenant_id,
+            community_id=community_id,
+            song_requests_allowed=None,
+            requests_category_restricted=None,
+            youtube_allowed_labels=youtube_allowed_labels,
+            updated_by=None,
+        )
+    except ApiError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_set_music_policy.unhandled_error", extra={"community_id": community_id}
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
+
+    return (
+        jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "community_id": community_id,
+                    "youtube_allowed_labels": policy.youtubeAllowedLabels,
+                },
+                "meta": {"version": 1},
+            }
+        ),
+        200,
+    )
 
 
 @music_internal_bp.route("/music/status", methods=["GET"])
@@ -569,6 +678,148 @@ async def internal_music_status() -> Any:
             }
         ),
         200,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal: live queue read/advance (OBS overlay + public queue page)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class LiveQueueStateResponse:
+    """`{status, data, meta}`-enveloped data payload for the internal live-queue GET."""
+
+    community_id: int
+    now_playing: svc.LiveQueueItemDTO | None
+    queue: list[svc.LiveQueueItemDTO]
+    updated_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class LiveQueueAdvanceResponse:
+    """`{status, data, meta}`-enveloped data payload for the internal guarded-advance POST."""
+
+    community_id: int
+    now_playing: svc.LiveQueueItemDTO | None
+    queue: list[svc.LiveQueueItemDTO]
+    updated_at: str
+    advanced: bool
+
+
+def _live_envelope(data: Any) -> tuple[Any, int]:
+    """`{status, data, meta}` envelope -- same shape `internal_music_status()` already returns.
+
+    Manual `jsonify()` (not `@validate_response`) deliberately, matching
+    `services/dto_response.py::jsonify_dto`'s own workaround -- both new
+    response DTOs above nest `LiveQueueItemDTO`/`RequestedByDTO`, the
+    exact shape that module's docstring documents as crashing quart-
+    schema's `TypeAdapter` response path.
+    """
+    return jsonify({"status": "success", "data": asdict(data), "meta": {"version": 1}}), 200
+
+
+@music_internal_bp.route("/music/queue", methods=["GET"])
+async def internal_get_live_queue() -> Any:
+    """`GET /api/v1/internal/music/queue?community_id=<id>` -- service-to-service only.
+
+    Backs the OBS overlay player (`core/svc_presentation`) and the public
+    (unauthenticated) queue page (`blueprints/v1/public_music_queue.py`) --
+    neither calls hub-api's admin-scoped `music_queue_bp` routes above (no
+    user JWT to present, same rationale as `internal_enqueue_song_request`).
+
+    Lazily auto-advances on read: an expired `playing` item (its track's
+    `duration_ms` plus a grace period elapsed) is marked `played` and the
+    oldest `queued` item promoted; an idle queue with nothing playing
+    auto-starts its head item. Both inside one locked transaction (see
+    `services.community_music_queue_service.get_live_queue_state`'s own
+    docstring) so two overlay instances polling concurrently can never
+    double-advance.
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    raw_community_id = request.args.get("community_id")
+    try:
+        community_id = int(raw_community_id) if raw_community_id is not None else None
+    except (TypeError, ValueError):
+        community_id = None
+    if community_id is None:
+        return {"success": False, "error": "community_id query param is required"}, 400
+
+    async_dal, dal = _dal()
+    try:
+        community_row = dal(dal.communities.id == community_id).select(dal.communities.id).first()
+        if community_row is None:
+            return _err(not_found("Community not found"))
+
+        now_playing, queue, _advanced = await svc.get_live_queue_state(
+            async_dal, dal, community_id=community_id, auto_advance=True
+        )
+    except ApiError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_get_live_queue.unhandled_error", extra={"community_id": community_id}
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
+
+    return _live_envelope(
+        LiveQueueStateResponse(
+            community_id=community_id,
+            now_playing=now_playing,
+            queue=queue,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+    )
+
+
+@music_internal_bp.route("/music/queue/advance", methods=["POST"])
+async def internal_advance_live_queue() -> Any:
+    """`POST /api/v1/internal/music/queue/advance` -- service-to-service only.
+
+    Body: `{"community_id": int, "item_id": int}`. Advances ONLY if
+    `item_id` is the community's CURRENT `playing` item -- a guard against
+    two overlay instances (or a race against the GET route's own lazy
+    auto-advance) both trying to advance the same already-advanced state.
+    `advanced: false` (never an error) means another caller already won
+    the race; the response still carries the current, authoritative state
+    either way.
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    body = await request.get_json(force=True, silent=True) or {}
+    community_id = body.get("community_id")
+    item_id = body.get("item_id")
+    if not isinstance(community_id, int) or not isinstance(item_id, int):
+        return {"success": False, "error": "community_id and item_id are required"}, 400
+
+    async_dal, dal = _dal()
+    try:
+        community_row = dal(dal.communities.id == community_id).select(dal.communities.id).first()
+        if community_row is None:
+            return _err(not_found("Community not found"))
+
+        now_playing, queue, advanced = await svc.advance_live_queue(
+            async_dal, dal, community_id=community_id, item_id=item_id
+        )
+    except ApiError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_advance_live_queue.unhandled_error", extra={"community_id": community_id}
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
+
+    return _live_envelope(
+        LiveQueueAdvanceResponse(
+            community_id=community_id,
+            now_playing=now_playing,
+            queue=queue,
+            updated_at=datetime.now(UTC).isoformat(),
+            advanced=advanced,
+        )
     )
 
 

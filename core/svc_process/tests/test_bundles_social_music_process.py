@@ -5,14 +5,26 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from flask_core import PROCESS_TARGET_APP_ID_KEY, PlatformEvent, bundle_context
+from flask_core import (
+    PROCESS_TARGET_APP_ID_KEY,
+    PlatformEvent,
+    bundle_context,
+    reset_bundle_dal_for_tests,
+    set_bundle_dal,
+)
 
+import bundles.social_music_process as social_music_process
 from bundles.social_music_process import (
     _MUSIC_APP_ID,
+    _QUEUE_LINK_NOT_CONFIGURED,
+    _SET_PERMISSION_DENIED_REPLY,
     _SET_UNAVAILABLE_REPLY,
     _SR_USAGE,
     _STATUS_CHECK_KEY,
     _STATUS_DISABLED_REPLY,
+    _YOUTUBE_LABELS_LIMIT_REPLY,
+    _YOUTUBE_LABELS_USAGE_REPLY,
+    _public_webui_url,
     transform,
 )
 
@@ -20,8 +32,15 @@ TENANT = "global"
 COMMUNITY = "42"
 APP_ID = "waddles.bot.discord.default"
 
+#: Default test actor -- seeded as `moderator` in `_FakeDal` so ordinary
+#: `!sr set youtube-labels` tests don't have to opt into permission
+#: separately; `TestSetYoutubeLabelsPermission` uses a non-privileged
+#: actor instead.
+MOD_ACTOR = "test_user"
+NON_MOD_ACTOR = "rando"
 
-def _event(text: str, **payload_overrides: object) -> PlatformEvent:
+
+def _event(text: str, *, actor: str = MOD_ACTOR, **payload_overrides: object) -> PlatformEvent:
     """Create a test event with the given text; a channel_id + tokenized author_id by default."""
     payload: dict[str, object] = {
         "text": text,
@@ -32,10 +51,46 @@ def _event(text: str, **payload_overrides: object) -> PlatformEvent:
     return PlatformEvent(
         platform="discord",
         event_type="message",
-        actor="test_user",
+        actor=actor,
         payload=payload,
         occurred_at="2026-01-01T00:00:00+00:00",
     )
+
+
+class _FakeDal:
+    """Minimal `AsyncDAL` stand-in -- answers `_caller_is_moderator_or_admin`'s raw `execute()`.
+
+    Same shape as `social_alias_process`'s own test `_FakeDal.execute()`
+    (matched by whether `platform_user_id` appears in the SQL text).
+    """
+
+    def __init__(self) -> None:
+        self.should_error_on_role_lookup = False
+        self.roles_by_display_name: dict[str, str] = {MOD_ACTOR: "moderator"}
+        self.roles_by_platform_user_id: dict[str, str] = {}
+        self._execute_count = 0
+
+    async def execute(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        self._execute_count += 1
+        if self.should_error_on_role_lookup:
+            raise RuntimeError("simulated permission lookup outage")
+
+        if "platform_user_id" in sql:
+            _community_id, _platform, platform_user_id = params
+            role = self.roles_by_platform_user_id.get(platform_user_id)
+        else:
+            _community_id, display_name = params
+            role = self.roles_by_display_name.get(display_name)
+        return [{"role": role}] if role is not None else []
+
+
+@pytest.fixture(autouse=True)
+def _dal() -> Any:
+    """Set up a fake DAL (seeded with `MOD_ACTOR` as moderator) for all tests."""
+    fake = _FakeDal()
+    set_bundle_dal(fake)
+    yield fake
+    reset_bundle_dal_for_tests()
 
 
 async def _flag_on(*_args: Any, **_kwargs: Any) -> bool:
@@ -50,6 +105,20 @@ async def _flag_off(*_args: Any, **_kwargs: Any) -> bool:
 def _flag_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default every test to flag ON -- the OFF-specific tests override this explicitly."""
     monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_on)
+
+
+@pytest.fixture(autouse=True)
+def _reset_public_webui_url_cache() -> Any:
+    """Clear `_public_webui_url`'s `lru_cache` around every test.
+
+    The accessor is cached for process lifetime by design (module
+    docstring), which would otherwise leak whichever `PUBLIC_WEBUI_URL`
+    value/absence a prior test observed into this one -- e.g. the "unset"
+    test's `None` result surviving into the "trailing slash" test.
+    """
+    _public_webui_url.cache_clear()
+    yield
+    _public_webui_url.cache_clear()
 
 
 class TestTransformSongRequest:
@@ -227,15 +296,25 @@ class TestTransformStatus:
 
 
 class TestTransformSet:
-    """`!sr set ...` -- out of scope this pass, never treated as a song title."""
+    """`!sr set ...` -- only `youtube-labels` is implemented, never treated as a song title."""
 
-    async def test_set_returns_unavailable_reply(self) -> None:
+    async def test_set_unknown_key_returns_unknown_setting_reply(self) -> None:
         with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             result = await transform(_event("!sr set discord #music"))
         assert isinstance(result, PlatformEvent)
-        assert result.payload["text"] == _SET_UNAVAILABLE_REPLY
+        assert (
+            result.payload["text"]
+            == "song requests: unknown setting 'discord' — supported: youtube-labels"
+        )
         assert PROCESS_TARGET_APP_ID_KEY not in result.payload
         assert "music_query" not in result.payload
+
+    async def test_set_unknown_key_names_key_as_typed(self) -> None:
+        """The unknown-setting reply echoes the key as the caller typed it (not lowercased)."""
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set Discord #music"))
+        assert isinstance(result, PlatformEvent)
+        assert "'Discord'" in str(result.payload["text"])
 
     async def test_bare_set_returns_unavailable_reply(self) -> None:
         with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
@@ -257,6 +336,188 @@ class TestTransformSet:
             result = await transform(_event("!sr settle down"))
         assert isinstance(result, PlatformEvent)
         assert result.payload["music_query"] == "settle down"
+
+
+class TestSetYoutubeLabels:
+    """`!sr set youtube-labels <value>` -- parsing, limits, and outgoing event shape."""
+
+    async def test_sets_labels_parsed_trimmed_lowercased(self) -> None:
+        raw_text = "!sr set youtube-labels music,lofi, Chill"
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event(raw_text))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "set"
+        assert result.payload["key"] == "youtube_allowed_labels"
+        assert result.payload["value"] == ["music", "lofi", "chill"]
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+        assert result.payload["text"] == raw_text  # routing carries the original text through
+
+    async def test_dedupes_labels(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music,Music,MUSIC,lofi"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == ["music", "lofi"]
+
+    async def test_drops_empty_entries_from_doubled_commas(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music,,lofi,"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == ["music", "lofi"]
+
+    async def test_none_clears_labels(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels none"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["subcommand"] == "set"
+        assert result.payload["key"] == "youtube_allowed_labels"
+        assert result.payload["value"] == []
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_clear_clears_labels(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels clear"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == []
+
+    async def test_none_clear_case_insensitive(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels NONE"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == []
+
+    async def test_no_value_returns_usage_reply(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _YOUTUBE_LABELS_USAGE_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_no_value_whitespace_only_returns_usage_reply(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels   "))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _YOUTUBE_LABELS_USAGE_REPLY
+
+    async def test_key_is_case_insensitive(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set YouTube-Labels music"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == ["music"]
+
+    async def test_too_many_labels_returns_limit_reply(self) -> None:
+        labels = ",".join(f"label{i}" for i in range(33))
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event(f"!sr set youtube-labels {labels}"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _YOUTUBE_LABELS_LIMIT_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_exactly_32_labels_is_allowed(self) -> None:
+        labels = ",".join(f"label{i}" for i in range(32))
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event(f"!sr set youtube-labels {labels}"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == [f"label{i}" for i in range(32)]
+
+    async def test_label_over_64_chars_returns_limit_reply(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event(f"!sr set youtube-labels {'x' * 65}"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _YOUTUBE_LABELS_LIMIT_REPLY
+
+    async def test_label_exactly_64_chars_is_allowed(self) -> None:
+        label = "x" * 64
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event(f"!sr set youtube-labels {label}"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["value"] == [label]
+
+    async def test_preserves_tokenized_requester_identity_and_channel(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["channel_id"] == "123"
+        assert result.payload["author_id"] == "platform-user-1"
+
+
+class TestSetYoutubeLabelsPermission:
+    """Admin/moderator gate on `!sr set youtube-labels` -- fail closed."""
+
+    async def test_non_moderator_denied(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _SET_PERMISSION_DENIED_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_moderator_allowed(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music", actor=MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] != _SET_PERMISSION_DENIED_REPLY
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_allowed_by_platform_user_id_match(self, _dal: Any) -> None:
+        _dal.roles_by_platform_user_id["platform-user-1"] = "admin"
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_role_lookup_error_fails_closed(self, _dal: Any) -> None:
+        _dal.should_error_on_role_lookup = True
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _SET_PERMISSION_DENIED_REPLY
+
+    async def test_unknown_key_does_not_require_permission(self) -> None:
+        """An unrecognized `set` key replies before ever consulting the DAL."""
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set discord #music", actor=NON_MOD_ACTOR))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] != _SET_PERMISSION_DENIED_REPLY
+
+
+class TestSetYoutubeLabelsFeatureFlag:
+    """`waddles.social.music.youtube_labels` -- independent of `_FEATURE_FLAG`, default ON."""
+
+    async def test_flag_off_falls_back_to_unavailable_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _music_flag_on(
+            flag_key: str, *, tenant: str, community: int | None = None, default: bool = False
+        ) -> bool:
+            return flag_key != "waddles.social.music.youtube_labels"
+
+        monkeypatch.setattr(social_music_process, "feature_enabled", _music_flag_on)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set youtube-labels music"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _SET_UNAVAILABLE_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_flag_checked_with_tenant_and_community(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _capture(
+            flag_key: str, *, tenant: str, community: int | None = None, default: bool = False
+        ) -> bool:
+            if flag_key == "waddles.social.music.youtube_labels":
+                captured["tenant"] = tenant
+                captured["community"] = community
+                captured["default"] = default
+            return True
+
+        monkeypatch.setattr(social_music_process, "feature_enabled", _capture)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await transform(_event("!sr set youtube-labels music"))
+
+        assert captured["tenant"] == TENANT
+        assert captured["community"] == 42
+        assert captured["default"] is True
 
 
 class TestTransformErrorHandling:
@@ -285,3 +546,119 @@ class TestTransformErrorHandling:
         with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             with pytest.raises(ValueError, match="text"):
                 await transform(event)
+
+
+class TestTransformSongQueue:
+    """`!sq`/`!songqueue` -- a sibling command, own flag, own reply, no hub-api routing."""
+
+    async def test_sq_replies_with_queue_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sq"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_songqueue_alias_replies_with_queue_link(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!songqueue"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"
+
+    async def test_sq_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!SQ"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"
+
+    async def test_sq_ignores_trailing_argument(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`!sq <anything>` ignores the argument -- same reply as bare `!sq`."""
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sq some random junk here"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"
+
+    async def test_unset_env_replies_not_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("PUBLIC_WEBUI_URL", raising=False)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sq"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _QUEUE_LINK_NOT_CONFIGURED
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+
+    async def test_unset_env_logs_a_warning_once(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The `lru_cache`d accessor body -- and its WARN log -- runs at most once."""
+        monkeypatch.delenv("PUBLIC_WEBUI_URL", raising=False)
+        with caplog.at_level("WARNING", logger="bundles.social_music_process"):
+            with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+                await transform(_event("!sq"))
+                await transform(_event("!songqueue"))
+        warnings = [r for r in caplog.records if "public_webui_url_not_configured" in r.message]
+        assert len(warnings) == 1
+
+    async def test_trailing_slash_is_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com/")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sq"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"
+
+    async def test_flag_off_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_off)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            assert await transform(_event("!sq")) is None
+
+    async def test_flag_check_receives_queue_flag_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`!sq` checks its OWN flag key, independent of `!sr`'s `_FEATURE_FLAG`."""
+        captured: dict[str, Any] = {}
+
+        async def _capture(
+            flag_key: str, *, tenant: str, community: int | None = None, default: bool = False
+        ) -> bool:
+            captured["flag_key"] = flag_key
+            captured["default"] = default
+            return True
+
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _capture)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await transform(_event("!sq"))
+
+        assert captured["flag_key"] == "waddles.social.music.queue_page"
+        assert captured["default"] is True
+
+
+class TestBotProcessFeatureModuleRegistration:
+    """`sq`/`songqueue` register onto this module in `bot_process._FEATURE_MODULES`.
+
+    `test_bundles_bot_process.py` is owned by another agent this round --
+    the registration/dispatch assertion lives here instead (see task scope).
+    """
+
+    def test_sq_and_songqueue_registered_to_this_module(self) -> None:
+        import bundles.bot_process as bot_process
+
+        assert bot_process._FEATURE_MODULES["sq"] == "bundles.social_music_process"
+        assert bot_process._FEATURE_MODULES["songqueue"] == "bundles.social_music_process"
+
+    async def test_sq_dispatches_through_bot_process_router(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`!sq` routes through `bot_process.transform` to this bundle, same as `!sr`."""
+        import bundles.bot_process as bot_process
+
+        monkeypatch.setenv("PUBLIC_WEBUI_URL", "https://waddles.example.com")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await bot_process.transform(_event("!sq"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == "song queue: https://waddles.example.com/c/42/music/queue"

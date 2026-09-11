@@ -18,6 +18,7 @@ from flask_core import PlatformEvent, StageEnvelope
 from waddle_transports import NonRetryableTransportError
 
 from bundles.social_music_action import (
+    _LABELS_CLEARED_REPLY,
     _STATUS_CHECK_KEY,
     _STATUS_ENABLED_REPLY,
     _STATUS_OFFLINE_REPLY,
@@ -27,6 +28,7 @@ from bundles.social_music_action import (
 
 _ENQUEUE_URL_FRAGMENT = "/api/v1/internal/music/queue/requests"
 _STATUS_URL_FRAGMENT = "/api/v1/internal/music/status"
+_POLICY_URL_FRAGMENT = "/api/v1/internal/music/policy"
 
 
 def _hub_api_item(eta_seconds: int | None = 187) -> dict[str, Any]:
@@ -87,6 +89,30 @@ def _envelope(
             occurred_at="2026-09-09T00:00:00Z",
         ),
         ts="2026-09-09T00:00:00Z",
+    )
+
+
+def _set_envelope(
+    *,
+    key: str = "youtube_allowed_labels",
+    value: list[str] | None = None,
+    platform: str = "twitch",
+) -> StageEnvelope:
+    """`!sr set youtube-labels ...`'s outgoing event shape.
+
+    `social_music_process._handle_set_subcommand`'s successful-parse
+    payload (`subcommand`/`key`/`value`).
+    """
+    return _envelope(
+        payload={
+            "subcommand": "set",
+            "key": key,
+            "value": value if value is not None else ["official", "lyrics"],
+            "channel_id": "123",
+            "channel_name": "testchannel",
+            "author_id": "platform-user-1",
+        },
+        platform=platform,
     )
 
 
@@ -183,6 +209,45 @@ class TestEnqueuePayload:
 class TestEnqueueSuccess:
     """Successful enqueue -> chat reply with title/artist/position."""
 
+    async def test_enqueue_success_logs_info_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Verify success path logs structured INFO event with parsed track data."""
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=_HUB_API_ITEM)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with (
+                caplog.at_level("INFO"),
+                patch(
+                    "bundles.social_music_action.RelayOutboundIrcTransport",
+                    return_value=_relay_transport(sent),
+                ),
+            ):
+                await enqueue_song_request(
+                    _envelope(platform="twitch"), _config(), http_client=client
+                )
+
+        # Verify the INFO event was logged
+        assert "social_music_action.enqueued" in caplog.text
+        assert "community_id" in caplog.text
+        assert "42" in caplog.text  # community_id value
+        assert "platform" in caplog.text
+        assert "twitch" in caplog.text
+        assert "channel" in caplog.text
+        assert "testchannel" in caplog.text
+        assert "title" in caplog.text
+        assert "Never Gonna Give You Up" in caplog.text
+        assert "artist" in caplog.text
+        assert "Rick Astley" in caplog.text
+        assert "position" in caplog.text
+        assert "3" in caplog.text  # position from the mock response
+        assert "eta_seconds" in caplog.text
+        assert "187" in caplog.text  # eta from the mock
+        assert "request_id" in caplog.text
+        assert "reply_length" in caplog.text
+
     async def test_success_reply_sent_via_twitch(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(201, json=_HUB_API_ITEM)
@@ -261,6 +326,49 @@ class TestEnqueueSuccess:
 
 class TestStatusCheck:
     """`!sr status` dispatch -- `music_status_check` payload flag routes here, not `_enqueue()`."""
+
+    async def test_status_check_success_logs_info_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Verify status check success path logs structured INFO event with state data."""
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "state": "enabled",
+                        "cause": None,
+                        "provider": "spotify",
+                        "queue_length": 2,
+                    },
+                    "meta": {"version": 1},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with (
+                caplog.at_level("INFO"),
+                patch(
+                    "bundles.social_music_action.RelayOutboundIrcTransport",
+                    return_value=_relay_transport(sent),
+                ),
+            ):
+                await enqueue_song_request(
+                    self._status_envelope(), _config(), http_client=client
+                )
+
+        # Verify the INFO event was logged with status check data
+        assert "social_music_action.status_replied" in caplog.text
+        assert "community_id" in caplog.text
+        assert "42" in caplog.text
+        assert "platform" in caplog.text
+        assert "twitch" in caplog.text
+        assert "channel" in caplog.text
+        assert "state" in caplog.text
+        assert "enabled" in caplog.text
+        assert "reply_length" in caplog.text
 
     def _status_envelope(self, *, platform: str = "twitch") -> StageEnvelope:
         return _envelope(
@@ -582,3 +690,260 @@ class TestDiscordSendFailures:
                     _config(bot_token_ref="UNSET_DISCORD_TOKEN"),
                     http_client=client,
                 )
+
+
+class TestSetPolicy:
+    """`!sr set youtube-labels ...` dispatch -- `subcommand="set"` payload routes here."""
+
+    async def test_posts_correct_policy_payload_and_service_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SERVICE_API_KEY", "s3cr3t")
+        monkeypatch.setenv("HUB_API_URL", "https://hub-api.internal")
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["method"] = request.method
+            captured["service_key"] = request.headers.get("x-service-key")
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"community_id": 42, "youtube_allowed_labels": ["official", "lyrics"]},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _set_envelope(value=["official", "lyrics"]), _config(), http_client=client
+                )
+
+        assert captured["url"] == f"https://hub-api.internal{_POLICY_URL_FRAGMENT}"
+        assert captured["method"] == "PUT"
+        assert captured["service_key"] == "s3cr3t"
+        assert captured["body"] == {
+            "community_id": 42,
+            "youtube_allowed_labels": ["official", "lyrics"],
+        }
+
+    async def test_success_reply_uses_sorted_labels(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "community_id": 42,
+                        "youtube_allowed_labels": ["official", "cover", "lyrics"],
+                    },
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _set_envelope(value=["official", "cover", "lyrics"]),
+                    _config(),
+                    http_client=client,
+                )
+
+        assert sent["message"]["text"] == "youtube labels set: cover, lyrics, official"
+
+    async def test_clearing_labels_returns_cleared_reply(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"community_id": 42, "youtube_allowed_labels": []},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(value=[]), _config(), http_client=client)
+
+        assert sent["message"]["text"] == _LABELS_CLEARED_REPLY
+
+    async def test_400_relays_error_message_verbatim(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                json={
+                    "status": "error",
+                    "error": {"message": "youtube-labels: up to 32 labels, 64 chars each"},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "youtube-labels: up to 32 labels, 64 chars each"
+
+    async def test_404_relays_error_message_verbatim(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                404, json={"status": "error", "error": {"message": "community 42 not found"}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "community 42 not found"
+
+    async def test_5xx_replies_unavailable_with_status_code(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                502, json={"status": "error", "error": {"message": "bad gateway"}}
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "song requests: settings unavailable (hub-api error 502)"
+
+    async def test_timeout_replies_unreachable(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: settings unavailable (hub-api unreachable)"
+        )
+
+    async def test_connection_error_replies_unreachable(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: settings unavailable (hub-api unreachable)"
+        )
+
+    async def test_malformed_2xx_response_replies_unavailable_with_status_code(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "data": {}})
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(_set_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == "song requests: settings unavailable (hub-api error 200)"
+
+    async def test_unknown_key_replies_without_calling_hub_api(self) -> None:
+        called = False
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal called
+            called = True
+            return httpx.Response(200, json={"status": "success", "data": {}})
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _set_envelope(key="spotify_allowed_labels"), _config(), http_client=client
+                )
+
+        assert called is False
+        assert sent["message"]["text"] == "song requests: unknown setting 'spotify_allowed_labels'"
+
+    async def test_non_list_value_raises_non_retryable(self) -> None:
+        async with _client(lambda _r: httpx.Response(200)) as client:
+            with pytest.raises(NonRetryableTransportError, match="value"):
+                await enqueue_song_request(
+                    _envelope(
+                        payload={
+                            "subcommand": "set",
+                            "key": "youtube_allowed_labels",
+                            "value": "not-a-list",
+                            "channel_id": "123",
+                            "channel_name": "testchannel",
+                        }
+                    ),
+                    _config(),
+                    http_client=client,
+                )
+
+    async def test_success_logs_policy_updated_info_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"community_id": 42, "youtube_allowed_labels": ["official", "lyrics"]},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with (
+                caplog.at_level("INFO"),
+                patch(
+                    "bundles.social_music_action.RelayOutboundIrcTransport",
+                    return_value=_relay_transport(sent),
+                ),
+            ):
+                await enqueue_song_request(
+                    _set_envelope(value=["official", "lyrics"]), _config(), http_client=client
+                )
+
+        assert "social_music_action.policy_updated" in caplog.text
+        assert "community_id" in caplog.text
+        assert "42" in caplog.text
+        assert "key" in caplog.text
+        assert "youtube_allowed_labels" in caplog.text
+        assert "count" in caplog.text

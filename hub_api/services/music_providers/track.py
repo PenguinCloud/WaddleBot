@@ -7,7 +7,7 @@ same queue without a translation layer between them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
@@ -18,6 +18,12 @@ class Track:
     `external_id` is that provider's native id (YouTube video id, Spotify
     track id), and `url` is the canonical link back to the track on that
     provider.
+
+    `labels` (gh-313): lowercase, de-duplicated category/tag/topic labels
+    -- YouTube populates this from a second `videos.list` call
+    (`services/music_providers/youtube.py::_fetch_labels`); every other
+    provider (Spotify) leaves it at the default empty tuple. Used by the
+    Music Station community label-allowlist gate.
     """
 
     provider: str
@@ -27,3 +33,4 @@ class Track:
     duration_ms: int
     artwork_url: str | None
     url: str
+    labels: tuple[str, ...] = field(default_factory=tuple)

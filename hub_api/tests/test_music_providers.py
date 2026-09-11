@@ -42,9 +42,28 @@ def _reset_spotify_token_cache() -> Any:
 
 
 @pytest.fixture(autouse=True)
+def _reset_youtube_oauth_token_cache() -> Any:
+    """YouTube's OAuth access-token cache is module-level state -- isolate every test."""
+    youtube_mod._oauth_token_cache = None
+    yield
+    youtube_mod._oauth_token_cache = None
+
+
+@pytest.fixture(autouse=True)
+def _reset_youtube_labels_cache() -> Any:
+    """YouTube's `Track.labels` cache (gh-313) is module-level state -- isolate every test."""
+    youtube_mod._labels_cache.clear()
+    yield
+    youtube_mod._labels_cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test controls its own credential source explicitly."""
     monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+    monkeypatch.delenv("YOUTUBE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("YOUTUBE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("YOUTUBE_REFRESH_TOKEN", raising=False)
     monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
     monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
     monkeypatch.setattr(
@@ -128,17 +147,52 @@ _YT_SECOND_VIDEO_ITEM = {
 
 
 def _youtube_transport(
-    videos_payload: dict[str, Any], search_payload: dict[str, Any] | None = None
+    videos_payload: dict[str, Any],
+    search_payload: dict[str, Any] | None = None,
+    *,
+    labels_payload: dict[str, Any] | None = None,
 ) -> httpx.MockTransport:
+    """Build a `videos.list` mock transport, optionally distinguishing the labels call.
+
+    `labels_payload` (gh-313), when given, answers the SECOND `videos.list`
+    call (`part=snippet,topicDetails`) distinctly from the primary one
+    (`part=snippet,contentDetails`) -- omit it and both calls get `videos_payload`,
+    which is fine for every pre-gh-313 test since none of them assert `.labels`.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/search"):
             assert search_payload is not None
             return httpx.Response(200, json=search_payload)
         if request.url.path.endswith("/videos"):
+            part = request.url.params.get("part", "")
+            if "topicDetails" in part and labels_payload is not None:
+                return httpx.Response(200, json=labels_payload)
             return httpx.Response(200, json=videos_payload)
         raise AssertionError(f"unexpected path: {request.url.path}")
 
     return httpx.MockTransport(handler)
+
+
+#: A video with a mapped category, mixed-case/duplicate tags, and topic categories --
+#: exercises `_extract_labels()`'s full union + dedupe/lowercase behavior end-to-end.
+_YT_VIDEO_ITEM_WITH_LABELS = {
+    "id": "labelVid1",
+    "snippet": {
+        "title": "Song With Labels",
+        "channelTitle": "Channel",
+        "categoryId": "10",
+        "tags": ["Pop", "Live Performance", "POP"],
+        "thumbnails": {"default": {"url": "https://i.ytimg.com/vi/labelVid1/default.jpg"}},
+    },
+    "contentDetails": {"duration": "PT3M0S"},
+    "topicDetails": {
+        "topicCategories": [
+            "https://en.wikipedia.org/wiki/Pop_music",
+            "https://en.wikipedia.org/wiki/Music",
+        ]
+    },
+}
 
 
 class TestYoutubeResolve:
@@ -193,7 +247,10 @@ class TestYoutubeResolve:
     async def test_resolve_no_credentials_raises_provider_unavailable(self) -> None:
         with pytest.raises(ProviderUnavailable) as exc_info:
             await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        assert exc_info.value.provider == "youtube"
+        assert exc_info.value.provider == (
+            "youtube credentials not configured: set YOUTUBE_API_KEY or "
+            "YOUTUBE_CLIENT_ID+YOUTUBE_CLIENT_SECRET+YOUTUBE_REFRESH_TOKEN"
+        )
 
     async def test_resolve_api_key_from_token_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
@@ -272,8 +329,12 @@ class TestYoutubeSearch:
             await youtube_mod.search("no such song anywhere")
 
     async def test_search_no_credentials_raises_provider_unavailable(self) -> None:
-        with pytest.raises(ProviderUnavailable):
+        with pytest.raises(ProviderUnavailable) as exc_info:
             await youtube_mod.search("anything")
+        assert exc_info.value.provider == (
+            "youtube credentials not configured: set YOUTUBE_API_KEY or "
+            "YOUTUBE_CLIENT_ID+YOUTUBE_CLIENT_SECRET+YOUTUBE_REFRESH_TOKEN"
+        )
 
     async def test_search_hydrate_returns_no_items_raises_track_not_found(
         self, monkeypatch: pytest.MonkeyPatch
@@ -350,6 +411,218 @@ class TestYoutubeHelpers:
 
     def test_best_thumbnail_empty(self) -> None:
         assert youtube_mod._best_thumbnail({}) is None
+
+
+# --------------------------------------------------------------------------
+# Label extraction (gh-313) -- pure helpers
+# --------------------------------------------------------------------------
+
+
+class TestYoutubeLabelExtraction:
+    """`_category_label()` / `_topic_leaf_name()` / `_extract_labels()` -- pure, no network."""
+
+    @pytest.mark.parametrize(
+        ("category_id", "expected"),
+        [
+            ("10", "music"),
+            ("20", "gaming"),
+            ("24", "entertainment"),
+            ("22", "people & blogs"),
+            ("9999", "category:9999"),
+            (None, None),
+            ("", None),
+        ],
+    )
+    def test_category_label(self, category_id: str | None, expected: str | None) -> None:
+        assert youtube_mod._category_label(category_id) == expected
+
+    @pytest.mark.parametrize(
+        ("topic_url", "expected"),
+        [
+            ("https://en.wikipedia.org/wiki/Pop_music", "Pop music"),
+            ("https://en.wikipedia.org/wiki/Music", "Music"),
+            ("https://en.wikipedia.org/wiki/", None),
+            ("not-a-url", "not-a-url"),
+        ],
+    )
+    def test_topic_leaf_name(self, topic_url: str, expected: str | None) -> None:
+        assert youtube_mod._topic_leaf_name(topic_url) == expected
+
+    def test_extract_labels_dedupes_lowercases_preserves_first_seen_order(self) -> None:
+        labels = youtube_mod._extract_labels(_YT_VIDEO_ITEM_WITH_LABELS)
+        assert labels == ("music", "pop", "live performance", "pop music")
+
+    def test_extract_labels_empty_item_returns_empty_tuple(self) -> None:
+        assert youtube_mod._extract_labels({}) == ()
+
+    def test_extract_labels_ignores_non_string_tags_and_topics(self) -> None:
+        item = {
+            "snippet": {"tags": [123, None, "valid"]},
+            "topicDetails": {"topicCategories": [456, None, "https://en.wikipedia.org/wiki/Jazz"]},
+        }
+        assert youtube_mod._extract_labels(item) == ("valid", "jazz")
+
+    def test_extract_labels_unmapped_category_falls_back(self) -> None:
+        item = {"snippet": {"categoryId": "777"}}
+        assert youtube_mod._extract_labels(item) == ("category:777",)
+
+
+# --------------------------------------------------------------------------
+# Label resolution + caching (gh-313) -- resolve()/search() integration
+# --------------------------------------------------------------------------
+
+
+class TestYoutubeLabels:
+    """`Track.labels` populated via the second `videos.list` call -- cache, failure modes."""
+
+    async def test_resolve_populates_labels(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        transport = _youtube_transport(
+            {"items": [_YT_VIDEO_ITEM]},
+            labels_payload={"items": [_YT_VIDEO_ITEM_WITH_LABELS]},
+        )
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(transport))
+
+        track = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+        assert track.labels == ("music", "pop", "live performance", "pop music")
+        # Primary resolution is unaffected by the second call's payload.
+        assert track.external_id == "dQw4w9WgXcQ"
+
+    async def test_spotify_tracks_never_get_labels(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOTIFY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret")
+        transport = _spotify_transport(_SPOTIFY_TRACK_ITEM)
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(transport))
+
+        track = await spotify_mod.resolve("https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp")
+        assert track.labels == ()
+
+    async def test_search_populates_labels_per_track(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/search"):
+                return httpx.Response(200, json=_YT_SEARCH_RESPONSE)
+            part = request.url.params.get("part", "")
+            if "topicDetails" in part:
+                video_id = request.url.params.get("id", "")
+                if video_id == "dQw4w9WgXcQ":
+                    return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM_WITH_LABELS]})
+                return httpx.Response(
+                    200, json={"items": [{"id": video_id, "snippet": {"categoryId": "20"}}]}
+                )
+            return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM, _YT_SECOND_VIDEO_ITEM]})
+
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+        tracks = await youtube_mod.search("never gonna give you up")
+
+        assert len(tracks) == 2
+        assert tracks[0].labels == ("music", "pop", "live performance", "pop music")
+        assert tracks[1].labels == ("gaming",)
+
+    async def test_second_call_failure_returns_empty_labels_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        label_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal label_calls
+            part = request.url.params.get("part", "")
+            if "topicDetails" in part:
+                label_calls += 1
+                return httpx.Response(500, json={"error": "boom"})
+            return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM]})
+
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+        with caplog.at_level("WARNING"):
+            track = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+        assert track.labels == ()
+        assert track.external_id == "dQw4w9WgXcQ"  # primary resolution unaffected
+        assert label_calls == 1
+        assert any("youtube.labels fetch_failed" in record.message for record in caplog.records)
+
+    async def test_second_call_network_error_returns_empty_labels(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            part = request.url.params.get("part", "")
+            if "topicDetails" in part:
+                raise httpx.ConnectError("refused")
+            return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM]})
+
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+        track = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert track.labels == ()
+
+    async def test_second_call_empty_items_returns_empty_labels(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        transport = _youtube_transport({"items": [_YT_VIDEO_ITEM]}, labels_payload={"items": []})
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(transport))
+
+        track = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert track.labels == ()
+
+    async def test_labels_cached_across_resolve_calls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        label_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal label_calls
+            part = request.url.params.get("part", "")
+            if "topicDetails" in part:
+                label_calls += 1
+                return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM_WITH_LABELS]})
+            return httpx.Response(200, json={"items": [_YT_VIDEO_ITEM]})
+
+        monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+        track1 = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        track2 = await youtube_mod.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+        assert (
+            track1.labels
+            == track2.labels
+            == (
+                "music",
+                "pop",
+                "live performance",
+                "pop music",
+            )
+        )
+        assert label_calls == 1  # second resolve() hit the cache
+
+    def test_labels_cache_expiry_forces_refetch(self) -> None:
+        youtube_mod._labels_cache_set("vid1", ("music",))
+        assert youtube_mod._labels_cache_get("vid1") == ("music",)
+
+        youtube_mod._labels_cache["vid1"].expires_at = time.monotonic() - 1
+
+        assert youtube_mod._labels_cache_get("vid1") is None
+        assert "vid1" not in youtube_mod._labels_cache
+
+    def test_labels_cache_bounded_size_evicts_oldest(self) -> None:
+        for i in range(youtube_mod._LABELS_CACHE_MAX_SIZE):
+            youtube_mod._labels_cache_set(f"vid{i}", (f"label{i}",))
+        assert len(youtube_mod._labels_cache) == youtube_mod._LABELS_CACHE_MAX_SIZE
+        assert "vid0" in youtube_mod._labels_cache
+
+        youtube_mod._labels_cache_set("vid_overflow", ("overflow",))
+
+        assert len(youtube_mod._labels_cache) == youtube_mod._LABELS_CACHE_MAX_SIZE
+        assert "vid0" not in youtube_mod._labels_cache
+        assert "vid_overflow" in youtube_mod._labels_cache
 
 
 # --------------------------------------------------------------------------
@@ -765,6 +1038,14 @@ class TestResolveContract:
         assert track.provider == "youtube"
 
     async def test_resolve_bare_query_no_provider_raises_track_not_found(self) -> None:
+        """No explicit `provider`, no `YOUTUBE_API_KEY` -- default falls straight to Spotify.
+
+        Real, unmocked `resolve()` path -- see `TestBareTextProviderDefault` for mocked-dispatch
+        coverage of the default-provider policy itself. `spotify.resolve()` extracts a track id
+        from the URL BEFORE touching credentials, so bare search text (not a Spotify track URL)
+        raises `TrackNotFound` here, same outward result as before this default policy existed,
+        just via a different code path.
+        """
         with pytest.raises(TrackNotFound):
             await resolve("some bare search text with no provider")
 
@@ -810,6 +1091,175 @@ class TestResolveContract:
     async def test_search_unknown_provider_raises_track_not_found(self) -> None:
         with pytest.raises(TrackNotFound):
             await search("query", "unknown-provider")
+
+
+class TestBareTextProviderDefault:
+    """`resolve()`'s bare-text (no URL, no explicit `provider`) default-provider policy.
+
+    `_no_real_creds` (autouse) clears `YOUTUBE_API_KEY` before every test, so each test here
+    sets it explicitly only where the case requires it configured.
+    """
+
+    async def test_youtube_tried_first_when_key_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        spotify_called = False
+
+        async def fake_youtube_resolve(url: str) -> Track:
+            return Track(
+                provider="youtube",
+                external_id="yt",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            nonlocal spotify_called
+            spotify_called = True
+            raise AssertionError("spotify must not be called when youtube succeeds")
+
+        monkeypatch.setattr(youtube_mod, "resolve", fake_youtube_resolve)
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("some bare search text")
+
+        assert track.provider == "youtube"
+        assert spotify_called is False
+
+    async def test_falls_back_to_spotify_when_youtube_finds_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+
+        async def fake_youtube_resolve(url: str) -> Track:
+            raise TrackNotFound(url)
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            return Track(
+                provider="spotify",
+                external_id="sp",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        monkeypatch.setattr(youtube_mod, "resolve", fake_youtube_resolve)
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("some bare search text")
+        assert track.provider == "spotify"
+
+    async def test_falls_back_to_spotify_when_youtube_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+
+        async def fake_youtube_resolve(url: str) -> Track:
+            raise ProviderUnavailable("youtube")
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            return Track(
+                provider="spotify",
+                external_id="sp",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        monkeypatch.setattr(youtube_mod, "resolve", fake_youtube_resolve)
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("some bare search text")
+        assert track.provider == "spotify"
+
+    async def test_spotify_only_when_no_youtube_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`_no_real_creds` already cleared `YOUTUBE_API_KEY` -- today's (pre-change) behavior."""
+        youtube_called = False
+
+        async def fake_youtube_resolve(url: str) -> Track:
+            nonlocal youtube_called
+            youtube_called = True
+            raise AssertionError("youtube must not be called with no key configured")
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            return Track(
+                provider="spotify",
+                external_id="sp",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        monkeypatch.setattr(youtube_mod, "resolve", fake_youtube_resolve)
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("some bare search text")
+
+        assert track.provider == "spotify"
+        assert youtube_called is False
+
+    async def test_explicit_provider_still_wins_over_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`YOUTUBE_API_KEY` set, but an explicit `provider="spotify"` overrides the default."""
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+        youtube_called = False
+
+        async def fake_youtube_resolve(url: str) -> Track:
+            nonlocal youtube_called
+            youtube_called = True
+            raise AssertionError("youtube must not be called -- explicit provider was spotify")
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            return Track(
+                provider="spotify",
+                external_id="sp",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        monkeypatch.setattr(youtube_mod, "resolve", fake_youtube_resolve)
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("some bare search text", provider="spotify")
+
+        assert track.provider == "spotify"
+        assert youtube_called is False
+
+    async def test_url_detection_unaffected_by_default_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A URL always wins host detection, regardless of `YOUTUBE_API_KEY`."""
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+
+        async def fake_spotify_resolve(url: str) -> Track:
+            return Track(
+                provider="spotify",
+                external_id="sp",
+                title="t",
+                artist="a",
+                duration_ms=1,
+                artwork_url=None,
+                url=url,
+            )
+
+        monkeypatch.setattr(spotify_mod, "resolve", fake_spotify_resolve)
+
+        track = await resolve("https://open.spotify.com/track/abc123")
+        assert track.provider == "spotify"
 
 
 class TestDetectProvider:

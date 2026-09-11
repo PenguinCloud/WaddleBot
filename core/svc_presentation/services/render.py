@@ -262,9 +262,19 @@ def render_music(
     """Music Station browser-source player -- now-playing + upcoming queue, polling `/queue`.
 
     Embeds the YouTube IFrame API player for `provider == "youtube"` tracks
-    and a Spotify track embed for `provider == "spotify"` tracks (task
-    scope). Other providers (e.g. SoundCloud) still render in the
-    now-playing/queue list, honestly without a player embed.
+    and a Spotify Embed Controller (iFrame API) for `provider == "spotify"`
+    tracks (task scope). Other providers (e.g. SoundCloud) still render in
+    the now-playing/queue list, honestly without a player embed.
+
+    Queue advance is client-driven off real playback end signals (YouTube
+    `onStateChange === ENDED`; Spotify's Embed Controller `playback_update`
+    event reaching `position >= duration - END_THRESHOLD_MS`, PLUS a
+    `duration_ms`-based timer fallback since Spotify's iFrame API documents
+    no explicit "ended" event -- only periodic `playback_update` ticks, so
+    a dropped/never-fired tick must not permanently stall the overlay) and
+    by the server's own lazy auto-advance surfacing on the next 5s poll
+    (a changed `now_playing.queue_id` reloads the player exactly like a
+    client-triggered advance does).
     """
     safe_community = html.escape(community)
     theme_style = _theme_style(
@@ -296,6 +306,7 @@ def render_music(
     #up-next-list {{ list-style: none; margin-top: 6px; max-height: 120px; overflow-y: auto; }}
     #up-next-list li {{ padding: 4px 0; border-top: 1px solid rgba(255,255,255,0.08); }}
     #empty-state {{ font-size: 14px; color: #999; text-align: center; padding: 20px 0; }}
+    #np-requested-by {{ font-size: 12px; color: #888; margin-top: 4px; }}
 </style>
 </head>
 <body data-community="{safe_community}" data-surface="music">
@@ -304,6 +315,7 @@ def render_music(
     <div id="now-playing" class="hidden">
       <div class="title" id="np-title"></div>
       <div class="artist" id="np-artist"></div>
+      <div id="np-requested-by"></div>
       <div id="progress-bar"><div id="progress-fill"></div></div>
     </div>
     <div id="empty-state">No tracks queued</div>
@@ -312,35 +324,118 @@ def render_music(
       <ul id="up-next-list"></ul>
     </div>
   </div>
-  <!-- No Subresource Integrity attribute: YouTube serves this file dynamically
-       and does not publish a stable hash to pin against (same accepted
-       exception every YouTube-embedding site relies on) -- first-party
-       Google domain, loaded over HTTPS. -->
+  <!-- No Subresource Integrity attribute on either embed script: YouTube
+       and Spotify both serve these files dynamically and neither publishes
+       a stable hash to pin against (the same accepted exception every
+       site embedding either player relies on) -- first-party domains,
+       loaded over HTTPS. -->
   <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
   <script>
     const community = {json.dumps(community)};
     const POLL_INTERVAL_MS = 5000;
+    // How close to the end (ms) a Spotify `playback_update` tick counts as
+    // "ended" -- the iFrame API reports periodic position/duration, not a
+    // discrete end event, so this is a threshold, not an exact boundary.
+    const END_THRESHOLD_MS = 500;
+
     let currentQueueId = null;
     let trackStartedAtMs = null;
     let currentDurationMs = 0;
     let ytPlayer = null;
     let ytReady = false;
+    let spotifyController = null;
+    let spotifyApiReady = false;
+    let spotifyIFrameAPI = null;
+    let endFallbackTimer = null;
+    let advanceInFlight = false;
 
     window.onYouTubeIframeAPIReady = () => {{ ytReady = true; }};
+    // Spotify's iFrame API convention: this global is called once, ever,
+    // with the controller factory -- see the embed script above.
+    window.onSpotifyIframeApiReady = (IFrameAPI) => {{
+      spotifyApiReady = true;
+      spotifyIFrameAPI = IFrameAPI;
+    }};
+
+    function clearEndFallbackTimer() {{
+      if (endFallbackTimer) {{
+        clearTimeout(endFallbackTimer);
+        endFallbackTimer = null;
+      }}
+    }}
+
+    async function advanceTrack(queueId) {{
+      // Guards: never advance a track that's already been superseded by a
+      // poll (server-side lazy advance already moved on), never fire two
+      // overlapping advance calls for the same end event.
+      if (advanceInFlight || queueId == null || queueId !== currentQueueId) return;
+      advanceInFlight = true;
+      try {{
+        await fetch(`/overlay/${{community}}/music/advance`, {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ item_id: queueId }}),
+        }});
+      }} catch (err) {{
+        console.error('music queue advance failed', err);
+      }} finally {{
+        advanceInFlight = false;
+        pollQueue();
+      }}
+    }}
+
+    function onYouTubeStateChange(event) {{
+      if (window.YT && event.data === YT.PlayerState.ENDED) {{
+        advanceTrack(currentQueueId);
+      }}
+    }}
 
     function renderPlayer(track) {{
+      clearEndFallbackTimer();
       const slot = document.getElementById('player-slot');
       if (track.provider === 'spotify' && track.external_id) {{
-        const trackId = encodeURIComponent(track.external_id);
-        const src = `https://open.spotify.com/embed/track/${{trackId}}`;
-        slot.innerHTML = `<iframe src="${{src}}" allow="encrypted-media" loading="lazy"></iframe>`;
+        slot.innerHTML = '<div id="spotify-target"></div>';
         ytPlayer = null;
+        spotifyController = null;
+        if (spotifyApiReady && spotifyIFrameAPI) {{
+          spotifyIFrameAPI.createController(
+            document.getElementById('spotify-target'),
+            {{ uri: `spotify:track:${{track.external_id}}` }},
+            (controller) => {{
+              spotifyController = controller;
+              controller.addListener('playback_update', (e) => {{
+                const data = (e && e.data) || {{}};
+                if (
+                  typeof data.position === 'number' &&
+                  typeof data.duration === 'number' &&
+                  data.duration > 0 &&
+                  data.position >= data.duration - END_THRESHOLD_MS
+                ) {{
+                  advanceTrack(track.queue_id);
+                }}
+              }});
+            }}
+          );
+        }}
+        // Fallback: `duration_ms`-based timer. Spotify's iFrame API has no
+        // documented explicit "ended" event -- only `playback_update`
+        // ticks -- so a missed/never-fired tick must not stall the
+        // overlay forever.
+        if (track.duration_ms) {{
+          endFallbackTimer = setTimeout(
+            () => advanceTrack(track.queue_id),
+            track.duration_ms + END_THRESHOLD_MS
+          );
+        }}
       }} else if (track.provider === 'youtube' && track.external_id) {{
         slot.innerHTML = '<div id="yt-target"></div>';
+        spotifyController = null;
         if (ytReady && window.YT) {{
           ytPlayer = new YT.Player('yt-target', {{
             videoId: track.external_id,
             playerVars: {{ autoplay: 1, controls: 0, modestbranding: 1 }},
+            events: {{ onStateChange: onYouTubeStateChange }},
           }});
         }}
       }} else {{
@@ -349,26 +444,52 @@ def render_music(
           '<div style="display:flex;align-items:center;justify-content:center;' +
           'height:100%;color:#888;">' + label + '</div>';
         ytPlayer = null;
+        spotifyController = null;
       }}
     }}
 
     function renderQueue(payload) {{
-      const nowPlaying = payload.now_playing;
-      const upcoming = payload.upcoming || [];
       const npEl = document.getElementById('now-playing');
       const emptyEl = document.getElementById('empty-state');
+      const list = document.getElementById('up-next-list');
+
+      if (payload.available === false) {{
+        npEl.classList.add('hidden');
+        document.getElementById('player-slot').innerHTML = '';
+        emptyEl.textContent = payload.unavailable_reason === 'service_key_not_configured'
+          ? 'queue unavailable: service key not configured'
+          : 'queue unavailable';
+        emptyEl.classList.remove('hidden');
+        list.innerHTML = '';
+        currentQueueId = null;
+        clearEndFallbackTimer();
+        return;
+      }}
+
+      const nowPlaying = payload.now_playing;
+      const upcoming = payload.upcoming || [];
 
       if (!nowPlaying) {{
         npEl.classList.add('hidden');
+        emptyEl.textContent = 'No tracks queued';
         emptyEl.classList.remove('hidden');
         document.getElementById('player-slot').innerHTML = '';
         currentQueueId = null;
+        clearEndFallbackTimer();
       }} else {{
         emptyEl.classList.add('hidden');
         npEl.classList.remove('hidden');
         document.getElementById('np-title').textContent = nowPlaying.name;
         document.getElementById('np-artist').textContent = nowPlaying.artist;
+        const requestedBy = nowPlaying.requested_by;
+        document.getElementById('np-requested-by').textContent = requestedBy
+          ? `requested by ${{requestedBy.display_name}} (${{requestedBy.platform}})`
+          : '';
 
+        // Covers both a client-triggered advance's own re-fetch AND
+        // hub-api's server-side lazy auto-advance showing up on an
+        // ordinary 5s poll -- either way, a changed `queue_id` means load
+        // the new track exactly the same way.
         if (nowPlaying.queue_id !== currentQueueId) {{
           currentQueueId = nowPlaying.queue_id;
           trackStartedAtMs = Date.now();
@@ -377,7 +498,6 @@ def render_music(
         }}
       }}
 
-      const list = document.getElementById('up-next-list');
       list.innerHTML = '';
       for (const track of upcoming) {{
         const li = document.createElement('li');

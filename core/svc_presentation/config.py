@@ -90,17 +90,17 @@ class Config:
     #: auth (security.md) is follow-up work once an actual caller exists.
     push_token: str
 
-    #: Namespace/key convention the JSON music-queue read matches exactly --
-    #: `core/unified_music_module/services/unified_queue.py`'s
-    #: `UnifiedQueue._make_key` (`f"{namespace}:{community_id}:queue"`,
-    #: `unified_queue.py:180-182`). hub-api has no `GET .../music/queue`
-    #: endpoint today (confirmed: `hub_api/blueprints/v1/music.py` only
-    #: exposes settings/providers/radio-stations); reading this Redis/
-    #: Valkey key directly is the only real, already-implemented source of
-    #: per-community queue state (music-station-design.md §4 table: "
-    #: presentation container's queue-state read" = `UnifiedQueue.
-    #: get_queue(community_id)`).
-    music_queue_namespace: str
+    #: Shared-secret `X-Service-Key` header value for calling hub-api's
+    #: internal music-queue endpoints (`GET/POST .../api/v1/internal/music/
+    #: queue*`) -- same `SERVICE_API_KEY` env var name/header convention
+    #: every other internal service-to-service caller in this repo already
+    #: uses (`core/svc_process/services/reputation_gate_client.py`,
+    #: `core/svc_action/bundles/social_music_action.py`,
+    #: `core/*_module/config.py`). Empty string means "not yet
+    #: provisioned" -- `services/queue_reader.py::MusicQueueReader` refuses
+    #: to call hub-api at all in that state (fails closed, logs a startup
+    #: WARN) rather than making calls guaranteed to 401.
+    service_api_key: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -132,5 +132,5 @@ class Config:
             hub_api_url=os.getenv("HUB_API_URL", "http://hub-api:8204"),
             hub_api_poll_interval_seconds=int(os.getenv("HUB_API_POLL_INTERVAL_SECONDS", "30")),
             push_token=os.getenv("PRESENTATION_PUSH_TOKEN", ""),
-            music_queue_namespace=os.getenv("MUSIC_QUEUE_NAMESPACE", "music_queue"),
+            service_api_key=os.getenv("SERVICE_API_KEY", ""),
         )

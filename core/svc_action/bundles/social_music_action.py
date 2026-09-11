@@ -22,6 +22,18 @@ when the flag is enabled) distinguishes the two at the top of the
 function; `_check_status()` calls hub-api's `GET /api/v1/internal/music/
 status` and maps the result to one of `!sr status`'s four exact replies.
 
+A third payload shape -- `subcommand="set"`, `key="youtube_allowed_labels"`,
+`value: list[str]` (`social_music_process._handle_set_subcommand`'s
+successful-parse output) -- routes `!sr set youtube-labels ...` here too,
+same `PROCESS_TARGET_APP_ID_KEY` mechanism. `_set_policy()` calls hub-api's
+service-key-gated `PUT /api/v1/internal/music/policy` (svc-process can't
+mint an admin JWT to call the JWT-scoped policy endpoint directly, same
+reasoning as the enqueue path above) and replies `youtube labels set:
+<sorted labels>` / `youtube labels cleared -- all videos allowed`. An
+unrecognized `key` (only `youtube_allowed_labels` is implemented so far)
+replies `song requests: unknown setting '<key>'` without a hub-api round
+trip.
+
 Reply-in-place: same channel-resolution (payload first, config fallback)
 and Discord/Twitch dispatch as `bundles.social_quote_action`/
 `bundles.discord_send_action`/`bundles.twitch_send_action` -- each
@@ -72,6 +84,32 @@ _STATUS_CHECK_KEY = "music_status_check"
 #: response -- see `_check_status()`.
 _STATUS_ENABLED_REPLY = "song requests: enabled"
 _STATUS_OFFLINE_REPLY = "song requests: offline"
+
+_POLICY_PATH = "/api/v1/internal/music/policy"
+_POLICY_TIMEOUT_SECONDS = 5.0
+
+#: `event.payload["subcommand"]` value `social_music_process
+#: ._handle_set_subcommand` stamps on a successful `!sr set youtube-labels
+#: ...` parse -- routes here instead of `_enqueue()`/`_check_status()`.
+#: Matches that module's own `"set"` string literal (no shared import
+#: between the two bundle processes).
+_SET_SUBCOMMAND = "set"
+
+#: The only `!sr set <key> ...` key implemented on the hub-api side so far
+#: -- matches `social_music_process._YOUTUBE_LABELS_PAYLOAD_KEY` and
+#: hub-api's own `PUT .../music-station/policy` field name, so it doubles
+#: as both `event.payload["key"]` AND the internal PUT body's field name
+#: without a translation table.
+_YOUTUBE_LABELS_KEY = "youtube_allowed_labels"
+
+#: `!sr set youtube-labels`'s two success replies (task requirement --
+#: sorted labels, or this exact reply when the allowlist is cleared).
+_LABELS_CLEARED_REPLY = "youtube labels cleared — all videos allowed"
+
+#: `_set_policy()`'s reply for an unreachable/network-failed hub-api call
+#: (a caught `httpx.HTTPError`, including timeouts) -- distinct from
+#: `_policy_unavailable_reply()`'s 5xx/malformed-response variant below.
+_POLICY_UNREACHABLE_REPLY = "song requests: settings unavailable (hub-api unreachable)"
 
 #: Lazily-built, process-wide Valkey client for IRC relay (same pattern as
 #: twitch_send_action.py / social_quote_action.py).
@@ -126,14 +164,13 @@ async def _enqueue(
     platform: str,
     platform_user_id: str | None,
     requested_by_display: str | None,
-) -> str:
+) -> tuple[str, dict[str, object] | None]:
     """POST to hub-api's internal Music Station enqueue endpoint; never raises.
 
-    Returns the chat reply text for every outcome -- success, provider
-    unavailable, no track match, policy-disallowed, malformed response, or
-    an unreachable hub-api -- so the caller always has a friendly reply to
-    send instead of failing the whole action dispatch (task's graceful-
-    degradation requirement).
+    Returns a tuple of (chat reply text, structured data dict or None) for every
+    outcome. The reply text is sent to chat; the data dict contains parsed
+    track/queue info for structured logging on success. Failure paths return
+    None for the data dict.
     """
     hub_api_base = os.getenv("HUB_API_URL", "http://hub-api:8204")
     service_api_key = os.getenv("SERVICE_API_KEY", "")
@@ -162,7 +199,7 @@ async def _enqueue(
             community_id,
             exc,
         )
-        return _UNAVAILABLE_REPLY
+        return (_UNAVAILABLE_REPLY, None)
 
     logger.debug(
         "social_music_action.enqueue_response community_id=%s status=%s",
@@ -189,8 +226,8 @@ async def _enqueue(
             response.text[:300],
         )
         if "no track found" in message.lower():
-            return _NOT_FOUND_REPLY
-        return _UNAVAILABLE_REPLY
+            return (_NOT_FOUND_REPLY, None)
+        return (_UNAVAILABLE_REPLY, None)
 
     try:
         data = response.json()
@@ -208,7 +245,7 @@ async def _enqueue(
             community_id,
             exc,
         )
-        return _UNAVAILABLE_REPLY
+        return (_UNAVAILABLE_REPLY, None)
 
     time_till_played = _format_time_till_played(eta_seconds, position)
     logger.debug(
@@ -217,12 +254,23 @@ async def _enqueue(
         position,
         eta_seconds,
     )
-    return f"added to the queue: {title} - {artist} - {time_till_played}"
+    reply = f"added to the queue: {title} - {artist} - {time_till_played}"
+    data_dict: dict[str, object] = {
+        "title": title,
+        "artist": artist,
+        "position": position,
+        "eta_seconds": eta_seconds,
+        "request_id": item.get("id"),
+    }
+    return (reply, data_dict)
 
 
-async def _check_status(http_client: httpx.AsyncClient, *, community_id: int) -> str:
+async def _check_status(
+    http_client: httpx.AsyncClient, *, community_id: int
+) -> tuple[str, dict[str, object] | None]:
     """GET hub-api's internal music-status endpoint; maps it to one of `!sr status`'s 4 replies.
 
+    Returns a tuple of (reply text, structured data dict or None).
     Never raises, never returns anything other than the four allowed
     reply strings (task requirement). `offline` covers an unreachable
     hub-api, a non-2xx response, AND a malformed 2xx body -- hub-api's
@@ -247,7 +295,7 @@ async def _check_status(http_client: httpx.AsyncClient, *, community_id: int) ->
             community_id,
             exc,
         )
-        return _STATUS_OFFLINE_REPLY
+        return (_STATUS_OFFLINE_REPLY, None)
 
     logger.debug(
         "social_music_action.status_response community_id=%s status=%s",
@@ -262,7 +310,7 @@ async def _check_status(http_client: httpx.AsyncClient, *, community_id: int) ->
             response.status_code,
             response.text[:300],
         )
-        return _STATUS_OFFLINE_REPLY
+        return (_STATUS_OFFLINE_REPLY, None)
 
     try:
         payload = response.json()
@@ -275,18 +323,125 @@ async def _check_status(http_client: httpx.AsyncClient, *, community_id: int) ->
             community_id,
             exc,
         )
-        return _STATUS_OFFLINE_REPLY
+        return (_STATUS_OFFLINE_REPLY, None)
 
     logger.debug(
         "social_music_action.status_reply_chosen community_id=%s state=%s", community_id, state
     )
+    data_dict: dict[str, object] = {"state": state}
     if state == "enabled":
-        return _STATUS_ENABLED_REPLY
+        return (_STATUS_ENABLED_REPLY, data_dict)
     if state == "error":
         cause_text = str(cause) if cause else "unknown error"
-        return f"song requests: error - {cause_text}"
+        data_dict["cause"] = cause_text
+        return (f"song requests: error - {cause_text}", data_dict)
     # Unknown/unexpected state from hub-api -- safest reply is offline, never silence.
-    return _STATUS_OFFLINE_REPLY
+    return (_STATUS_OFFLINE_REPLY, None)
+
+
+def _policy_unavailable_reply(status_code: int) -> str:
+    """Render the `settings unavailable` reply for a 5xx or malformed hub-api policy response.
+
+    Distinct from `_POLICY_UNREACHABLE_REPLY` (network failure/timeout --
+    no status code to report) -- see `_set_policy()`.
+    """
+    return f"song requests: settings unavailable (hub-api error {status_code})"
+
+
+async def _set_policy(
+    http_client: httpx.AsyncClient,
+    *,
+    community_id: int,
+    key: str,
+    value: list[str],
+) -> tuple[str, dict[str, object] | None]:
+    """PUT hub-api's internal Music Station policy endpoint; never raises.
+
+    Returns (chat reply text, structured data dict or None), same contract
+    as `_enqueue()`/`_check_status()`. Task requirement: a 4xx response
+    relays hub-api's `error.message` verbatim (it's user-facing); a 5xx
+    response, a malformed 2xx body, or an unreachable hub-api (including a
+    timeout) fall back to a generic `settings unavailable` reply instead
+    (`_policy_unavailable_reply()` / `_POLICY_UNREACHABLE_REPLY`).
+    """
+    hub_api_base = os.getenv("HUB_API_URL", "http://hub-api:8204")
+    service_api_key = os.getenv("SERVICE_API_KEY", "")
+    body = {"community_id": community_id, key: value}
+
+    logger.debug(
+        "social_music_action.policy_update_request community_id=%s key=%s count=%d",
+        community_id,
+        key,
+        len(value),
+    )
+
+    try:
+        response = await http_client.put(
+            f"{hub_api_base}{_POLICY_PATH}",
+            json=body,
+            headers={"X-Service-Key": service_api_key},
+            timeout=_POLICY_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "social_music_action.policy_hub_api_unreachable community_id=%s error=%s",
+            community_id,
+            exc,
+        )
+        return (_POLICY_UNREACHABLE_REPLY, None)
+
+    logger.debug(
+        "social_music_action.policy_response community_id=%s status=%s",
+        community_id,
+        response.status_code,
+    )
+
+    if 400 <= response.status_code < 500:
+        message = ""
+        try:
+            error_body = response.json()
+            message = str((error_body.get("error") or {}).get("message", ""))
+        except ValueError:
+            pass
+        logger.warning(
+            "social_music_action.policy_rejected community_id=%s status=%s message=%s",
+            community_id,
+            response.status_code,
+            message,
+        )
+        return (message or _policy_unavailable_reply(response.status_code), None)
+
+    if response.status_code >= 500:
+        logger.warning(
+            "social_music_action.policy_server_error community_id=%s status=%s",
+            community_id,
+            response.status_code,
+        )
+        return (_policy_unavailable_reply(response.status_code), None)
+
+    try:
+        data = response.json()["data"]
+        labels_raw = data[key]
+        if not isinstance(labels_raw, list):
+            raise TypeError(f"{key!r} is not a list")
+        labels = [str(label) for label in labels_raw]
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "social_music_action.policy_malformed_response community_id=%s error=%s",
+            community_id,
+            exc,
+        )
+        return (_policy_unavailable_reply(response.status_code), None)
+
+    logger.debug(
+        "social_music_action.policy_reply_chosen community_id=%s key=%s count=%s",
+        community_id,
+        key,
+        len(labels),
+    )
+    reply = f"youtube labels set: {', '.join(sorted(labels))}" if labels else _LABELS_CLEARED_REPLY
+    data_dict: dict[str, object] = {"key": key, "count": len(labels)}
+    return (reply, data_dict)
 
 
 async def _send_reply(
@@ -415,7 +570,8 @@ async def enqueue_song_request(
     `app_catalog` seed row (`"entrypoint": "bundles.social_music_action:
     enqueue_song_request"`) -- kept unchanged (module docstring) even
     though a `music_status_check` payload flag now routes some events to
-    `_check_status()` instead of `_enqueue()`.
+    `_check_status()` instead of `_enqueue()`, and `subcommand="set"` routes
+    others to `_set_policy()` -- see module docstring.
 
     Requester identity is read from the SAME already-tokenized fields
     every other bundle uses -- `event.payload["author_id"]` (platform-
@@ -444,9 +600,39 @@ async def enqueue_song_request(
 
     platform = envelope.event.platform.lower() if envelope.event.platform else "discord"
 
+    # Resolve channel for logging
+    payload_channel_id = payload.get("channel_id")
+    payload_channel_name = payload.get("channel_name")
+    if platform == "twitch":
+        channel = payload_channel_name if isinstance(payload_channel_name, str) else None
+        if not channel:
+            channel = config.get("channel")
+    else:
+        channel = payload_channel_id if isinstance(payload_channel_id, str) else None
+        if not channel:
+            channel = config.get("channel_id")
+
+    subcommand = payload.get("subcommand")
+
     if payload.get(_STATUS_CHECK_KEY):
         logger.debug("social_music_action.dispatch_status_check community_id=%s", community_id)
-        text = await _check_status(http_client, community_id=community_id)
+        text, data = await _check_status(http_client, community_id=community_id)
+    elif subcommand == _SET_SUBCOMMAND:
+        key = payload.get("key")
+        value = payload.get("value")
+        logger.debug("social_music_action.dispatch_set community_id=%s key=%s", community_id, key)
+        if key != _YOUTUBE_LABELS_KEY:
+            logger.debug(
+                "social_music_action.set_unknown_key community_id=%s key=%s", community_id, key
+            )
+            text, data = (f"song requests: unknown setting '{key}'", None)
+        else:
+            if not isinstance(value, list):
+                raise NonRetryableTransportError("music action 'set' requires list 'value'")
+            labels = [str(item) for item in value]
+            text, data = await _set_policy(
+                http_client, community_id=community_id, key=key, value=labels
+            )
     else:
         query = payload.get("music_query")
         if not isinstance(query, str) or not query.strip():
@@ -454,7 +640,7 @@ async def enqueue_song_request(
         raw_author_id = payload.get("author_id")
         platform_user_id = str(raw_author_id) if raw_author_id is not None else None
         logger.debug("social_music_action.dispatch_enqueue community_id=%s", community_id)
-        text = await _enqueue(
+        text, data = await _enqueue(
             http_client,
             community_id=community_id,
             url_or_query=query.strip(),
@@ -463,7 +649,7 @@ async def enqueue_song_request(
             requested_by_display=envelope.event.actor,
         )
 
-    return await _send_reply(
+    result = await _send_reply(
         text,
         community_id=community_id,
         platform=platform,
@@ -471,3 +657,43 @@ async def enqueue_song_request(
         config=config,
         http_client=http_client,
     )
+
+    # Log success with structured data
+    if data is not None:
+        if payload.get(_STATUS_CHECK_KEY):
+            logger.info(
+                "social_music_action.status_replied community_id=%s platform=%s channel=%s "
+                "state=%s reply_length=%s",
+                community_id,
+                platform,
+                channel,
+                data.get("state"),
+                len(text),
+            )
+        elif subcommand == _SET_SUBCOMMAND:
+            logger.info(
+                "social_music_action.policy_updated community_id=%s platform=%s channel=%s "
+                "key=%s count=%s reply_length=%s",
+                community_id,
+                platform,
+                channel,
+                data.get("key"),
+                data.get("count"),
+                len(text),
+            )
+        else:
+            logger.info(
+                "social_music_action.enqueued community_id=%s platform=%s channel=%s "
+                "title=%s artist=%s position=%s eta_seconds=%s request_id=%s reply_length=%s",
+                community_id,
+                platform,
+                channel,
+                data.get("title"),
+                data.get("artist"),
+                data.get("position"),
+                data.get("eta_seconds"),
+                data.get("request_id"),
+                len(text),
+            )
+
+    return result

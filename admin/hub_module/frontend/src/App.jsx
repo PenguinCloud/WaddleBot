@@ -12,6 +12,7 @@ import CommunitiesPage from './pages/public/CommunitiesPage';
 import CommunityPublicPage from './pages/public/CommunityPublicPage';
 import LiveStreamsPage from './pages/public/LiveStreamsPage';
 import UserPublicProfile from './pages/public/UserPublicProfile';
+import MusicQueuePage from './pages/public/MusicQueuePage';
 
 // Auth pages
 import LoginPage from './pages/auth/LoginPage';
@@ -224,6 +225,9 @@ function App() {
 
         {/* Public booking page (no auth required) */}
         <Route path="/book/:slug" element={<BookingPagePublic />} />
+
+        {/* Public song-queue page (no auth required) -- linked from chat via !sq */}
+        <Route path="/c/:communityId/music/queue" element={<MusicQueuePage />} />
 
         {/* Vendor submission routes (public) */}
         <Route path="/vendor/submit" element={<VendorSubmissionForm />} />

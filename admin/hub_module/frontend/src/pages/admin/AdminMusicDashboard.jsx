@@ -330,6 +330,22 @@ function AdminMusicDashboard() {
       <div>
         <h2 className="text-lg font-semibold text-sky-100 mb-4">Quick Navigation</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Public queue page link */}
+          <Link
+            to={`/c/${communityId}/music/queue`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="bg-navy-800 border border-navy-700 hover:border-gold-500/50 rounded-lg p-6 transition-colors group"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-semibold text-sky-100 mb-1">Public Queue Page</h3>
+                <p className="text-sm text-navy-400">Share with viewers via !sq in chat</p>
+              </div>
+              <MusicalNoteIcon className="w-5 h-5 text-navy-500 group-hover:text-gold-400 transition-colors" />
+            </div>
+          </Link>
+
           {/* Settings Link */}
           <Link
             to={`/admin/${communityId}/music/settings`}

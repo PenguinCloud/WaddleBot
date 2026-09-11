@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from services.surfaces import resolve_community_id
+
 
 @dataclass(slots=True, frozen=True)
 class ThemeConfig:
@@ -24,32 +26,13 @@ class ThemeConfig:
     font_family: str | None
 
 
-def _community_id(community: str) -> int | None:
-    """Best-effort parse of the URL path's `community` segment as an integer FK.
-
-    `overlay_surfaces.community_id`/`presentation_config.community_id` are
-    both `INTEGER REFERENCES communities(id)` (migration 073) -- the URL
-    path segment itself stays a generic slug-validated string (matching
-    this scaffold's pre-existing `community` param shape, and the same
-    OBS-browser-source-URL convention `browser_source_core_module` already
-    uses, `docs/browser_source_core_module/API.md:118` `community_id` in
-    the path). A non-numeric community (e.g. test fixtures using a plain
-    slug) simply has no config/surface row to look up -- callers get
-    `None` and apply defaults, never an error.
-    """
-    try:
-        return int(community)
-    except ValueError:
-        return None
-
-
 async def is_surface_enabled(async_dal: Any, dal: Any, *, community: str, surface: str) -> bool:
     """True unless an explicit `overlay_surfaces` row disables this surface for this community.
 
     No row at all (the common case -- no admin has touched per-community
     surface config yet) means "enabled by default", not "not found".
     """
-    community_id = _community_id(community)
+    community_id = resolve_community_id(community)
     if community_id is None:
         return True
     rows = await async_dal.select_async(
@@ -65,7 +48,7 @@ async def is_surface_enabled(async_dal: Any, dal: Any, *, community: str, surfac
 
 async def get_theme_config(async_dal: Any, dal: Any, *, community: str) -> ThemeConfig:
     """Return this community's theme overrides, or all-`None` defaults if unset."""
-    community_id = _community_id(community)
+    community_id = resolve_community_id(community)
     if community_id is None:
         return ThemeConfig(primary_color=None, secondary_color=None, font_family=None)
     rows = await async_dal.select_async(dal(dal.presentation_config.community_id == community_id))

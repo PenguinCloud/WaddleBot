@@ -93,7 +93,7 @@ def create_app(config: Config | None = None) -> Quart:
         app.config["PRESENTATION_HUB"] = hub
 
         queue_reader = MusicQueueReader(
-            valkey_url=cfg.valkey_url, namespace=cfg.music_queue_namespace
+            hub_api_url=cfg.hub_api_url, service_api_key=cfg.service_api_key
         )
         await queue_reader.start()
         app.config["MUSIC_QUEUE_READER"] = queue_reader

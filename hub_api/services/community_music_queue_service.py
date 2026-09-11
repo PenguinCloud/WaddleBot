@@ -24,17 +24,29 @@ this module has no other dependency on that group's own tables).
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from services.errors import bad_request, forbidden, not_found, unprocessable
+from services.errors import ApiError, bad_request, forbidden, not_found, unprocessable
 from services.music_providers import ProviderUnavailable, Track, TrackNotFound, resolve
 from services.schema import bind_streaming_tables
 
+logger = logging.getLogger(__name__)
+
 _LIVE_PLATFORM = "twitch"
 _MUSIC_CATEGORY_NAMES = frozenset({"music"})
+
+#: gh-313 `youtube_allowed_labels` write bounds -- kept small enough that the
+#: validation-failure message stays a single short, human-readable line
+#: (`core/svc_action` relays it verbatim to chat on a rejected policy update).
+_MAX_YOUTUBE_ALLOWED_LABELS = 32
+_MAX_YOUTUBE_ALLOWED_LABEL_LENGTH = 64
+YOUTUBE_LABEL_VALIDATION_MESSAGE = "youtube-labels: up to 32 labels, 64 chars each"
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +104,7 @@ class PolicyDTO:
     communityId: int
     songRequestsAllowed: bool
     requestsCategoryRestricted: bool
+    youtubeAllowedLabels: list[str]
     updatedBy: int | None
     updatedAt: str | None
 
@@ -138,11 +151,57 @@ def _queue_item_dto(
     )
 
 
+def _decode_youtube_allowed_labels(raw: Any) -> list[str]:
+    """JSON-decode `music_policy.youtube_allowed_labels` -- NULL/invalid/wrong-shape -> `[]`.
+
+    Never raises: a NULL column (unrestricted, the default) and a
+    corrupted or legacy value both degrade to "no restriction" on read
+    rather than a 500.
+    """
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        return []
+    return decoded
+
+
+def _normalize_youtube_allowed_labels(labels: list[str]) -> list[str]:
+    """Validate + normalize a `youtube_allowed_labels` write -- lowercase/trim/dedupe, bounded.
+
+    Raises `bad_request(YOUTUBE_LABEL_VALIDATION_MESSAGE)` on more than
+    `_MAX_YOUTUBE_ALLOWED_LABELS` entries, a non-string entry, or any
+    entry that's blank or over `_MAX_YOUTUBE_ALLOWED_LABEL_LENGTH` chars
+    once trimmed -- length is checked AFTER trim/lowercase so incidental
+    whitespace never trips the bound. Order of first appearance is kept;
+    duplicates (post-normalization) are dropped silently.
+    """
+    if len(labels) > _MAX_YOUTUBE_ALLOWED_LABELS:
+        raise bad_request(YOUTUBE_LABEL_VALIDATION_MESSAGE)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in labels:
+        if not isinstance(raw, str):
+            raise bad_request(YOUTUBE_LABEL_VALIDATION_MESSAGE)
+        cleaned = raw.strip().lower()
+        if not cleaned or len(cleaned) > _MAX_YOUTUBE_ALLOWED_LABEL_LENGTH:
+            raise bad_request(YOUTUBE_LABEL_VALIDATION_MESSAGE)
+        if cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return normalized
+
+
 def _policy_dto(row: Any, *, community_id: int) -> PolicyDTO:
     return PolicyDTO(
         communityId=community_id,
         songRequestsAllowed=bool(row.song_requests_allowed),
         requestsCategoryRestricted=bool(row.requests_category_restricted),
+        youtubeAllowedLabels=_decode_youtube_allowed_labels(row.youtube_allowed_labels),
         updatedBy=row.updated_by,
         updatedAt=_iso(row.updated_at),
     )
@@ -169,6 +228,7 @@ async def get_policy(async_dal: Any, dal: Any, *, tenant_id: int, community_id: 
         community_id=community_id,
         song_requests_allowed=True,
         requests_category_restricted=False,
+        youtube_allowed_labels=None,
         updated_by=None,
         updated_at=now,
     )
@@ -184,11 +244,29 @@ async def set_policy(
     community_id: int,
     song_requests_allowed: bool | None,
     requests_category_restricted: bool | None,
+    youtube_allowed_labels: list[str] | None,
     updated_by: int | None,
 ) -> PolicyDTO:
-    """Upsert the community's policy -- only the provided fields change."""
-    if song_requests_allowed is None and requests_category_restricted is None:
+    """Upsert the community's policy -- only the provided fields change.
+
+    `youtube_allowed_labels=None` means "leave unchanged", same
+    partial-update convention as the two boolean fields above; pass `[]`
+    explicitly to clear the allowlist back to unrestricted. Validated and
+    normalized via `_normalize_youtube_allowed_labels()` before being
+    JSON-encoded for storage.
+    """
+    if (
+        song_requests_allowed is None
+        and requests_category_restricted is None
+        and youtube_allowed_labels is None
+    ):
         raise bad_request("No policy fields to update")
+
+    normalized_youtube_labels = (
+        _normalize_youtube_allowed_labels(youtube_allowed_labels)
+        if youtube_allowed_labels is not None
+        else None
+    )
 
     existing = await async_dal.select_async(dal(dal.music_policy.community_id == community_id))
     now = datetime.now(UTC)
@@ -200,12 +278,16 @@ async def set_policy(
         default_category_restricted = (
             requests_category_restricted if requests_category_restricted is not None else False
         )
+        default_youtube_labels_json = (
+            json.dumps(normalized_youtube_labels) if normalized_youtube_labels is not None else None
+        )
         new_id = await async_dal.insert_async(
             dal.music_policy,
             tenant_id=tenant_id,
             community_id=community_id,
             song_requests_allowed=default_requests_allowed,
             requests_category_restricted=default_category_restricted,
+            youtube_allowed_labels=default_youtube_labels_json,
             updated_by=updated_by,
             updated_at=now,
         )
@@ -217,6 +299,8 @@ async def set_policy(
         fields["song_requests_allowed"] = song_requests_allowed
     if requests_category_restricted is not None:
         fields["requests_category_restricted"] = requests_category_restricted
+    if normalized_youtube_labels is not None:
+        fields["youtube_allowed_labels"] = json.dumps(normalized_youtube_labels)
 
     query = dal.music_policy.community_id == community_id
     await async_dal.update_async(query, **fields)
@@ -320,6 +404,64 @@ async def _enforce_request_policy(
     raise unprocessable("Song requests are restricted to the live Music category right now")
 
 
+def _youtube_label_match(allowed_labels: list[str], track_labels: tuple[str, ...]) -> str | None:
+    """First `allowed_labels` entry satisfied by `track_labels`, or `None` (gh-313).
+
+    Match iff an allowed label equals a track label outright, OR is a
+    whole word inside a multi-word track label -- e.g. allowed `"music"`
+    matches track label `"music video"` but not `"musical"`. Both sides
+    are already lowercase by the time they reach here
+    (`_normalize_youtube_allowed_labels()` on write, `Track.labels` at
+    resolution), so this is a plain string/word comparison, not a second
+    case-fold.
+    """
+    for allowed in allowed_labels:
+        for label in track_labels:
+            if allowed == label or allowed in label.split():
+                return allowed
+    return None
+
+
+async def _enforce_youtube_label_gate(
+    async_dal: Any, dal: Any, *, community_id: int, track: Track
+) -> None:
+    """Reject a YouTube track whose labels don't satisfy the community's allowlist (gh-313).
+
+    No-op when the track isn't from YouTube (Spotify/other providers are
+    never gated by this policy field) or the community's
+    `youtube_allowed_labels` list is empty (unrestricted, the default).
+    Always DEBUG-logs the match attempt, pass or reject, so an operator
+    can trace why a specific video was accepted or rejected.
+    """
+    if track.provider != "youtube":
+        return
+
+    policy_rows = await async_dal.select_async(dal(dal.music_policy.community_id == community_id))
+    allowed_labels = (
+        _decode_youtube_allowed_labels(policy_rows.first().youtube_allowed_labels)
+        if policy_rows
+        else []
+    )
+    if not allowed_labels:
+        return
+
+    matched = _youtube_label_match(allowed_labels, track.labels)
+    logger.debug(
+        "music.label_gate community_id=%s video=%s allowed=%s labels=%s matched=%s",
+        community_id,
+        track.external_id,
+        allowed_labels,
+        list(track.labels),
+        matched,
+    )
+    if matched is None:
+        raise ApiError(
+            f"that video isn't allowed here (allowed: {', '.join(allowed_labels)})",
+            422,
+            "youtube_label_not_allowed",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Track resolution + dedup
 # ---------------------------------------------------------------------------
@@ -413,8 +555,8 @@ async def _compute_eta_seconds(
         playing_row = playing_rows.first()
         track_row = await _get_track_row(async_dal, dal, track_id=playing_row.track_id)
         duration_ms = int(track_row.duration_ms or 0)
-        started_at = playing_row.started_at
-        if isinstance(started_at, datetime):
+        started_at = _as_aware_utc(playing_row.started_at)
+        if started_at is not None:
             elapsed_ms = max(0, int((datetime.now(UTC) - started_at).total_seconds() * 1000))
             remaining_ms = max(0, duration_ms - elapsed_ms)
         else:
@@ -459,8 +601,17 @@ async def enqueue_request(
     provider: str | None,
     requested_by: int | None,
     is_admin_override: bool,
+    enforce_youtube_labels: bool,
 ) -> QueueItemDTO:
-    """Resolve `url_or_query` to a `Track` and enqueue it as a single song request."""
+    """Resolve `url_or_query` to a `Track` and enqueue it as a single song request.
+
+    `enforce_youtube_labels` gates the community's `youtube_allowed_labels`
+    allowlist (gh-313) behind the `waddles.social.music.youtube_labels`
+    PostHog flag -- callers resolve the flag themselves (blueprint layer,
+    same convention as every other `feature_enabled()` check in this
+    port) and pass the result through, so this function stays a pure
+    enqueue operation rather than a flag client itself.
+    """
     if not url_or_query or not url_or_query.strip():
         raise bad_request("urlOrQuery is required")
 
@@ -474,6 +625,8 @@ async def enqueue_request(
     )
 
     track = await _resolve_track(url_or_query, provider)
+    if enforce_youtube_labels:
+        await _enforce_youtube_label_gate(async_dal, dal, community_id=community_id, track=track)
     track_id = await _get_or_create_track_id(async_dal, dal, tenant_id=tenant_id, track=track)
     position = await _next_queue_position(async_dal, dal, community_id=community_id)
 
@@ -732,3 +885,365 @@ async def advance_queue(
             )
 
     return previous_dto, next_dto
+
+
+# ---------------------------------------------------------------------------
+# Live queue read model -- backs the OBS overlay player (`core/svc_presentation`)
+# and the public (unauthenticated) queue page via `blueprints/v1/
+# community_music_queue.py`'s `music_internal_bp` (service-key) routes and
+# `blueprints/v1/public_music_queue.py`. Deliberately a SEPARATE, snake_case
+# wire contract from `QueueItemDTO` above (camelCase, admin-API-only) --
+# this shape is pinned by concurrent work against it; do not merge the two.
+#
+# `requested_by` never carries a raw user id or email -- only a display
+# name + platform, resolved at read time by joining `community_members`
+# (which already carries a per-platform `display_name`, see
+# `services/schema.py`'s own field list for that table) on the
+# `requested_by` (`hub_users.id`) value this row was enqueued with. An
+# unresolvable requester (anonymous/unlinked platform identity, or no
+# active `community_members` row at all) falls back to a generic label,
+# never a new PII column.
+# ---------------------------------------------------------------------------
+
+#: Grace period added on top of a `playing` track's own `duration_ms`
+#: before the lazy auto-advance considers it expired -- absorbs normal
+#: clock/poll-interval drift between "the track actually finished" and
+#: "a reader happened to poll" without prematurely cutting a track short.
+_ADVANCE_GRACE_SECONDS = 10
+_DISPLAY_NAME_FALLBACK = "platform user"
+_PLATFORM_FALLBACK = "unknown"
+
+
+@dataclass(slots=True, frozen=True)
+class RequestedByDTO:
+    """Attribution for one live queue item -- a display name only, never an id/email."""
+
+    display_name: str
+    platform: str
+
+
+@dataclass(slots=True, frozen=True)
+class LiveQueueItemDTO:
+    """One `music_station_queue` row in the overlay/public-page wire shape (snake_case)."""
+
+    id: int
+    position: int
+    status: str
+    title: str
+    artist: str
+    duration_ms: int
+    artwork_url: str | None
+    provider: str
+    external_id: str
+    url: str
+    eta_seconds: int | None
+    started_at: str | None
+    requested_by: RequestedByDTO
+
+
+def _as_aware_utc(value: Any) -> datetime | None:
+    """Normalize a possibly-naive DB-read `datetime` to aware UTC for safe arithmetic.
+
+    Every `datetime` column here is written via `datetime.now(UTC)`
+    (aware), but read back NAIVE on both sqlite and Postgres (pydal's
+    `"datetime"` Field type maps to `TIMESTAMP WITHOUT TIME ZONE` --
+    confirmed empirically against `pydal.DAL("sqlite:memory")`).
+    Subtracting a naive value from `datetime.now(UTC)` raises `TypeError:
+    can't subtract offset-naive and offset-aware datetimes`; every value
+    this DAL produces was written as UTC, so re-attaching `UTC` (never
+    re-interpreting as local time) is the correct fix, not just a
+    convenient one.
+    """
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _sync_resolve_requested_by(
+    dal: Any, *, community_id: int, requested_by: int | None
+) -> RequestedByDTO:
+    """Best-effort display-name lookup for a `music_station_queue.requested_by` value.
+
+    Joins `community_members` on `(community_id, user_id=str(requested_by),
+    is_active=True)` -- the same legacy-VARCHAR `user_id` column every
+    other `community_members` lookup in this port compares as a string
+    (see `services/community_authz.py`'s own note). `requested_by=None`
+    (anonymous/unlinked chat requester -- see `_resolve_requester()`
+    above) and "member row found but has no `display_name` set" both fall
+    back to the same generic label -- never raises, never a new column.
+    """
+    if requested_by is None:
+        return RequestedByDTO(display_name=_DISPLAY_NAME_FALLBACK, platform=_PLATFORM_FALLBACK)
+
+    row = (
+        dal(
+            (dal.community_members.community_id == community_id)
+            & (dal.community_members.user_id == str(requested_by))
+            & (dal.community_members.is_active == True)  # noqa: E712 - pydal idiom
+        )
+        .select(orderby=dal.community_members.id, limitby=(0, 1))
+        .first()
+    )
+    if row is None or not row.display_name:
+        platform = row.platform if row is not None and row.platform else _PLATFORM_FALLBACK
+        return RequestedByDTO(display_name=_DISPLAY_NAME_FALLBACK, platform=platform)
+    return RequestedByDTO(
+        display_name=row.display_name, platform=row.platform or _PLATFORM_FALLBACK
+    )
+
+
+def _sync_live_item_dto(
+    dal: Any, row: Any, track: Any, *, community_id: int, eta_seconds: int | None
+) -> LiveQueueItemDTO:
+    return LiveQueueItemDTO(
+        id=int(row.id),
+        position=int(row.position),
+        status=row.status,
+        title=track.title,
+        artist=track.artist,
+        duration_ms=int(track.duration_ms or 0),
+        artwork_url=track.artwork_url,
+        provider=track.provider,
+        external_id=track.external_id,
+        url=track.url,
+        eta_seconds=eta_seconds,
+        started_at=_iso(row.started_at),
+        requested_by=_sync_resolve_requested_by(
+            dal, community_id=community_id, requested_by=row.requested_by
+        ),
+    )
+
+
+def _sync_build_live_dtos(
+    dal: Any, *, community_id: int, playing_row: Any, queued_rows: list[Any], now: datetime
+) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO]]:
+    """Build `(now_playing, queue)` DTOs from already-locked/committed rows.
+
+    ETA for each queued item is the sum of every still-queued track ahead
+    of it plus the currently-playing track's own remaining time -- same
+    formula as `_compute_eta_seconds()` above, recomputed here from the
+    rows already in hand (no extra query) since this always runs inside
+    the same locked transaction that read them. `now_playing` itself gets
+    `eta_seconds=None` -- it's already playing, there's nothing to wait
+    for.
+    """
+    track_ids = {int(row.track_id) for row in queued_rows}
+    if playing_row is not None:
+        track_ids.add(int(playing_row.track_id))
+    tracks: dict[int, Any] = (
+        {int(t.id): t for t in dal(dal.music_tracks.id.belongs(list(track_ids))).select()}
+        if track_ids
+        else {}
+    )
+
+    now_playing_dto: LiveQueueItemDTO | None = None
+    running_ahead_ms = 0
+    if playing_row is not None:
+        track = tracks[int(playing_row.track_id)]
+        now_playing_dto = _sync_live_item_dto(
+            dal, playing_row, track, community_id=community_id, eta_seconds=None
+        )
+        duration_ms = int(track.duration_ms or 0)
+        started_at = _as_aware_utc(playing_row.started_at)
+        if started_at is not None:
+            elapsed_ms = max(0, int((now - started_at).total_seconds() * 1000))
+            running_ahead_ms = max(0, duration_ms - elapsed_ms)
+        else:
+            running_ahead_ms = duration_ms
+
+    queue_dtos: list[LiveQueueItemDTO] = []
+    for row in queued_rows:
+        track = tracks[int(row.track_id)]
+        queue_dtos.append(
+            _sync_live_item_dto(
+                dal, row, track, community_id=community_id, eta_seconds=running_ahead_ms // 1000
+            )
+        )
+        running_ahead_ms += int(track.duration_ms or 0)
+
+    return now_playing_dto, queue_dtos
+
+
+def _sync_get_live_state(
+    dal: Any, *, community_id: int, auto_advance: bool, now: datetime
+) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
+    """Single executor job: lock + (optionally) auto-advance/auto-start + build DTOs + commit.
+
+    `AsyncDAL.transaction_async()`'s own docstring (`libs/flask_core/
+    flask_core/database.py`) is explicit that every `*_async()` write
+    method commits inside its OWN executor job, so nothing short of one
+    synchronous function submitted as a SINGLE `run_in_executor()` job
+    guarantees cross-statement atomicity here -- see that docstring's own
+    "bundle an entire read-modify-write + `dal.commit()` into ONE
+    synchronous function" guidance, which this follows directly rather
+    than composing multiple awaited `*_async()` calls.
+
+    `SELECT ... FOR UPDATE` locks the community's active (`playing`/
+    `queued`) rows for the rest of this transaction wherever the adapter
+    supports it (`dal._adapter.dbengine != "sqlite"` -- sqlite rejects the
+    syntax outright at the driver level, and this port's own sqlite test
+    fixtures are `pool_size=1` anyway, i.e. single-threaded-serialized
+    regardless). Two callers racing the same expiry/auto-start window
+    therefore always serialize on this lock in production: the second
+    one's `SELECT ... FOR UPDATE` blocks until the first commits, then
+    observes the ALREADY-advanced state and correctly no-ops -- never a
+    double-advance.
+    """
+    q = dal.music_station_queue
+    query = (q.community_id == community_id) & (q.status.belongs(("playing", "queued")))
+    for_update = dal._adapter.dbengine != "sqlite"
+    try:
+        rows = dal(query).select(orderby=q.position | q.added_at, for_update=for_update)
+
+        playing_row: Any = None
+        queued_rows: list[Any] = []
+        for row in rows:
+            if row.status == "playing":
+                playing_row = row
+            else:
+                queued_rows.append(row)
+
+        advanced = False
+        if auto_advance:
+            if playing_row is not None:
+                track = dal(dal.music_tracks.id == playing_row.track_id).select().first()
+                duration_ms = int(track.duration_ms or 0) if track is not None else 0
+                started_at = _as_aware_utc(playing_row.started_at)
+                expired = started_at is not None and (
+                    started_at
+                    + timedelta(milliseconds=duration_ms)
+                    + timedelta(seconds=_ADVANCE_GRACE_SECONDS)
+                    < now
+                )
+                if expired:
+                    dal(q.id == playing_row.id).update(status="played", ended_at=now)
+                    logger.debug(
+                        "music.live_queue.auto_advance_expired community_id=%s queue_id=%s",
+                        community_id,
+                        playing_row.id,
+                    )
+                    playing_row = None
+                    advanced = True
+
+            if playing_row is None and queued_rows:
+                head = queued_rows.pop(0)
+                dal(q.id == head.id).update(status="playing", started_at=now)
+                playing_row = dal(q.id == head.id).select().first()
+                advanced = True
+                logger.debug(
+                    "music.live_queue.auto_start community_id=%s queue_id=%s",
+                    community_id,
+                    head.id,
+                )
+            elif playing_row is None:
+                logger.debug(
+                    "music.live_queue.auto_advance_noop_empty_queue community_id=%s",
+                    community_id,
+                )
+
+        now_playing_dto, queue_dtos = _sync_build_live_dtos(
+            dal,
+            community_id=community_id,
+            playing_row=playing_row,
+            queued_rows=queued_rows,
+            now=now,
+        )
+        dal.commit()
+        return now_playing_dto, queue_dtos, advanced
+    except Exception:
+        dal.rollback()
+        raise
+
+
+def _sync_guarded_advance(
+    dal: Any, *, community_id: int, item_id: int, now: datetime
+) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
+    """Single executor job: advance ONLY if `item_id` is still the community's `playing` item.
+
+    Same lock/atomicity rationale as `_sync_get_live_state()` above. A
+    stale `item_id` (already advanced by a concurrent caller, or never
+    the playing item at all) is a no-op -- `advanced=False`, current
+    state returned unchanged, never an error: this is the expected
+    outcome of losing the race, not a caller mistake.
+    """
+    q = dal.music_station_queue
+    query = (q.community_id == community_id) & (q.status.belongs(("playing", "queued")))
+    for_update = dal._adapter.dbengine != "sqlite"
+    try:
+        rows = dal(query).select(orderby=q.position | q.added_at, for_update=for_update)
+
+        playing_row: Any = None
+        queued_rows: list[Any] = []
+        for row in rows:
+            if row.status == "playing":
+                playing_row = row
+            else:
+                queued_rows.append(row)
+
+        advanced = False
+        if playing_row is not None and int(playing_row.id) == int(item_id):
+            dal(q.id == playing_row.id).update(status="played", ended_at=now)
+            playing_row = None
+            advanced = True
+            if queued_rows:
+                head = queued_rows.pop(0)
+                dal(q.id == head.id).update(status="playing", started_at=now)
+                playing_row = dal(q.id == head.id).select().first()
+            logger.debug(
+                "music.live_queue.guarded_advance community_id=%s item_id=%s",
+                community_id,
+                item_id,
+            )
+        else:
+            logger.debug(
+                "music.live_queue.guarded_advance_rejected community_id=%s item_id=%s "
+                "current_playing_id=%s",
+                community_id,
+                item_id,
+                playing_row.id if playing_row is not None else None,
+            )
+
+        now_playing_dto, queue_dtos = _sync_build_live_dtos(
+            dal,
+            community_id=community_id,
+            playing_row=playing_row,
+            queued_rows=queued_rows,
+            now=now,
+        )
+        dal.commit()
+        return now_playing_dto, queue_dtos, advanced
+    except Exception:
+        dal.rollback()
+        raise
+
+
+async def get_live_queue_state(
+    async_dal: Any, dal: Any, *, community_id: int, auto_advance: bool
+) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
+    """Read a community's live queue; `auto_advance=True` also expires/promotes atomically.
+
+    `auto_advance=False` (the public, unauthenticated page) is a pure
+    read with no side effects -- runs through the same locking helper for
+    one consistent code path, but never mutates anything itself (`_sync_
+    get_live_state`'s own `if auto_advance:` guard).
+    """
+    loop = asyncio.get_event_loop()
+    now = datetime.now(UTC)
+    return await loop.run_in_executor(
+        async_dal.executor,
+        lambda: _sync_get_live_state(
+            dal, community_id=community_id, auto_advance=auto_advance, now=now
+        ),
+    )
+
+
+async def advance_live_queue(
+    async_dal: Any, dal: Any, *, community_id: int, item_id: int
+) -> tuple[LiveQueueItemDTO | None, list[LiveQueueItemDTO], bool]:
+    """Guarded advance: only if `item_id` is the community's current `playing` item."""
+    loop = asyncio.get_event_loop()
+    now = datetime.now(UTC)
+    return await loop.run_in_executor(
+        async_dal.executor,
+        lambda: _sync_guarded_advance(dal, community_id=community_id, item_id=item_id, now=now),
+    )

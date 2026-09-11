@@ -12,12 +12,16 @@ re-derived here).
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from quart import Quart
 from quart_schema import QuartSchema
 
+import blueprints.v1.community_music_queue as community_music_queue_module
 from blueprints.v1.community_music_queue import music_internal_bp, music_queue_bp
 from config import HubAPIConfig
 from services import music_status_service
@@ -27,6 +31,9 @@ from tests.conftest import TENANT_SLUG
 SERVICE_API_KEY = "test-service-key"
 _ROUTE = "/api/v1/internal/music/queue/requests"
 _STATUS_ROUTE = "/api/v1/internal/music/status"
+_LIVE_QUEUE_ROUTE = "/api/v1/internal/music/queue"
+_LIVE_ADVANCE_ROUTE = "/api/v1/internal/music/queue/advance"
+_POLICY_ROUTE = "/api/v1/internal/music/policy"
 
 
 def _test_config() -> HubAPIConfig:
@@ -77,19 +84,35 @@ def client(app: Quart) -> Any:
 @pytest.fixture
 def fake_resolve(monkeypatch: Any) -> None:
     """Deterministic stand-in for the real, network-calling `resolve()`."""
+    _set_fake_resolve(monkeypatch)
+
+
+def _set_fake_resolve(
+    monkeypatch: Any, *, track_provider: str = "youtube", labels: tuple[str, ...] = ()
+) -> None:
+    """Same fake `resolve()` as `fake_resolve`, with configurable provider/labels (gh-313)."""
 
     async def _fake(url_or_query: str, provider: str | None = None) -> Track:
         return Track(
-            provider=provider or "youtube",
+            provider=provider or track_provider,
             external_id=url_or_query,
             title=f"Track for {url_or_query}",
             artist="Test Artist",
             duration_ms=210000,
             artwork_url=None,
             url=url_or_query,
+            labels=labels,
         )
 
     monkeypatch.setattr("services.community_music_queue_service.resolve", _fake)
+
+
+@pytest.fixture(autouse=True)
+def _youtube_labels_flag_default_on(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Default the `waddles.social.music.youtube_labels` flag ON for this file's tests (gh-313)."""
+    stub = AsyncMock(return_value=True)
+    monkeypatch.setattr(community_music_queue_module, "feature_enabled", stub)
+    return stub
 
 
 def _seed_community(db: Any) -> int:
@@ -97,6 +120,48 @@ def _seed_community(db: Any) -> int:
     community_id = db.dal.communities.insert(name="test-community", tenant_id=tenant_row.id)
     db.dal.commit()
     return int(community_id)
+
+
+def _seed_track(db: Any, *, tenant_id: int = 1, duration_ms: int = 210000) -> int:
+    track_id = db.dal.music_tracks.insert(
+        tenant_id=tenant_id,
+        provider="youtube",
+        external_id="abc123",
+        title="Track Title",
+        artist="Track Artist",
+        duration_ms=duration_ms,
+        artwork_url=None,
+        url="https://youtube.com/watch?v=abc123",
+        created_at=datetime.now(UTC),
+    )
+    db.dal.commit()
+    return int(track_id)
+
+
+def _seed_queue_item(
+    db: Any,
+    *,
+    community_id: int,
+    track_id: int,
+    status: str,
+    position: int = 1,
+    started_at: datetime | None = None,
+    requested_by: int | None = None,
+) -> int:
+    queue_id = db.dal.music_station_queue.insert(
+        tenant_id=1,
+        community_id=community_id,
+        track_id=track_id,
+        position=position,
+        status=status,
+        source="request",
+        playlist_id=None,
+        requested_by=requested_by,
+        added_at=datetime.now(UTC),
+        started_at=started_at,
+    )
+    db.dal.commit()
+    return int(queue_id)
 
 
 class TestServiceKeyAuth:
@@ -291,6 +356,173 @@ class TestEnqueue:
         assert body["error"]["message"]  # non-empty -- the bug being fixed
 
 
+class TestInternalSetPolicy:
+    """`PUT /api/v1/internal/music/policy` -- service-key gated `youtube_allowed_labels` writes.
+
+    gh-313: lets a chat-side moderation command update the allowlist
+    without a user JWT -- same validator (`services.
+    community_music_queue_service._normalize_youtube_allowed_labels`) as
+    the admin-JWT `music_queue_bp.set_policy` route.
+    """
+
+    async def test_missing_service_key_is_401(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.put(
+            _POLICY_ROUTE,
+            json={"community_id": community_id, "youtube_allowed_labels": ["music"]},
+        )
+        assert response.status_code == 401
+
+    async def test_wrong_service_key_is_401(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": "wrong-key"},
+            json={"community_id": community_id, "youtube_allowed_labels": ["music"]},
+        )
+        assert response.status_code == 401
+
+    async def test_missing_fields_is_400(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id},
+        )
+        assert response.status_code == 400
+
+    async def test_unknown_community_is_404(self, client: Any) -> None:
+        response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": 999999, "youtube_allowed_labels": ["music"]},
+        )
+        assert response.status_code == 404
+
+    async def test_validation_failure_is_400_with_exact_message(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "youtube_allowed_labels": ["x" * 65]},
+        )
+        assert response.status_code == 400
+        body = await response.get_json()
+        assert body["error"]["message"] == "youtube-labels: up to 32 labels, 64 chars each"
+
+    async def test_set_then_clear_round_trip(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        set_response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "youtube_allowed_labels": [" Music ", "MUSIC"]},
+        )
+        assert set_response.status_code == 200
+        set_body = await set_response.get_json()
+        assert set_body["status"] == "success"
+        assert set_body["data"]["community_id"] == community_id
+        assert set_body["data"]["youtube_allowed_labels"] == ["music"]
+
+        clear_response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "youtube_allowed_labels": []},
+        )
+        assert clear_response.status_code == 200
+        clear_body = await clear_response.get_json()
+        assert clear_body["data"]["youtube_allowed_labels"] == []
+
+
+class TestYoutubeLabelGateInternal:
+    """gh-313 label-allowlist gate exercised through the service-key `!sr` enqueue route."""
+
+    async def _set_allowed_labels(self, client: Any, community_id: int, labels: list[str]) -> None:
+        response = await client.put(
+            _POLICY_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "youtube_allowed_labels": labels},
+        )
+        assert response.status_code == 200
+
+    async def test_empty_allowlist_accepts(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        response = await client.post(
+            _ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"communityId": community_id, "urlOrQuery": "some song"},
+        )
+        assert response.status_code == 201
+
+    async def test_label_match_accepts(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("gaming", "music"))
+        community_id = _seed_community(music_station_db)
+        await self._set_allowed_labels(client, community_id, ["music"])
+
+        response = await client.post(
+            _ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"communityId": community_id, "urlOrQuery": "some song"},
+        )
+        assert response.status_code == 201
+
+    async def test_no_match_rejected_with_code_and_message(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        await self._set_allowed_labels(client, community_id, ["a", "b", "c"])
+
+        response = await client.post(
+            _ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"communityId": community_id, "urlOrQuery": "some song"},
+        )
+        assert response.status_code == 422
+        body = await response.get_json()
+        assert body["error"]["code"] == "youtube_label_not_allowed"
+        assert body["error"]["message"] == "that video isn't allowed here (allowed: a, b, c)"
+
+    async def test_spotify_track_bypasses_gate(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, track_provider="spotify", labels=())
+        community_id = _seed_community(music_station_db)
+        await self._set_allowed_labels(client, community_id, ["music"])
+
+        response = await client.post(
+            _ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"communityId": community_id, "urlOrQuery": "some song", "provider": "spotify"},
+        )
+        assert response.status_code == 201
+
+    async def test_flag_off_bypasses_gate(
+        self,
+        client: Any,
+        music_station_db: Any,
+        monkeypatch: Any,
+        _youtube_labels_flag_default_on: AsyncMock,
+    ) -> None:
+        _youtube_labels_flag_default_on.return_value = False
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        await self._set_allowed_labels(client, community_id, ["music"])
+
+        response = await client.post(
+            _ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"communityId": community_id, "urlOrQuery": "some song"},
+        )
+        assert response.status_code == 201
+
+
 class TestMusicStatus:
     """`GET /api/v1/internal/music/status` -- backs `!sr status`'s enabled/error replies."""
 
@@ -401,3 +633,363 @@ class TestMusicStatus:
         )
         body = await response.get_json()
         assert body["data"]["queue_length"] == 1
+
+
+class TestLiveQueueRead:
+    """`GET /api/v1/internal/music/queue` -- lazy auto-advance-on-read for the overlay/page."""
+
+    async def test_missing_service_key_is_401(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.get(f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}")
+        assert response.status_code == 401
+
+    async def test_missing_community_id_is_400(self, client: Any) -> None:
+        response = await client.get(_LIVE_QUEUE_ROUTE, headers={"X-Service-Key": SERVICE_API_KEY})
+        assert response.status_code == 400
+
+    async def test_unknown_community_is_404(self, client: Any) -> None:
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id=999999",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 404
+
+    async def test_empty_queue_returns_null_now_playing(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["status"] == "success"
+        assert body["data"]["community_id"] == community_id
+        assert body["data"]["now_playing"] is None
+        assert body["data"]["queue"] == []
+        assert "updated_at" in body["data"]
+
+    async def test_auto_starts_head_item_when_nothing_playing(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db)
+        queue_id = _seed_queue_item(
+            music_station_db, community_id=community_id, track_id=track_id, status="queued"
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["id"] == queue_id
+        assert body["data"]["now_playing"]["status"] == "playing"
+        assert body["data"]["now_playing"]["started_at"] is not None
+        assert body["data"]["queue"] == []
+
+        # Persisted, not just reflected in the response.
+        row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == queue_id)
+            .select()
+            .first()
+        )
+        assert row.status == "playing"
+
+    async def test_expired_playing_item_auto_advances(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=1000)  # 1s track
+        expired_started_at = datetime.now(UTC) - timedelta(seconds=30)  # well past 1s + grace
+        expired_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=expired_started_at,
+        )
+        next_track_id = _seed_track(music_station_db)
+        next_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=next_track_id,
+            status="queued",
+            position=1,
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["id"] == next_id
+        assert body["data"]["queue"] == []
+
+        expired_row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == expired_id)
+            .select()
+            .first()
+        )
+        assert expired_row.status == "played"
+        assert expired_row.ended_at is not None
+
+    async def test_not_yet_expired_playing_item_does_not_advance(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=600000)  # 10 minute track
+        playing_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["id"] == playing_id
+        assert body["data"]["now_playing"]["status"] == "playing"
+
+    async def test_concurrent_double_read_only_advances_once(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        """Two overlay instances polling at once never double-advance the same expiry."""
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db, duration_ms=1000)
+        expired_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="playing",
+            started_at=datetime.now(UTC) - timedelta(seconds=30),
+        )
+        next_track_id = _seed_track(music_station_db)
+        next_id = _seed_queue_item(
+            music_station_db, community_id=community_id, track_id=next_track_id, status="queued"
+        )
+
+        url = f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}"
+        headers = {"X-Service-Key": SERVICE_API_KEY}
+        first, second = await asyncio.gather(
+            client.get(url, headers=headers), client.get(url, headers=headers)
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        # Exactly one `playing` row exists afterward, regardless of which
+        # response "saw" the transition -- the expired item is `played`
+        # exactly once, never re-expired or double-promoted.
+        playing_rows = music_station_db.dal(
+            music_station_db.dal.music_station_queue.status == "playing"
+        ).select()
+        assert len(playing_rows) == 1
+        assert playing_rows.first().id == next_id
+
+        expired_row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == expired_id)
+            .select()
+            .first()
+        )
+        assert expired_row.status == "played"
+
+    async def test_eta_seconds_for_queued_items(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        playing_track = _seed_track(music_station_db, duration_ms=600000)  # far from expiring
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=playing_track,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+        queued_track_1 = _seed_track(music_station_db, duration_ms=210000)
+        queued_track_2 = _seed_track(music_station_db, duration_ms=180000)
+        first_queued_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=queued_track_1,
+            status="queued",
+            position=1,
+        )
+        second_queued_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=queued_track_2,
+            status="queued",
+            position=2,
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["now_playing"]["eta_seconds"] is None
+
+        by_id = {item["id"]: item for item in body["data"]["queue"]}
+        # First queued item: ~all of the still-playing track's remaining time.
+        assert 590 <= by_id[first_queued_id]["eta_seconds"] <= 600
+        # Second queued item: first item's ETA + the first item's own duration (210s).
+        assert by_id[second_queued_id]["eta_seconds"] == by_id[first_queued_id]["eta_seconds"] + 210
+
+    async def test_requested_by_resolves_display_name_from_community_members(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        music_station_db.dal.community_members.insert(
+            community_id=community_id,
+            user_id="7",
+            platform="twitch",
+            platform_user_id="abc123",
+            display_name="PenguinFan42",
+            is_active=True,
+        )
+        music_station_db.dal.commit()
+        track_id = _seed_track(music_station_db)
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="queued",
+            requested_by=7,
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        body = await response.get_json()
+        item = body["data"]["now_playing"]  # auto-started (nothing else playing)
+        assert item["requested_by"] == {"display_name": "PenguinFan42", "platform": "twitch"}
+
+    async def test_requested_by_falls_back_when_unresolvable(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        track_id = _seed_track(music_station_db)
+        _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=track_id,
+            status="queued",
+            requested_by=None,
+        )
+
+        response = await client.get(
+            f"{_LIVE_QUEUE_ROUTE}?community_id={community_id}",
+            headers={"X-Service-Key": SERVICE_API_KEY},
+        )
+        body = await response.get_json()
+        item = body["data"]["now_playing"]
+        assert item["requested_by"] == {"display_name": "platform user", "platform": "unknown"}
+
+
+class TestLiveQueueAdvance:
+    """`POST /api/v1/internal/music/queue/advance` -- guarded advance, service-key only."""
+
+    async def test_missing_service_key_is_401(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE, json={"community_id": community_id, "item_id": 1}
+        )
+        assert response.status_code == 401
+
+    async def test_missing_params_is_400(self, client: Any) -> None:
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE, headers={"X-Service-Key": SERVICE_API_KEY}, json={}
+        )
+        assert response.status_code == 400
+
+    async def test_unknown_community_is_404(self, client: Any) -> None:
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": 999999, "item_id": 1},
+        )
+        assert response.status_code == 404
+
+    async def test_advances_when_item_id_matches_current_playing(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        playing_track = _seed_track(music_station_db)
+        playing_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=playing_track,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+        next_track = _seed_track(music_station_db)
+        next_id = _seed_queue_item(
+            music_station_db, community_id=community_id, track_id=next_track, status="queued"
+        )
+
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "item_id": playing_id},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["advanced"] is True
+        assert body["data"]["now_playing"]["id"] == next_id
+
+        old_row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == playing_id)
+            .select()
+            .first()
+        )
+        assert old_row.status == "played"
+
+    async def test_stale_item_id_does_not_advance(self, client: Any, music_station_db: Any) -> None:
+        community_id = _seed_community(music_station_db)
+        playing_track = _seed_track(music_station_db)
+        playing_id = _seed_queue_item(
+            music_station_db,
+            community_id=community_id,
+            track_id=playing_track,
+            status="playing",
+            started_at=datetime.now(UTC),
+        )
+
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "item_id": playing_id + 999},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["advanced"] is False
+        assert body["data"]["now_playing"]["id"] == playing_id
+
+        row = (
+            music_station_db.dal(music_station_db.dal.music_station_queue.id == playing_id)
+            .select()
+            .first()
+        )
+        assert row.status == "playing"
+
+    async def test_advance_with_no_playing_item_does_not_advance(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        response = await client.post(
+            _LIVE_ADVANCE_ROUTE,
+            headers={"X-Service-Key": SERVICE_API_KEY},
+            json={"community_id": community_id, "item_id": 1},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["data"]["advanced"] is False
+        assert body["data"]["now_playing"] is None

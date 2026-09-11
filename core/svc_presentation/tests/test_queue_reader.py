@@ -1,209 +1,454 @@
-"""`MusicQueueReader` -- direct unit tests for the Valkey-backed queue parse logic."""
+"""`MusicQueueReader` -- HTTP client, DTO mapping, caching, and stale-on-failure tests."""
 
 from __future__ import annotations
 
-import json
+from typing import Any
 
+import httpx
 import pytest
 
-from services.queue_reader import MusicQueueReader
+from services.queue_reader import MusicQueueReader, QueueSnapshot
 
 
-class _FakeRedis:
-    def __init__(self, stored: dict[str, str]) -> None:
-        self._stored = stored
+class _FakeResponse:
+    def __init__(self, status_code: int, json_body: Any) -> None:
+        self.status_code = status_code
+        self._json_body = json_body
 
-    async def get(self, key: str) -> str | None:
-        return self._stored.get(key)
+    def json(self) -> Any:
+        if isinstance(self._json_body, Exception):
+            raise self._json_body
+        return self._json_body
 
-    async def ping(self) -> bool:
-        return True
 
-    async def close(self) -> None:
+class _FakeClient:
+    """Stand-in for `httpx.AsyncClient` -- records calls, returns a queued response."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[dict[str, Any]] = []
+        self.post_calls: list[dict[str, Any]] = []
+        self._get_response: _FakeResponse | Exception = _FakeResponse(200, {})
+        self._post_response: _FakeResponse | Exception = _FakeResponse(200, {})
+
+    def queue_get(self, response: _FakeResponse | Exception) -> None:
+        self._get_response = response
+
+    def queue_post(self, response: _FakeResponse | Exception) -> None:
+        self._post_response = response
+
+    async def get(self, path: str, **kwargs: Any) -> _FakeResponse:
+        self.get_calls.append({"path": path, **kwargs})
+        if isinstance(self._get_response, Exception):
+            raise self._get_response
+        return self._get_response
+
+    async def post(self, path: str, **kwargs: Any) -> _FakeResponse:
+        self.post_calls.append({"path": path, **kwargs})
+        if isinstance(self._post_response, Exception):
+            raise self._post_response
+        return self._post_response
+
+    async def aclose(self) -> None:
         return None
 
 
+def _queue_item(
+    *,
+    item_id: int,
+    status: str,
+    title: str,
+    artist: str,
+    provider: str,
+    external_id: str,
+    position: int = 0,
+    requested_by: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build one hub-api `QueueItem` DTO entry."""
+    return {
+        "id": item_id,
+        "position": position,
+        "status": status,
+        "title": title,
+        "artist": artist,
+        "duration_ms": 210000,
+        "artwork_url": "https://example.com/art.jpg",
+        "provider": provider,
+        "external_id": external_id,
+        "url": f"https://example.com/{provider}/{external_id}",
+        "eta_seconds": 30,
+        "started_at": "2026-09-11T00:00:00Z",
+        "requested_by": requested_by,
+    }
+
+
+async def _connected_reader() -> tuple[MusicQueueReader, _FakeClient]:
+    """A `MusicQueueReader` with a fake HTTP client swapped in post-`start()`."""
+    reader = MusicQueueReader(hub_api_url="http://hub-api-test.invalid:8204", service_api_key="k")
+    await reader.start()
+    fake = _FakeClient()
+    reader._client = fake  # type: ignore[assignment]
+    return reader, fake
+
+
 @pytest.mark.asyncio
-async def test_start_without_valkey_url_stays_disconnected() -> None:
-    """No URL configured -- `connected` stays False, `get_queue` returns an empty list."""
-    reader = MusicQueueReader(valkey_url=None)
+async def test_start_without_service_key_stays_disconnected() -> None:
+    """No `SERVICE_API_KEY` -- `connected` stays False, `get_queue` returns an empty snapshot."""
+    reader = MusicQueueReader(hub_api_url="http://hub-api-test.invalid:8204", service_api_key="")
     await reader.start()
     assert reader.connected is False
-    assert await reader.get_queue("1") == []
+    snapshot = await reader.get_queue(1)
+    assert snapshot == QueueSnapshot(
+        community_id=1, now_playing=None, upcoming=[], updated_at=None, stale=False
+    )
     await reader.stop()
 
 
 @pytest.mark.asyncio
-async def test_get_queue_filters_out_played_and_skipped() -> None:
-    """Only `queued`/`playing` statuses surface -- `played`/`skipped` are history, not the queue."""
-    reader = MusicQueueReader(valkey_url="redis://fake", namespace="music_queue_test")
-    items = [
-        {
-            "id": "q1",
-            "track": {
-                "track_id": "t1",
-                "name": "A",
-                "artist": "X",
-                "provider": "youtube",
-                "album_art_url": "",
-                "duration_ms": 1000,
-                "uri": "",
-            },
-            "position": 0,
-            "status": "played",
-            "votes": 0,
-        },
-        {
-            "id": "q2",
-            "track": {
-                "track_id": "t2",
-                "name": "B",
-                "artist": "Y",
-                "provider": "youtube",
-                "album_art_url": "",
-                "duration_ms": 1000,
-                "uri": "",
-            },
-            "position": 1,
-            "status": "skipped",
-            "votes": 0,
-        },
-        {
-            "id": "q3",
-            "track": {
-                "track_id": "t3",
-                "name": "C",
-                "artist": "Z",
-                "provider": "youtube",
-                "album_art_url": "",
-                "duration_ms": 1000,
-                "uri": "",
-            },
-            "position": 2,
-            "status": "queued",
-            "votes": 0,
-        },
-    ]
-    reader._redis = _FakeRedis({"music_queue_test:1:queue": json.dumps(items)})  # type: ignore[attr-defined]
-    reader.connected = True
-
-    tracks = await reader.get_queue("1")
-    assert [t.queue_id for t in tracks] == ["q3"]
-
-
-@pytest.mark.asyncio
-async def test_get_queue_sorts_by_position() -> None:
-    """Out-of-order raw entries are returned sorted by `position`."""
-    reader = MusicQueueReader(valkey_url="redis://fake", namespace="music_queue_test")
-    items = [
-        {
-            "id": "q-second",
-            "track": {
-                "track_id": "t2",
-                "name": "B",
-                "artist": "Y",
-                "provider": "youtube",
-                "album_art_url": "",
-                "duration_ms": 1000,
-                "uri": "",
-            },
-            "position": 1,
-            "status": "queued",
-            "votes": 0,
-        },
-        {
-            "id": "q-first",
-            "track": {
-                "track_id": "t1",
-                "name": "A",
-                "artist": "X",
-                "provider": "spotify",
-                "album_art_url": "",
-                "duration_ms": 1000,
-                "uri": "",
-            },
-            "position": 0,
-            "status": "playing",
-            "votes": 0,
-        },
-    ]
-    reader._redis = _FakeRedis({"music_queue_test:2:queue": json.dumps(items)})  # type: ignore[attr-defined]
-    reader.connected = True
-
-    tracks = await reader.get_queue("2")
-    assert [t.queue_id for t in tracks] == ["q-first", "q-second"]
-
-
-@pytest.mark.asyncio
-async def test_get_queue_handles_missing_key() -> None:
-    """No key in Valkey for this community -- empty queue, not an error."""
-    reader = MusicQueueReader(valkey_url="redis://fake", namespace="music_queue_test")
-    reader._redis = _FakeRedis({})  # type: ignore[attr-defined]
-    reader.connected = True
-
-    assert await reader.get_queue("999") == []
-
-
-@pytest.mark.asyncio
-async def test_get_queue_handles_malformed_json() -> None:
-    """Corrupt JSON at the key -- logged and treated as empty, never a 500."""
-    reader = MusicQueueReader(valkey_url="redis://fake", namespace="music_queue_test")
-    reader._redis = _FakeRedis({"music_queue_test:3:queue": "{not json"})  # type: ignore[attr-defined]
-    reader.connected = True
-
-    assert await reader.get_queue("3") == []
-
-
-@pytest.mark.asyncio
-async def test_start_connects_successfully(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reachable Valkey URL -- `start()` pings it and flips `connected` True."""
-    fake_client = _FakeRedis({})
-
-    class _FakeRedisModule:
-        @staticmethod
-        def from_url(*_args: object, **_kwargs: object) -> _FakeRedis:
-            return fake_client
-
-    monkeypatch.setattr("services.queue_reader.redis_asyncio", _FakeRedisModule())
-    monkeypatch.setattr("services.queue_reader.REDIS_AVAILABLE", True)
-
-    reader = MusicQueueReader(valkey_url="redis://fake:6379/0")
+async def test_start_with_service_key_connects() -> None:
+    reader = MusicQueueReader(hub_api_url="http://hub-api-test.invalid:8204", service_api_key="k")
     await reader.start()
     assert reader.connected is True
     await reader.stop()
 
 
 @pytest.mark.asyncio
-async def test_start_connection_failure_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ping()` raising (broker unreachable) -- `connected` stays False, never crashes startup."""
+async def test_get_queue_maps_dto_and_calls_correct_url_and_headers() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "community_id": 42,
+                    "now_playing": _queue_item(
+                        item_id=1,
+                        status="playing",
+                        title="Song A",
+                        artist="Artist A",
+                        provider="spotify",
+                        external_id="spotify123",
+                        requested_by={"display_name": "viewer1", "platform": "twitch"},
+                    ),
+                    "queue": [
+                        _queue_item(
+                            item_id=2,
+                            status="queued",
+                            title="Song B",
+                            artist="Artist B",
+                            provider="youtube",
+                            external_id="ytABC",
+                            position=1,
+                        )
+                    ],
+                    "updated_at": "2026-09-11T00:00:05Z",
+                },
+                "meta": {"version": 1},
+            },
+        )
+    )
 
-    class _BrokenRedis:
-        async def ping(self) -> bool:
-            raise ConnectionError("no route to host")
+    snapshot = await reader.get_queue(42)
 
-    class _FakeRedisModule:
-        @staticmethod
-        def from_url(*_args: object, **_kwargs: object) -> _BrokenRedis:
-            return _BrokenRedis()
+    assert len(fake.get_calls) == 1
+    call = fake.get_calls[0]
+    assert call["path"] == "/api/v1/internal/music/queue"
+    assert call["params"] == {"community_id": 42}
+    assert call["headers"] == {"X-Service-Key": "k"}
 
-    monkeypatch.setattr("services.queue_reader.redis_asyncio", _FakeRedisModule())
-    monkeypatch.setattr("services.queue_reader.REDIS_AVAILABLE", True)
-
-    reader = MusicQueueReader(valkey_url="redis://fake:6379/0")
-    await reader.start()
-    assert reader.connected is False
+    assert snapshot.stale is False
+    assert snapshot.now_playing is not None
+    assert snapshot.now_playing.queue_id == 1
+    assert snapshot.now_playing.provider == "spotify"
+    assert snapshot.now_playing.external_id == "spotify123"
+    assert snapshot.now_playing.name == "Song A"
+    assert snapshot.now_playing.requested_by is not None
+    assert snapshot.now_playing.requested_by.display_name == "viewer1"
+    assert snapshot.now_playing.requested_by.platform == "twitch"
+    assert len(snapshot.upcoming) == 1
+    assert snapshot.upcoming[0].queue_id == 2
+    assert snapshot.upcoming[0].provider == "youtube"
 
 
 @pytest.mark.asyncio
-async def test_get_queue_read_failure_returns_empty() -> None:
-    """A transient Valkey error on `get()` -- logged and treated as empty, never a 500."""
+async def test_get_queue_handles_null_now_playing_and_empty_queue() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "community_id": 5,
+                    "now_playing": None,
+                    "queue": [],
+                    "updated_at": None,
+                },
+            },
+        )
+    )
+    snapshot = await reader.get_queue(5)
+    assert snapshot.now_playing is None
+    assert snapshot.upcoming == []
+    assert snapshot.stale is False
 
-    class _FlakyRedis:
-        async def get(self, _key: str) -> str:
-            raise TimeoutError("valkey read timed out")
 
-    reader = MusicQueueReader(valkey_url="redis://fake", namespace="music_queue_test")
-    reader._redis = _FlakyRedis()  # type: ignore[attr-defined]
-    reader.connected = True
+@pytest.mark.asyncio
+async def test_get_queue_caches_within_ttl() -> None:
+    """A second call inside `cache_ttl_seconds` doesn't hit the network again."""
+    reader, fake = await _connected_reader()
+    reader.cache_ttl_seconds = 60.0
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {"status": "success", "data": {"now_playing": None, "queue": [], "updated_at": None}},
+        )
+    )
 
-    assert await reader.get_queue("4") == []
+    await reader.get_queue(7)
+    await reader.get_queue(7)
+
+    assert len(fake.get_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_queue_unreachable_returns_stale_cached_value() -> None:
+    """A cached snapshot exists; the next fetch fails -- stale=True, cached data preserved."""
+    reader, fake = await _connected_reader()
+    reader.cache_ttl_seconds = 0.0  # force a real fetch every call
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "now_playing": _queue_item(
+                        item_id=9,
+                        status="playing",
+                        title="Cached Song",
+                        artist="X",
+                        provider="youtube",
+                        external_id="yt9",
+                    ),
+                    "queue": [],
+                    "updated_at": "2026-09-11T00:00:00Z",
+                },
+            },
+        )
+    )
+    first = await reader.get_queue(3)
+    assert first.stale is False
+    assert first.now_playing is not None
+
+    fake.queue_get(httpx.ConnectError("connection refused"))
+    second = await reader.get_queue(3)
+    assert second.stale is True
+    assert second.now_playing is not None
+    assert second.now_playing.queue_id == 9
+
+
+@pytest.mark.asyncio
+async def test_get_queue_unreachable_with_no_cache_returns_empty() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(httpx.ReadTimeout("timed out"))
+
+    snapshot = await reader.get_queue(11)
+
+    assert snapshot.stale is False
+    assert snapshot.now_playing is None
+    assert snapshot.upcoming == []
+
+
+@pytest.mark.asyncio
+async def test_get_queue_non_2xx_treated_as_failure() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(_FakeResponse(401, {"error": "unauthorized"}))
+
+    snapshot = await reader.get_queue(13)
+
+    assert snapshot.now_playing is None
+    assert snapshot.stale is False
+
+
+@pytest.mark.asyncio
+async def test_get_queue_malformed_json_treated_as_failure() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(_FakeResponse(200, ValueError("bad json")))
+
+    snapshot = await reader.get_queue(14)
+
+    assert snapshot.now_playing is None
+    assert snapshot.stale is False
+
+
+@pytest.mark.asyncio
+async def test_get_queue_skips_malformed_upcoming_entries() -> None:
+    """An entry with a missing/non-numeric `id` is skipped, not a crash or a bogus track."""
+    reader, fake = await _connected_reader()
+    fake.queue_get(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "now_playing": None,
+                    "queue": [
+                        {"title": "no id field"},
+                        {"id": "not-an-int"},
+                        _queue_item(
+                            item_id=3,
+                            status="queued",
+                            title="Valid",
+                            artist="X",
+                            provider="youtube",
+                            external_id="yt3",
+                        ),
+                    ],
+                    "updated_at": None,
+                },
+            },
+        )
+    )
+
+    snapshot = await reader.get_queue(16)
+
+    assert len(snapshot.upcoming) == 1
+    assert snapshot.upcoming[0].queue_id == 3
+
+
+@pytest.mark.asyncio
+async def test_get_queue_missing_data_key_treated_as_failure() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_get(_FakeResponse(200, {"status": "success"}))
+
+    snapshot = await reader.get_queue(15)
+
+    assert snapshot.now_playing is None
+
+
+@pytest.mark.asyncio
+async def test_get_queue_not_connected_returns_empty_without_calling() -> None:
+    reader = MusicQueueReader(hub_api_url="http://hub-api-test.invalid:8204", service_api_key="")
+    await reader.start()
+    fake = _FakeClient()
+    reader._client = fake  # type: ignore[assignment]
+
+    snapshot = await reader.get_queue(1)
+
+    assert snapshot.now_playing is None
+    assert fake.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_advance_posts_community_and_item_id_and_returns_advanced_flag() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "now_playing": _queue_item(
+                        item_id=2,
+                        status="playing",
+                        title="Next Song",
+                        artist="Y",
+                        provider="youtube",
+                        external_id="yt2",
+                    ),
+                    "queue": [],
+                    "updated_at": "2026-09-11T00:01:00Z",
+                },
+                "advanced": True,
+            },
+        )
+    )
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is True
+    assert snapshot is not None
+    assert snapshot.now_playing is not None
+    assert snapshot.now_playing.queue_id == 2
+    call = fake.post_calls[0]
+    assert call["path"] == "/api/v1/internal/music/queue/advance"
+    assert call["json"] == {"community_id": 42, "item_id": 1}
+    assert call["headers"] == {"X-Service-Key": "k"}
+
+
+@pytest.mark.asyncio
+async def test_advance_not_current_item_returns_advanced_false_with_snapshot() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(
+        _FakeResponse(
+            200,
+            {
+                "status": "success",
+                "data": {"now_playing": None, "queue": [], "updated_at": None},
+                "advanced": False,
+            },
+        )
+    )
+
+    advanced, snapshot = await reader.advance(42, 999)
+
+    assert advanced is False
+    assert snapshot is not None
+
+
+@pytest.mark.asyncio
+async def test_advance_unreachable_returns_false_none() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(httpx.ConnectError("connection refused"))
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is False
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_advance_non_2xx_returns_false_none() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(_FakeResponse(404, {"error": "not found"}))
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is False
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_advance_malformed_json_returns_false_none() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(_FakeResponse(200, ValueError("bad json")))
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is False
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_advance_missing_data_key_returns_false_none() -> None:
+    reader, fake = await _connected_reader()
+    fake.queue_post(_FakeResponse(200, {"status": "success", "advanced": False}))
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is False
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_advance_not_connected_returns_false_none_without_calling() -> None:
+    reader = MusicQueueReader(hub_api_url="http://hub-api-test.invalid:8204", service_api_key="")
+    await reader.start()
+    fake = _FakeClient()
+    reader._client = fake  # type: ignore[assignment]
+
+    advanced, snapshot = await reader.advance(42, 1)
+
+    assert advanced is False
+    assert snapshot is None
+    assert fake.post_calls == []

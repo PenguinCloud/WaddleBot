@@ -65,12 +65,15 @@ here):
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from quart import Quart
 from quart_schema import QuartSchema
 
+import blueprints.v1.community_music_queue as community_music_queue_module
 from blueprints.v1.community_music_queue import music_queue_bp
 from config import HubAPIConfig
 from services.music_providers.track import Track
@@ -119,19 +122,39 @@ def client(app: Quart) -> Any:
 @pytest.fixture
 def fake_resolve(monkeypatch: Any) -> None:
     """Deterministic stand-in for the real, network-calling `resolve()` -- see module docstring."""
+    _set_fake_resolve(monkeypatch)
+
+
+def _set_fake_resolve(
+    monkeypatch: Any, *, track_provider: str = "youtube", labels: tuple[str, ...] = ()
+) -> None:
+    """Same fake `resolve()` as the `fake_resolve` fixture, with configurable provider/labels.
+
+    Used directly (not as a fixture) by `TestYoutubeLabelGate` (gh-313),
+    which needs a different `Track.labels`/`provider` per test case.
+    """
 
     async def _fake(url_or_query: str, provider: str | None = None) -> Track:
         return Track(
-            provider=provider or "youtube",
+            provider=provider or track_provider,
             external_id=url_or_query,
             title=f"Track for {url_or_query}",
             artist="Test Artist",
             duration_ms=210000,
             artwork_url=None,
             url=url_or_query,
+            labels=labels,
         )
 
     monkeypatch.setattr("services.community_music_queue_service.resolve", _fake)
+
+
+@pytest.fixture(autouse=True)
+def _youtube_labels_flag_default_on(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Default the `waddles.social.music.youtube_labels` flag ON for this file's tests (gh-313)."""
+    stub = AsyncMock(return_value=True)
+    monkeypatch.setattr(community_music_queue_module, "feature_enabled", stub)
+    return stub
 
 
 def _tenant_id(db: Any) -> int:
@@ -270,6 +293,108 @@ class TestPolicy:
             f"/api/v1/admin/{community_id}/music-station/policy", headers=headers, json={}
         )
         assert response.status_code == 400
+
+    # regression: gh-313
+
+    async def test_get_policy_default_youtube_allowed_labels_is_empty(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        response = await client.get(
+            f"/api/v1/admin/{community_id}/music-station/policy", headers=headers
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["policy"]["youtubeAllowedLabels"] == []
+
+    async def test_set_policy_youtube_allowed_labels_round_trip_normalizes(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        response = await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": [" Music ", "MUSIC", "Gaming"]},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        # Trimmed, lowercased, de-duplicated, order of first appearance kept.
+        assert body["policy"]["youtubeAllowedLabels"] == ["music", "gaming"]
+
+        get_response = await client.get(
+            f"/api/v1/admin/{community_id}/music-station/policy", headers=headers
+        )
+        get_body = await get_response.get_json()
+        assert get_body["policy"]["youtubeAllowedLabels"] == ["music", "gaming"]
+
+    async def test_set_policy_youtube_allowed_labels_clear_with_empty_list(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": ["music"]},
+        )
+        response = await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": []},
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["policy"]["youtubeAllowedLabels"] == []
+
+    async def test_set_policy_youtube_allowed_labels_too_many_is_400(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        response = await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": [f"label{i}" for i in range(33)]},
+        )
+        assert response.status_code == 400
+        body = await response.get_json()
+        assert body["error"]["message"] == "youtube-labels: up to 32 labels, 64 chars each"
+
+    async def test_set_policy_youtube_allowed_labels_too_long_entry_is_400(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        response = await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": ["a" * 65]},
+        )
+        assert response.status_code == 400
+        body = await response.get_json()
+        assert body["error"]["message"] == "youtube-labels: up to 32 labels, 64 chars each"
+
+    async def test_get_policy_invalid_json_column_returns_empty_list(
+        self, client: Any, music_station_db: Any
+    ) -> None:
+        """A corrupted/legacy `youtube_allowed_labels` value degrades to `[]`, never a 500."""
+        community_id = _seed_community(music_station_db)
+        headers = _admin_headers(music_station_db, community_id=community_id)
+        # Create the default row first.
+        await client.get(f"/api/v1/admin/{community_id}/music-station/policy", headers=headers)
+        music_station_db.dal(music_station_db.dal.music_policy.community_id == community_id).update(
+            youtube_allowed_labels="not valid json"
+        )
+        music_station_db.dal.commit()
+
+        response = await client.get(
+            f"/api/v1/admin/{community_id}/music-station/policy", headers=headers
+        )
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["policy"]["youtubeAllowedLabels"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +536,141 @@ class TestEnqueueRequest:
             json={"urlOrQuery": "   "},
         )
         assert response.status_code == 400
+
+
+class TestYoutubeLabelGate:
+    """gh-313: `youtube_allowed_labels` community allowlist enforcement on enqueue."""
+
+    async def _set_allowed_labels(
+        self, client: Any, headers: dict[str, str], community_id: int, labels: list[str]
+    ) -> None:
+        response = await client.put(
+            f"/api/v1/admin/{community_id}/music-station/policy",
+            headers=headers,
+            json={"youtubeAllowedLabels": labels},
+        )
+        assert response.status_code == 200
+
+    async def test_empty_allowlist_accepts_any_youtube_track(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        headers = _member_headers(music_station_db, community_id=community_id)
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 201
+
+    async def test_exact_label_match_accepts(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("music", "comedy"))
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["music"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 201
+
+    async def test_whole_word_match_in_multiword_label_accepts(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        """Allowed `"music"` matches multi-word track label `"rock music"` as a whole word."""
+        _set_fake_resolve(monkeypatch, labels=("rock music",))
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["music"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 201
+
+    async def test_substring_without_word_boundary_does_not_match(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        """`"music"` inside `"musical"` is a substring, not a whole word -- must reject."""
+        _set_fake_resolve(monkeypatch, labels=("musical",))
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["music"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 422
+        body = await response.get_json()
+        assert body["error"]["code"] == "youtube_label_not_allowed"
+
+    async def test_no_match_rejected_with_code_and_exact_message(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["a", "b", "c"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 422
+        body = await response.get_json()
+        assert body["error"]["code"] == "youtube_label_not_allowed"
+        assert body["error"]["message"] == "that video isn't allowed here (allowed: a, b, c)"
+
+    async def test_spotify_track_bypasses_label_gate(
+        self, client: Any, music_station_db: Any, monkeypatch: Any
+    ) -> None:
+        _set_fake_resolve(monkeypatch, track_provider="spotify", labels=())
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["music"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://open.spotify.com/track/abc123"},
+        )
+        assert response.status_code == 201
+
+    async def test_flag_off_bypasses_label_gate(
+        self,
+        client: Any,
+        music_station_db: Any,
+        monkeypatch: Any,
+        _youtube_labels_flag_default_on: AsyncMock,
+    ) -> None:
+        _youtube_labels_flag_default_on.return_value = False
+        _set_fake_resolve(monkeypatch, labels=("comedy",))
+        community_id = _seed_community(music_station_db)
+        admin_headers = _admin_headers(music_station_db, community_id=community_id, user_id=1)
+        member_headers = _member_headers(music_station_db, community_id=community_id, user_id=2)
+        await self._set_allowed_labels(client, admin_headers, community_id, ["music"])
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=member_headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=abc123"},
+        )
+        assert response.status_code == 201
 
 
 class TestEnqueuePlaylist:
@@ -693,3 +953,86 @@ class TestCrossTenantIsolation:
             f"/api/v1/admin/{community_id}/music-station/queue", headers=headers
         )
         assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Regression: eta_seconds naive started_at
+# ---------------------------------------------------------------------------
+
+
+class TestEtaSecondsNaiveStartedAt:
+    async def test_enqueue_with_playing_row_computes_sane_eta(
+        self, client: Any, music_station_db: Any, fake_resolve: None
+    ) -> None:
+        """# regression: eta naive started_at.
+
+        `pydal` returns a NAIVE `datetime` on read even for a value
+        written via `datetime.now(UTC)` (aware) -- `_compute_eta_seconds()`
+        used to subtract that naive `started_at` straight from
+        `datetime.now(UTC)`, raising `TypeError: can't subtract
+        offset-naive and offset-aware datetimes` any time a `playing` row
+        existed. Seeds one `playing` row (~50s into a 200s track) and one
+        `queued` row ahead of the new request (a 100s track) -- the new
+        item's `etaSeconds` must be the playing row's remaining time
+        (~150s) plus the queued-ahead track's full duration (100s), never
+        a 500.
+        """
+        community_id = _seed_community(music_station_db)
+        tenant_id = _tenant_id(music_station_db)
+        headers = _member_headers(music_station_db, community_id=community_id)
+
+        playing_track_id = music_station_db.dal.music_tracks.insert(
+            tenant_id=tenant_id,
+            provider="youtube",
+            external_id="now-playing",
+            title="Now Playing",
+            artist="Artist",
+            duration_ms=200_000,
+            artwork_url=None,
+            url="https://www.youtube.com/watch?v=nowplaying",
+            created_at=datetime.now(UTC),
+        )
+        queued_track_id = music_station_db.dal.music_tracks.insert(
+            tenant_id=tenant_id,
+            provider="youtube",
+            external_id="queued-ahead",
+            title="Queued Ahead",
+            artist="Artist",
+            duration_ms=100_000,
+            artwork_url=None,
+            url="https://www.youtube.com/watch?v=queuedahead",
+            created_at=datetime.now(UTC),
+        )
+        music_station_db.dal.music_station_queue.insert(
+            tenant_id=tenant_id,
+            community_id=community_id,
+            track_id=playing_track_id,
+            position=0,
+            status="playing",
+            source="request",
+            added_at=datetime.now(UTC) - timedelta(seconds=50),
+            started_at=datetime.now(UTC) - timedelta(seconds=50),
+        )
+        music_station_db.dal.music_station_queue.insert(
+            tenant_id=tenant_id,
+            community_id=community_id,
+            track_id=queued_track_id,
+            position=1,
+            status="queued",
+            source="request",
+            added_at=datetime.now(UTC),
+        )
+        music_station_db.dal.commit()
+
+        response = await client.post(
+            f"/api/v1/admin/{community_id}/music-station/queue/requests",
+            headers=headers,
+            json={"urlOrQuery": "https://www.youtube.com/watch?v=newrequest"},
+        )
+
+        assert response.status_code == 201
+        body = await response.get_json()
+        eta_seconds = body["item"]["etaSeconds"]
+        # ~150s remaining on the playing track + 100s queued ahead == ~250s;
+        # generous tolerance absorbs normal test-execution wall-clock drift.
+        assert 200 <= eta_seconds <= 255

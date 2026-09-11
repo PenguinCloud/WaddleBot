@@ -62,6 +62,8 @@ export const publicApi = {
   getStreamDetails: (entityId) => api.get(`/api/v1/public/streams/${entityId}`),
   getSignupSettings: () => api.get('/api/v1/signup-settings'),
   getBanner: () => api.get('/api/v1/public/banner'),
+  // Public song-queue page (no auth required) -- chat users land here via !sq
+  getMusicQueue: (communityId) => api.get(`/api/v1/public/communities/${communityId}/music-station/queue`),
 };
 
 export const communityApi = {
@@ -377,6 +379,14 @@ export const adminApi = {
     api.get(`/api/v1/admin/${communityId}/music/dashboard`),
   controlPlayback: (communityId, action) =>
     api.post(`/api/v1/admin/${communityId}/music/playback/control`, { action }),
+  // Moderation from the public queue page (admin/moderator only, server-enforced)
+  removeMusicQueueItem: (communityId, itemId) =>
+    api.delete(`/api/v1/admin/${communityId}/music-station/queue/${itemId}`),
+  // Music Station policy (YouTube allowed labels, etc.)
+  getMusicStationPolicy: (communityId) =>
+    api.get(`/api/v1/admin/${communityId}/music-station/policy`),
+  updateMusicStationPolicy: (communityId, policy) =>
+    api.put(`/api/v1/admin/${communityId}/music-station/policy`, policy),
 
   // Calendar Events
   getCalendarEvents: (communityId, params) =>
