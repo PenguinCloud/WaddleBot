@@ -537,8 +537,14 @@ jobs:
           profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -camera-back emulated -camera-front emulated -accel on
           disable-animations: true
+          # Fix round 3: reactivecircus/android-emulator-runner executes `script:` via
+          # /usr/bin/sh (dash), not bash -- `set -o pipefail` is a bash-only extension dash
+          # doesn't recognize ("Illegal option -o pipefail"), unlike the plain `run:` steps
+          # elsewhere in this job/file which do run under bash. Use POSIX `set -eu` only;
+          # pipefail isn't actually needed here since both piped commands below are verified
+          # afterward by grepping their captured log file, not by the pipe's own exit status.
           script: |
-            set -euo pipefail
+            set -eu
             adb install -r mobile/gazer/build/app/outputs/flutter-apk/app-debug.apk
             adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
             adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
