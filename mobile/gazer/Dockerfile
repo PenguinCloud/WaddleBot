@@ -160,7 +160,15 @@ RUN sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" \
       "build-tools;36.0.0" \
       "ndk;28.2.13676358" \
       "platform-tools" \
-      "cmake;3.22.1"
+      "cmake;3.22.1" \
+      "system-images;android-34;google_apis;x86_64" \
+      "emulator"
+
+# python3 is needed at test-runtime by scripts/decode_screenshots.py (Task 21) --
+# verify rather than assume Ubuntu 24.04's base image ships it (it does, from the
+# apt-get layer above, but confirm here so a base-image change fails the build
+# loudly instead of failing opaquely inside a later mobile-test-integration run).
+RUN python3 --version
 
 # --- Switch to appuser before any flutter invocation ------------------------
 # /opt/flutter is chown'd to appuser (above); git refuses to operate inside a
