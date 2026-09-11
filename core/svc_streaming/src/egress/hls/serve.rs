@@ -128,7 +128,22 @@ async fn list_pipelines(
         .into_iter()
         .map(|p| PipelineListingEntry {
             id: p.id,
-            url: format!("/live/{community_id}/{}/{}/master.m3u8", p.id, p.profile),
+            // Points at the *media* playlist, not `master.m3u8`: for this
+            // MVP's single-profile-per-pipeline output, ffmpeg writes
+            // `master.m3u8`'s `#EXT-X-STREAM-INF` line only once it knows
+            // its own stream parameters, which (for a single fmp4 HLS
+            // output) never happens -- the file stays header-only forever
+            // and hls.js has nothing to play. `index.m3u8` is always
+            // complete and playable directly. `serve_file` additionally
+            // synthesizes a valid master on request (see
+            // `synthesize_master_playlist`) so a `master.m3u8` URL built
+            // from an older client/cached response still works.
+            url: format!(
+                "/live/{community_id}/{}/{}/{}",
+                p.id,
+                p.profile,
+                output::MEDIA_PLAYLIST_NAME
+            ),
             profile: p.profile,
             started_at: p.started_at,
         })
@@ -149,6 +164,48 @@ fn content_type_for(filename: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// `BANDWIDTH` (bits/sec) advertised in a synthesized master playlist's
+/// `#EXT-X-STREAM-INF` line. This service's disk layout carries no
+/// per-profile bitrate at the file-serving layer -- `serve_file` is a pure
+/// filesystem read keyed only by path segments (see this module's doc
+/// comment), never consulting the `TranscodeProfile`/`VideoCodec`
+/// `bitrate_kbps` config that produced the running pipeline -- so this
+/// fallback is always what gets advertised for now; RESOLUTION is omitted
+/// entirely for the same reason (never known at this layer).
+const DEFAULT_MASTER_BANDWIDTH_BPS: u32 = 2_000_000;
+
+/// If `body` (an on-disk `master.m3u8`, read as bytes) is missing an
+/// `#EXT-X-STREAM-INF` line, returns a synthesized replacement referencing
+/// [`output::MEDIA_PLAYLIST_NAME`] in the same directory; `None` if `body`
+/// already declares a variant (or isn't valid UTF-8 text), in which case
+/// the caller serves it verbatim.
+///
+/// Why this is needed: `ffmpeg -master_pl_name master.m3u8` writes that
+/// file once, at HLS-muxer-init time, before the first frame is fully
+/// analyzed -- for this MVP's single fmp4 HLS output per pipeline, it is
+/// *never rewritten*, so it stays permanently header-only
+/// (`#EXTM3U\n#EXT-X-VERSION:7\n`) and no HLS.js player has a variant to
+/// select. `index.m3u8`, the media playlist, is complete and playable the
+/// entire time. This keeps `master.m3u8` URLs (already-cached client
+/// responses, external links) working without waiting on a future
+/// multi-profile ladder to make ffmpeg's own master playlist meaningful.
+fn maybe_synthesize_master_playlist(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    if text
+        .lines()
+        .any(|line| line.starts_with("#EXT-X-STREAM-INF"))
+    {
+        return None;
+    }
+    Some(
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH={DEFAULT_MASTER_BANDWIDTH_BPS}\n{}\n",
+            output::MEDIA_PLAYLIST_NAME
+        )
+        .into_bytes(),
+    )
 }
 
 async fn serve_file(
@@ -174,7 +231,13 @@ async fn serve_file(
     let path = dir.join(&filename);
     let resolved = resolve_safe_path(&dir, &path).await?;
 
-    let bytes = tokio::fs::read(&resolved).await.map_err(|_| not_found())?;
+    let mut bytes = tokio::fs::read(&resolved).await.map_err(|_| not_found())?;
+
+    if filename == output::MASTER_PLAYLIST_NAME {
+        if let Some(synthesized) = maybe_synthesize_master_playlist(&bytes) {
+            bytes = synthesized;
+        }
+    }
 
     let cache_control = if filename.ends_with(".m3u8") {
         "no-cache"
@@ -287,7 +350,7 @@ mod tests {
         assert!(pipelines[0]["url"]
             .as_str()
             .unwrap()
-            .ends_with(&format!("/{pipeline_id}/1080p60/master.m3u8")));
+            .ends_with(&format!("/{pipeline_id}/1080p60/index.m3u8")));
     }
 
     #[tokio::test]
@@ -341,7 +404,7 @@ mod tests {
         assert_eq!(entry["profile"], "1080p60");
         assert_eq!(
             entry["url"],
-            format!("/live/community-1/{pipeline_id}/1080p60/master.m3u8")
+            format!("/live/community-1/{pipeline_id}/1080p60/index.m3u8")
         );
         assert!(entry["started_at"].as_str().is_some());
     }
@@ -410,8 +473,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A `master.m3u8` that already declares a variant (`#EXT-X-STREAM-INF`
+    /// present) -- e.g. a future multi-profile ladder ffmpeg rewrote after
+    /// analyzing its inputs -- must be served exactly as-is, not
+    /// resynthesized.
     #[tokio::test]
-    async fn serve_existing_playlist_has_correct_headers_and_body() {
+    async fn serve_complete_master_playlist_is_passed_through_verbatim() {
         let data_dir =
             std::env::temp_dir().join(format!("svc-streaming-hls-serve-{}", Uuid::new_v4()));
         let pipeline_id = Uuid::new_v4();
@@ -419,7 +486,9 @@ mod tests {
             .join(pipeline_id.to_string())
             .join("prof1");
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("master.m3u8"), b"#EXTM3U\n")
+        let complete_master =
+            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4500000\nindex.m3u8\n".to_vec();
+        tokio::fs::write(dir.join("master.m3u8"), &complete_master)
             .await
             .unwrap();
 
@@ -443,9 +512,77 @@ mod tests {
         );
         assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"#EXTM3U\n");
+        assert_eq!(&body[..], &complete_master[..]);
 
         tokio::fs::remove_dir_all(&data_dir).await.ok();
+    }
+
+    /// A `master.m3u8` ffmpeg wrote header-only (no `#EXT-X-STREAM-INF`) --
+    /// this module's doc comment on `maybe_synthesize_master_playlist`
+    /// explains why this is the steady state for a single-profile pipeline
+    /// -- must be resynthesized into a playable master referencing the
+    /// media playlist, not served as the unplayable two-line stub.
+    #[tokio::test]
+    async fn serve_header_only_master_playlist_is_synthesized() {
+        let data_dir =
+            std::env::temp_dir().join(format!("svc-streaming-hls-serve-{}", Uuid::new_v4()));
+        let pipeline_id = Uuid::new_v4();
+        let dir = output::hls_root(&data_dir)
+            .join(pipeline_id.to_string())
+            .join("prof1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("master.m3u8"), b"#EXTM3U\n#EXT-X-VERSION:7\n")
+            .await
+            .unwrap();
+
+        let app = hls_router(HlsRouterState::new(
+            data_dir.clone(),
+            Arc::new(FakeRegistry(vec![])),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/live/c1/{pipeline_id}/prof1/master.m3u8"))
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.starts_with("#EXTM3U\n"));
+        assert!(text.contains("#EXT-X-STREAM-INF:BANDWIDTH=2000000"));
+        assert!(text.trim_end().ends_with("index.m3u8"));
+
+        tokio::fs::remove_dir_all(&data_dir).await.ok();
+    }
+
+    #[test]
+    fn maybe_synthesize_master_playlist_leaves_variant_playlists_untouched() {
+        let complete = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nindex.m3u8\n";
+        assert!(maybe_synthesize_master_playlist(complete).is_none());
+    }
+
+    #[test]
+    fn maybe_synthesize_master_playlist_replaces_header_only_files() {
+        let header_only = b"#EXTM3U\n#EXT-X-VERSION:7\n";
+        let synthesized = maybe_synthesize_master_playlist(header_only)
+            .expect("header-only master must be synthesized");
+        let text = String::from_utf8(synthesized).unwrap();
+        assert!(text.contains("#EXT-X-STREAM-INF:BANDWIDTH=2000000"));
+        assert!(text.trim_end().ends_with("index.m3u8"));
+    }
+
+    #[test]
+    fn maybe_synthesize_master_playlist_ignores_non_utf8_bytes() {
+        let invalid = [0xFFu8, 0xFE, 0x00];
+        assert!(maybe_synthesize_master_playlist(&invalid).is_none());
     }
 
     #[tokio::test]

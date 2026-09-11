@@ -470,7 +470,7 @@ async fn rtmp_publish_starts_a_transcoded_pipeline_and_hls_lists_it() {
     let entry = &pipelines[0];
     assert_eq!(entry["id"], pipeline_id.to_string());
     assert_eq!(entry["profile"], "default");
-    let expected_url = format!("/live/{COMMUNITY_ID}/{pipeline_id}/default/master.m3u8");
+    let expected_url = format!("/live/{COMMUNITY_ID}/{pipeline_id}/default/index.m3u8");
     assert_eq!(entry["url"], expected_url);
     assert!(
         entry["started_at"].as_str().is_some(),

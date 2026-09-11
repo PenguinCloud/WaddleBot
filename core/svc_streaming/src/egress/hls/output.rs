@@ -19,8 +19,13 @@ const PLAYLIST_WINDOW_SEGMENTS: &str = "6";
 /// LL-HLS partial-segment duration (`-hls_part_time`), seconds.
 const LL_PART_TIME_SECONDS: &str = "0.5";
 
-const MASTER_PLAYLIST_NAME: &str = "master.m3u8";
-const MEDIA_PLAYLIST_NAME: &str = "index.m3u8";
+/// `pub(crate)` (not private) -- `super::serve` needs both names: to point
+/// the `GET /live/{community_id}` listing at the always-playable media
+/// playlist, and to detect+synthesize a `master.m3u8` request against an
+/// on-disk file ffmpeg wrote before it knew its own stream parameters (see
+/// `serve::synthesize_master_playlist`'s doc comment).
+pub(crate) const MASTER_PLAYLIST_NAME: &str = "master.m3u8";
+pub(crate) const MEDIA_PLAYLIST_NAME: &str = "index.m3u8";
 const INIT_SEGMENT_NAME: &str = "init.mp4";
 const SEGMENT_FILENAME_PATTERN: &str = "segment_%05d.m4s";
 
