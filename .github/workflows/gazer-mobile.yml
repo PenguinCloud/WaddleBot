@@ -526,7 +526,18 @@ jobs:
 
       - name: Pre-build debug APK (installed inside the emulator step, after the AVD boots)
         working-directory: mobile/gazer
-        run: flutter build apk --debug --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture
+        # --target makes this the integration test's own entrypoint APK, so the emulator step can
+        # hand it straight to `flutter drive --use-application-binary` instead of letting drive
+        # build one. That indirection is load-bearing, not a shortcut: R23 activates Gradle
+        # dependency locking on :app's debug/profile/release {Runtime,Compile}Classpath, and a lock
+        # is strict in both directions. `flutter build apk` resolves all three
+        # io.flutter:{armeabi_v7a,arm64_v8a,x86_64}_debug ABI artifacts and satisfies the lock,
+        # but `flutter drive`/`flutter run` pass -Ptarget-platform=android-x64 for the attached
+        # emulator, so the two arm artifacts never resolve and Gradle fails :app:mergeDebugAssets
+        # with "Did not resolve io.flutter:armeabi_v7a_debug:... which is part of the dependency
+        # lock state" (CI run 34613733371). Building here keeps the lock intact -- relaxing it to
+        # LENIENT would disarm the osv-scanner Gradle gate R16/R23 exist to feed.
+        run: flutter build apk --debug --target=integration_test/go_live_unreachable_test.dart --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture
 
       - name: Run integration_test + connectedDebugAndroidTest on emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
@@ -558,12 +569,15 @@ jobs:
           # mobile/gazer/test_driver/integration_test.dart.
           # dash has no `pipefail`, so each pipeline runs under an explicit `bash -eo pipefail`:
           # flutter's/gradle's own exit status gates the step instead of tee's.
+          # Fix round 5: `--use-application-binary` runs the APK the pre-build step already
+          # produced rather than letting drive build a single-ABI one that breaks R23's Gradle
+          # dependency lock -- see that step's comment for the full reasoning.
           working-directory: mobile/gazer
           script: |
             adb install -r build/app/outputs/flutter-apk/app-debug.apk
             adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
             adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
-            bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart -d emulator-5554 --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
+            bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk -d emulator-5554 --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
             grep -qE '\+[1-9][0-9]*' /tmp/flutter_integration.log
             python3 scripts/decode_screenshots.py
             bash -eo pipefail -c "cd android && ./gradlew connectedDebugAndroidTest 2>&1 | tee /tmp/gradle_connected.log"

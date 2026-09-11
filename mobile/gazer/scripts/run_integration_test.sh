@@ -35,7 +35,18 @@ while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1
   sleep 2
 done
 
-flutter build apk --debug --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE"
+# --target builds the integration test's own entrypoint into the APK, and
+# `flutter drive --use-application-binary` below then runs exactly this APK.
+# That is required, not cosmetic: R23 locks :app's debug/profile/release
+# {Runtime,Compile}Classpath, and a Gradle lock is strict both ways. `flutter
+# build apk` resolves all three io.flutter:{armeabi_v7a,arm64_v8a,x86_64}_debug
+# artifacts and satisfies the lock; `flutter drive` on its own passes
+# -Ptarget-platform=android-x64 for the attached emulator, leaving the two arm
+# artifacts unresolved and failing :app:mergeDebugAssets with "Did not resolve
+# ... which is part of the dependency lock state".
+flutter build apk --debug \
+  --target=integration_test/go_live_unreachable_test.dart \
+  --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE"
 adb install -r build/app/outputs/flutter-apk/app-debug.apk
 adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
 adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
@@ -48,6 +59,7 @@ adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
 flutter drive \
   --driver=test_driver/integration_test.dart \
   --target=integration_test/go_live_unreachable_test.dart \
+  --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk \
   -d emulator-5554 \
   --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE" \
   | tee /tmp/integration_test.log
