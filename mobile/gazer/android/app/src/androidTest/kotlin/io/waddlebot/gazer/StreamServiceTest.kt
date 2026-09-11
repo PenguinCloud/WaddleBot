@@ -8,6 +8,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
 import androidx.test.rule.ServiceTestRule
 import io.waddlebot.gazer.pipeline.StreamService
+import io.waddlebot.gazer.pipeline.buildStopPendingIntent
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -57,12 +58,14 @@ class StreamServiceTest {
             }
         assertTrue("expected an active notification after start", hasNotification)
 
-        // The real Stop trigger: the notification's own action (and any other Stop UI) broadcasts
-        // ACTION_STOP, which stopReceiver handles by stopping the pipeline, removing the
-        // foreground notification, and calling stopSelf() to destroy the service - exercised here
-        // via sendBroadcast rather than a direct stopService()/unbindService() call, since that's
-        // the actual path production code takes.
-        context.sendBroadcast(Intent(StreamService.ACTION_STOP).setPackage(context.packageName))
+        // The real Stop trigger: the notification's own action (and any other Stop UI) sends the
+        // exact PendingIntent buildStopPendingIntent builds for the notification - not a hand-built
+        // broadcast, since a test that constructs its own Intent(ACTION_STOP).setPackage(...) can
+        // pass while buildStopPendingIntent's own setPackage call regresses (item 3, 7c review):
+        // this pins both the package and the delivery path that the notification's Stop action
+        // actually takes to reach stopReceiver, which stops the pipeline, removes the foreground
+        // notification, and calls stopSelf() to destroy the service.
+        buildStopPendingIntent(context)!!.send()
 
         // stopForeground(STOP_FOREGROUND_REMOVE) removes the notification synchronously with the
         // broadcast receipt, before the asynchronous stopSelf()-driven onDestroy() completes, so
