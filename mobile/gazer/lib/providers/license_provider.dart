@@ -5,6 +5,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/constants.dart';
+import '../config/debug_overrides.dart';
 import '../models/license_state.dart';
 import '../services/device_id.dart';
 import '../services/feature_flags.dart';
@@ -37,8 +38,25 @@ Future<LicenseClient> licenseClient(Ref ref) async {
 /// what refreshes staleness while foregrounded.
 @Riverpod(keepAlive: true)
 Future<LicenseState> license(Ref ref) async {
-  final client = await ref.watch(licenseClientProvider.future);
-  return client.validateAndFetchFlags();
+  final LicenseClient client = await ref.watch(licenseClientProvider.future);
+  final LicenseState fetched = await client.validateAndFetchFlags();
+
+  if (!DebugOverrides.enabled) {
+    return fetched;
+  }
+
+  // Debug-only: force the M1 flags ON so integration tests and local dev
+  // don't depend on a reachable license.penguintech.io. Never runs in a
+  // release build — DebugOverrides.enabled requires kDebugMode.
+  final Map<String, bool> overridden = <String, bool>{...fetched.flags};
+  for (final String key in DebugOverrides.flags) {
+    overridden[key] = true;
+  }
+  return fetched.copyWith(
+    status: LicenseStatus.valid,
+    flags: overridden,
+    lastFetched: DateTime.now(),
+  );
 }
 
 /// Read-only view over [license] for flag checks; never throws — while
