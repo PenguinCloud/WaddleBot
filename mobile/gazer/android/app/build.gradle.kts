@@ -232,6 +232,24 @@ tasks.register<JacocoReport>("jacocoTestReport") {
             // classDirectories.files.map{fileTree(it){...}} would re-wrap already-resolved leaf
             // .class files instead of directories and silently produce an empty report.)
             "**/pipeline/RootEncoderEngine.class",
+            // Why (controller ruling R29, Task 20): StreamService's Service lifecycle callbacks
+            // (onCreate/onStartCommand/onDestroy/onBind) call real Context methods
+            // (getSystemService, registerReceiver, startForeground, NotificationCompat.Builder.
+            // build()) that NPE on the JVM unit-test target because attachBaseContext is never
+            // invoked outside Robolectric/instrumentation -- confirmed empirically, not assumed.
+            // This project does not adopt Robolectric (its vendored-plugin tests are already
+            // disabled here for Java 17 incompatibility), so these callbacks structurally cannot
+            // be unit-tested. Constraint: StreamService MUST stay a thin lifecycle shell that
+            // delegates every real decision to already-unit-tested helpers (WakeLockController,
+            // buildNotificationChannel/registerNotificationChannel/buildStopPendingIntent,
+            // isStopAction, foregroundServiceType, buildStreamPipeline, GazerFlutterBindings) --
+            // its actual behavior is covered by the instrumented StreamServiceTest in CI's
+            // emulator job (Task 21), just not by this JVM-only gate. Narrow, single class +
+            // its synthetic inner classes, documented, not a blanket exclusion -- any logic added
+            // to StreamService itself later must be extracted into a unit-tested helper instead
+            // of widening this exclusion.
+            "**/pipeline/StreamService.class",
+            "**/pipeline/StreamService\$*.class",
         )
     val debugTree =
         fileTree("${layout.buildDirectory.get()}/tmp/kotlin-classes/debug") {
