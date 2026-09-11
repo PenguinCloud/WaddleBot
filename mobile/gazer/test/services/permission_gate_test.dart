@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gazer/services/permission_gate.dart';
 import 'package:mocktail/mocktail.dart';
@@ -123,5 +124,25 @@ void main() {
         verify(() => platform.requestPermissions(captureAny())).captured.single
             as List<Permission>;
     expect(requested, isNot(contains(Permission.notification)));
+  });
+
+  test('requestPermissions throwing PlatformException -> PermissionOutcome.denied, never rethrows', () async {
+    when(() => platform.requestPermissions(any()))
+        .thenThrow(PlatformException(code: 'x'));
+
+    final result = await buildGate(sdkInt: 30).ensureLivePermissions();
+
+    expect(result, PermissionOutcome.denied);
+  });
+
+  test('sdkInt throwing -> PermissionOutcome.denied, never rethrows, and never calls requestPermissions', () async {
+    final gate = PermissionHandlerGate(
+      sdkInt: () async => throw StateError('device_info_plus unavailable'),
+    );
+
+    final result = await gate.ensureLivePermissions();
+
+    expect(result, PermissionOutcome.denied);
+    verifyNever(() => platform.requestPermissions(any()));
   });
 }
