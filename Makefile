@@ -185,3 +185,15 @@ mobile-clean:
 # framework's own exit code says pass.
 mobile-telemetry-check:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test test/telemetry/otlp_sink_test.dart 2>&1 | tee /tmp/gazer-telemetry-check.log; grep -E 'telemetry sink received: logs=[1-9][0-9]* metrics=[1-9][0-9]* histograms=[1-9][0-9]* spans=[1-9][0-9]*' /tmp/gazer-telemetry-check.log"
+
+seed-mock-data-mobile: ## Launch Gazer with the mock target/quality preset seeded (debug only; needs an already-running emulator/device - interactive, not CI-safe/headless)
+	@echo "NOTE: attaches to whatever device/emulator is already running - start one first (e.g. run mobile/gazer/scripts/run_integration_test.sh's boot steps by hand, or launch an AVD from Android Studio). This cannot run headless or in CI; make mobile-test-integration already covers automated seeded coverage via --dart-define."
+	docker run --rm -it \
+		--network host \
+		--user $(shell id -u):$(shell id -g) \
+		-v $(PWD)/mobile/gazer:/work \
+		-v gazer-pub-cache:/home/appuser/.pub-cache \
+		-v gazer-gradle:/home/appuser/.gradle \
+		-w /work \
+		gazer-toolchain:3.47.2 \
+		flutter run --dart-define=GAZER_SEED=true
