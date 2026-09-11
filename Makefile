@@ -197,3 +197,18 @@ seed-mock-data-mobile: ## Launch Gazer with the mock target/quality preset seede
 		-w /work \
 		gazer-toolchain:3.47.2 \
 		flutter run --dart-define=GAZER_SEED=true
+
+mobile-screenshots: ## Capture the docs/screenshots/gazer/ marketing set from seeded phone + tablet emulators (needs /dev/kvm)
+	@test -e /dev/kvm || { echo "ERROR: /dev/kvm not present - screenshot capture requires KVM"; exit 1; }
+	docker run --rm \
+		--device /dev/kvm \
+		--group-add "$(shell stat -c '%g' /dev/kvm)" \
+		--network host \
+		--user $(shell id -u):$(shell id -g) \
+		-v $(PWD)/mobile/gazer:/work \
+		-v gazer-pub-cache:/home/appuser/.pub-cache \
+		-v gazer-gradle:/home/appuser/.gradle \
+		-w /work \
+		gazer-toolchain:3.47.2 \
+		bash scripts/mobile_screenshots_entrypoint.sh
+	bash mobile/gazer/scripts/collect_screenshots.sh
