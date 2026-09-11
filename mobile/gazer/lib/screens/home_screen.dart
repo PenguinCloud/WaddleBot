@@ -100,6 +100,57 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         state is StreamingState ||
         state is ReconnectingState;
 
+    final Widget controls = Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: <Widget>[
+          StatusChip(state: state, onTap: () => showStatusPanel(context)),
+          const SizedBox(height: 16),
+          Expanded(
+            child: SourcePicker(
+              devices: devices,
+              selectedId: _selectedDeviceId,
+              onSelected: (String id) => setState(() => _selectedDeviceId = id),
+            ),
+          ),
+          if (state is ErrorState) _ErrorBanner(error: state.error),
+          const SizedBox(height: 16),
+          if (showStop)
+            Semantics(
+              label: l10n.stopButtonSemanticsLabel,
+              button: true,
+              child: FilledButton(
+                key: const Key('stopButton'),
+                onPressed: () => controller.stop(),
+                child: Text(l10n.stopButtonLabel),
+              ),
+            )
+          else
+            Semantics(
+              label: l10n.goLiveButtonSemanticsLabel,
+              button: true,
+              child: FilledButton(
+                key: const Key('goLiveButton'),
+                onPressed: canGoLive
+                    ? () => _handleGoLive(
+                        controller: controller,
+                        settings: settings,
+                        devices: devices,
+                        flags: flags,
+                        orientation:
+                            MediaQuery.orientationOf(context) ==
+                                Orientation.portrait
+                            ? OutputOrientation.portrait
+                            : OutputOrientation.landscape,
+                      )
+                    : null,
+                child: Text(l10n.goLiveButtonLabel),
+              ),
+            ),
+        ],
+      ),
+    );
+
     return Scaffold(
       appBar: AppBar(
         title: Text(l10n.homeScreenTitle),
@@ -116,57 +167,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: <Widget>[
-            StatusChip(state: state, onTap: () => showStatusPanel(context)),
-            const SizedBox(height: 16),
-            Expanded(
-              child: SourcePicker(
-                devices: devices,
-                selectedId: _selectedDeviceId,
-                onSelected: (String id) =>
-                    setState(() => _selectedDeviceId = id),
-              ),
-            ),
-            if (state is ErrorState) _ErrorBanner(error: state.error),
-            const SizedBox(height: 16),
-            if (showStop)
-              Semantics(
-                label: l10n.stopButtonSemanticsLabel,
-                button: true,
-                child: FilledButton(
-                  key: const Key('stopButton'),
-                  onPressed: () => controller.stop(),
-                  child: Text(l10n.stopButtonLabel),
-                ),
-              )
-            else
-              Semantics(
-                label: l10n.goLiveButtonSemanticsLabel,
-                button: true,
-                child: FilledButton(
-                  key: const Key('goLiveButton'),
-                  onPressed: canGoLive
-                      ? () => _handleGoLive(
-                          controller: controller,
-                          settings: settings,
-                          devices: devices,
-                          flags: flags,
-                          orientation:
-                              MediaQuery.orientationOf(context) ==
-                                  Orientation.portrait
-                              ? OutputOrientation.portrait
-                              : OutputOrientation.landscape,
-                        )
-                      : null,
-                  child: Text(l10n.goLiveButtonLabel),
-                ),
-              ),
-          ],
-        ),
-      ),
+      body: MediaQuery.of(context).size.width >= 600
+          ? Row(
+              children: <Widget>[
+                Expanded(flex: 2, child: controls),
+                const VerticalDivider(width: 1),
+                const Expanded(flex: 1, child: StatusPanel()),
+              ],
+            )
+          : controls,
     );
   }
 }
