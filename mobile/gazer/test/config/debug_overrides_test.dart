@@ -17,7 +17,10 @@ void main() {
   });
 
   test('enabled is exactly flagsOverride.isNotEmpty given kDebugMode is always true here', () {
-    expect(DebugOverrides.enabled, equals(DebugOverrides.flagsOverride.isNotEmpty));
+    expect(
+      DebugOverrides.enabled,
+      equals(DebugOverrides.flagsOverride.isNotEmpty),
+    );
   });
 
   test('flags parses the currently-configured define into a trimmed, non-empty-only set', () {
@@ -29,21 +32,33 @@ void main() {
     expect(DebugOverrides.flags, equals(expected));
   });
 
-  test('default invocation (no define) yields empty flags and enabled == false', () {
-    if (DebugOverrides.flagsOverride.isEmpty) {
-      expect(DebugOverrides.flags, isEmpty);
-      expect(DebugOverrides.enabled, isFalse);
-    }
-  });
+  test(
+    'default invocation (no define) yields empty flags and enabled == false',
+    () {
+      if (DebugOverrides.flagsOverride.isEmpty) {
+        expect(DebugOverrides.flags, isEmpty);
+        expect(DebugOverrides.enabled, isFalse);
+      }
+    },
+  );
 
-  test('the M1 integration define decodes to exactly the 4 flag keys used by CI', () {
-    const String integrationDefine = 'camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture';
-    if (DebugOverrides.flagsOverride == integrationDefine) {
-      expect(
-        DebugOverrides.flags,
-        equals(<String>{'camera-stream', 'adaptive-bitrate', 'rtmp-auth', 'uvc-capture'}),
-      );
-      expect(DebugOverrides.enabled, isTrue);
-    }
-  });
+  test(
+    'the M1 integration define decodes to exactly the 4 flag keys used by CI',
+    () {
+      const String integrationDefine =
+          'camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture';
+      if (DebugOverrides.flagsOverride == integrationDefine) {
+        expect(
+          DebugOverrides.flags,
+          equals(<String>{
+            'camera-stream',
+            'adaptive-bitrate',
+            'rtmp-auth',
+            'uvc-capture',
+          }),
+        );
+        expect(DebugOverrides.enabled, isTrue);
+      }
+    },
+  );
 }

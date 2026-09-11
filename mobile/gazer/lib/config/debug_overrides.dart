@@ -12,7 +12,9 @@ class DebugOverrides {
 
   /// Raw comma-separated flag-key list from
   /// `--dart-define=GAZER_FLAGS_OVERRIDE=...`. Empty when not supplied.
-  static const String flagsOverride = String.fromEnvironment('GAZER_FLAGS_OVERRIDE');
+  static const String flagsOverride = String.fromEnvironment(
+    'GAZER_FLAGS_OVERRIDE',
+  );
 
   /// True only when running a debug build AND a non-empty override was
   /// supplied. Both conditions are required — kDebugMode is false in

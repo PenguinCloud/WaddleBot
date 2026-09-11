@@ -12,9 +12,9 @@ class MockLicenseClient extends Mock implements LicenseClient {}
 void main() {
   test('license() force-enables DebugOverrides.flags, status valid, lastFetched set, only when enabled', () async {
     final MockLicenseClient client = MockLicenseClient();
-    final LicenseState base = LicenseState(
+    final LicenseState base = const LicenseState(
       status: LicenseStatus.unknown,
-      flags: const <String, bool>{},
+      flags: <String, bool>{},
       lastFetched: null,
       deviceId: 'test-device-0001',
     );
@@ -31,7 +31,11 @@ void main() {
       expect(result.status, LicenseStatus.valid);
       expect(result.lastFetched, isNotNull);
       for (final String key in DebugOverrides.flags) {
-        expect(result.flags[key], isTrue, reason: 'flag $key must be forced ON');
+        expect(
+          result.flags[key],
+          isTrue,
+          reason: 'flag $key must be forced ON',
+        );
       }
     } else {
       expect(result.status, base.status);
