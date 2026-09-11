@@ -484,10 +484,22 @@ jobs:
         # "Failed to install the following SDK components" error the Dockerfile documents.
         # system-images/emulator are intentionally NOT installed here -- the
         # reactivecircus/android-emulator-runner step below provisions its own AVD.
+        # Fix round 1: `sdkmanager: command not found` (exit 127) -- the preinstalled Android
+        # SDK's cmdline-tools/latest/bin is not on PATH by default on GitHub-hosted runners
+        # (actions/runner-images installs it under $ANDROID_HOME but only adds ANDROID_HOME/
+        # ANDROID_SDK_ROOT to the environment, not this subdirectory to PATH). Resolve the
+        # binary's full path explicitly instead of relying on PATH.
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager \
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME/ANDROID_SDK_ROOT not set by runner image}}"
+          SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "${SDKMANAGER}" ]; then
+            echo "::error::sdkmanager not found at ${SDKMANAGER}" >&2
+            find "${SDK_ROOT}/cmdline-tools" -maxdepth 2 -name sdkmanager 2>/dev/null || true
+            exit 1
+          fi
+          yes | "${SDKMANAGER}" --licenses > /dev/null
+          "${SDKMANAGER}" \
             "platforms;android-34" \
             "platforms;android-35" \
             "platforms;android-36" \
@@ -495,6 +507,8 @@ jobs:
             "ndk;28.2.13676358" \
             "platform-tools" \
             "cmake;3.22.1"
+          echo "${SDK_ROOT}/platform-tools" >> "$GITHUB_PATH"
+          echo "${SDK_ROOT}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       - name: Pre-build debug APK (installed inside the emulator step, after the AVD boots)
         working-directory: mobile/gazer
