@@ -55,7 +55,7 @@ void main() {
     // "Fetching features...". pumpAndSettle cannot wait for a real network
     // round trip; poll instead, same pattern and timeout as
     // go_live_unreachable_test.dart's wait for goLiveButton to enable.
-    await _pumpUntil(
+    final bool goLiveEnabled = await _pumpUntil(
       tester,
       () =>
           tester
@@ -63,6 +63,14 @@ void main() {
               .onPressed !=
           null,
       timeout: const Duration(seconds: 60),
+    );
+    expect(
+      goLiveEnabled,
+      isTrue,
+      reason:
+          'expected Go Live to become enabled once the license/flag fetch '
+          'resolved, so screenshots reflect a settled state rather than a '
+          'stalled "Fetching features..." license row',
     );
 
     // Android renders Flutter into a SurfaceView the screenshot API cannot
