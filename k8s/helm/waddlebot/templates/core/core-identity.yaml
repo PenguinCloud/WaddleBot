@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: core-identity
-        image: "{{ .Values.global.imageRegistry }}/core-identity:{{ .Values.modules.coreIdentity.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "core-identity" "imageTag" .Values.modules.coreIdentity.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

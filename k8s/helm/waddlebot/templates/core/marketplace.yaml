@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: marketplace
-        image: "{{ .Values.global.imageRegistry }}/marketplace:{{ .Values.modules.marketplace.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "marketplace" "imageTag" .Values.modules.marketplace.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

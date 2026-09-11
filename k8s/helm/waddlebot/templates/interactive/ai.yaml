@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: interactive-ai
-        image: "{{ .Values.global.imageRegistry }}/interactive-ai:{{ .Values.modules.interactiveAi.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "interactive-ai" "imageTag" .Values.modules.interactiveAi.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

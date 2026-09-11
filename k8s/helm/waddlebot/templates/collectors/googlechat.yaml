@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 8 }}
       containers:
         - name: googlechat-collector
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.modules.collectors.googlechat.image }}:{{ .Values.modules.collectors.googlechat.imageTag | default .Values.global.imageTag }}"
+          image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" (.Values.modules.collectors.googlechat.image) "imageTag" .Values.modules.collectors.googlechat.imageTag) }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http

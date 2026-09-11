@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: ai-researcher
-        image: "{{ .Values.global.imageRegistry }}/ai-researcher:{{ .Values.modules.aiResearcher.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "ai-researcher" "imageTag" .Values.modules.aiResearcher.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

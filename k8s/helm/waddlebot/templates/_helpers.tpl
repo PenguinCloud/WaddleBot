@@ -189,12 +189,30 @@ Format: redis://[:password@]host:port[/database]
 Module image helper
 Simplified image helper for module-specific images.
 Uses global registry and chart version as defaults.
+Handles both bare module names and legacy patterns with properly scoped registry.
 Usage: {{ include "waddlebot.moduleImage" (dict "root" . "module" "router" "tag" .Values.modules.router.imageTag) }}
 */}}
 {{- define "waddlebot.moduleImage" -}}
 {{- $registry := .root.Values.global.imageRegistry | default "" }}
 {{- $repository := .module | required "module name is required" }}
 {{- $tag := .tag | default .root.Chart.AppVersion | default "latest" }}
+{{- if $registry }}
+{{- printf "%s/%s:%s" $registry $repository $tag }}
+{{- else }}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+{{- end }}
+
+{{/*
+Legacy Module Image (for templates still using global.imageRegistry concatenation)
+Builds image reference for legacy modules with correct registry handling.
+Same as moduleImage but kept separate for clarity in legacy template conversions.
+Usage: {{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "action-platforms" "imageTag" .Values.modules.actionPlatforms.imageTag) }}
+*/}}
+{{- define "waddlebot.legacyModuleImage" -}}
+{{- $registry := .root.Values.global.imageRegistry | default "" }}
+{{- $repository := .module | required "module name is required" }}
+{{- $tag := .imageTag | default .root.Values.global.imageTag | default "latest" }}
 {{- if $registry }}
 {{- printf "%s/%s:%s" $registry $repository $tag }}
 {{- else }}
@@ -364,8 +382,15 @@ beta/gamma/production until an operator sets them.
 Usage: {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
 */}}
 {{- define "waddlebot.dbMigrateInitContainer" -}}
+{{- $registry := .Values.global.imageRegistry | default "" }}
+{{- $repository := .Values.modules.migrations.image | default "waddlebot-migrations" }}
+{{- $tag := .Values.global.imageTag }}
 - name: db-migrate
-  image: "{{ .Values.global.imageRegistry }}/migrations:{{ .Values.global.imageTag }}"
+  {{- if $registry }}
+  image: "{{ $registry }}/{{ $repository }}:{{ $tag }}"
+  {{- else }}
+  image: "{{ $repository }}:{{ $tag }}"
+  {{- end }}
   imagePullPolicy: {{ .Values.global.imagePullPolicy }}
   env:
   - name: DATABASE_URL

@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 8 }}
       containers:
         - name: twitch-collector
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.modules.collectors.twitch.image }}:{{ .Values.modules.collectors.twitch.imageTag | default .Values.global.imageTag }}"
+          image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" (.Values.modules.collectors.twitch.image) "imageTag" .Values.modules.collectors.twitch.imageTag) }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http

@@ -1,29 +1,24 @@
-# v3.0.x — REAL control plane + real ffmpeg data plane (Streaming module). See
-# docs/plans/2026-08-31-svc-streaming-design.md for the target-state design (Rust control
-# plane, build-vs-external-media-engine decision at §8.1, still genuinely open). This build is
-# a deliberate, documented scope choice for a working alpha demo: Python/Quart control plane
-# (own DB tables, migration 078) + a real `ffmpeg` subprocess as the data plane (`services/
-# ffmpeg_engine.py`) — not the external MarchProxy/LiveKit fronting the design doc describes,
-# because neither exists in this repo/environment to front. The Rust data-plane migration
-# remains a documented follow-up (see the PR that landed this container).
+# v3.0.x — Rust data-plane rewrite (Issue #287). Supersedes the Python/ffmpeg-subprocess
+# control+data plane this file previously templated (own DB tables, migration 078, real
+# `ffmpeg` subprocess data plane) — the Rust crate at `core/svc_streaming/` now owns both
+# control and media-ingest (RTMP/SRT/WebRTC) directly, built from
+# `core/svc_streaming/Dockerfile.rust`, pushed as
+# `localhost:32000/waddlebot/svc-streaming:alpha-<epoch>` in alpha (CI beta/gamma/prod builds
+# follow the standard ghcr.io tag convention — see `streaming.image` below).
 #
-# ffmpeg PULLS from a caller-supplied source_url (HLS/RTMP) and fans out to N forward targets
-# — this pod never listens on an RTMP/WebRTC media port itself, so only the control REST/gRPC
-# ports are declared here: no privileged port, no hostNetwork/hostPort, no NET_ADMIN/NET_RAW.
-# (gRPC port is reserved/declared, matching every other pipeline-stage container's shape —
-# this build's control surface is REST-only; a gRPC surface is follow-up work.)
+# Unlike the old placeholder (control-only, no media ports declared), this pod now listens
+# directly on RTMP (1935/tcp), SRT (9000/udp), and a WebRTC UDP media range
+# (40000-40100/udp) in addition to the HTTP control/health port, gRPC (reserved, still
+# REST-primary), and a Prometheus metrics port. Gated solely on
+# `pipeline.svcStreaming.enabled`, same single-condition gate as before.
 #
-# Gated solely on `pipeline.svcStreaming.enabled`, same single-condition gate as
-# svc-presentation.yaml — NOT on a `modules.streaming.enabled` toggle (that module doesn't
-# exist in `modules.*` yet; adding it is out of scope here). svc-rtc.yaml / video_proxy_module
-# are UNTOUCHED — this is a new, additional container, not a replacement (design spec §6's
-# absorption of both remains staged/future work).
+# db-migrate initContainer included (same helper every other pipeline-stage/standalone
+# service in this chart uses) — svc-streaming reads its own DB tables via SeaORM;
+# migrations are applied by the shared `migrations` image/initContainer, not by this crate.
 #
-# Base image still pinned to the shared `pipeline.pythonBaseImage` placeholder digest — no CI
-# build exists for svc-streaming yet (same posture every other freshly-built core/svc_*
-# container in this chart is in today, e.g. svc-presentation.yaml's own header comment).
-# `core/svc_streaming/Dockerfile` is real (installs ffmpeg via apt, hash-pinned pip deps,
-# rootless `USER appuser`) but not yet wired into CI image publishing.
+# securityContext deliberately does NOT reuse the chart's shared `.Values.securityContext`
+# (runAsUser 1000) — the Rust image's Dockerfile creates a dedicated non-root `appuser` at
+# uid 10001, so this container pins that uid explicitly instead.
 {{- if .Values.pipeline.svcStreaming.enabled }}
 ---
 apiVersion: apps/v1
@@ -49,23 +44,50 @@ spec:
       {{- include "waddlebot.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+      {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: svc-streaming
-        # PLACEHOLDER — no CI-built image exists yet for svc-streaming; pinned to the repo's
-        # shared Python base digest rather than inventing one or using a mutable tag. Replace
-        # with a real `ghcr.io/.../svc-streaming` tag once CI publishes one for
-        # `core/svc_streaming/Dockerfile` (the Dockerfile itself is real, not a placeholder).
-        image: "{{ .Values.pipeline.pythonBaseImage }}"
+        image: "{{ .Values.streaming.image.repository }}:{{ .Values.streaming.image.tag | default .Values.global.imageTag }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+        # Pinned to the Rust image's own `appuser` (uid 10001), not the chart-wide
+        # `.Values.securityContext` (uid 1000) every Python-base placeholder uses.
         securityContext:
-          {{- toYaml .Values.securityContext | nindent 10 }}
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
         ports:
         - name: http
           containerPort: {{ .Values.pipeline.svcStreaming.port }}
           protocol: TCP
+        - name: metrics
+          containerPort: {{ .Values.pipeline.svcStreaming.metricsPort }}
+          protocol: TCP
         - name: grpc
           containerPort: {{ .Values.pipeline.svcStreaming.grpcPort }}
           protocol: TCP
+        - name: rtmp
+          containerPort: {{ .Values.pipeline.svcStreaming.rtmpPort }}
+          protocol: TCP
+        - name: srt
+          containerPort: {{ .Values.pipeline.svcStreaming.srtPort }}
+          protocol: UDP
+        # WebRTC media range is 101 ports (40000-40100/udp) -- too many to enumerate as
+        # individual containerPort entries and no range-loop precedent exists elsewhere in
+        # this chart's port declarations, so only the range's two boundary ports are
+        # declared here for documentation/introspection. WEBRTC_UDP_RANGE (env, below) is
+        # what the app actually binds against; no Service/NodePort exposes this range in any
+        # environment today (alpha's direct media exposure is RTMP/SRT/HTTP only).
+        - name: webrtc-lo
+          containerPort: {{ .Values.pipeline.svcStreaming.webrtcRangeStart }}
+          protocol: UDP
+        - name: webrtc-hi
+          containerPort: {{ .Values.pipeline.svcStreaming.webrtcRangeEnd }}
+          protocol: UDP
         envFrom:
         - configMapRef:
             name: {{ include "waddlebot.fullname" . }}-config
@@ -78,6 +100,38 @@ spec:
           value: "streaming"
         - name: MODULE_PORT
           value: {{ .Values.pipeline.svcStreaming.port | quote }}
+        - name: RTMP_PORT
+          value: {{ .Values.pipeline.svcStreaming.rtmpPort | quote }}
+        - name: SRT_PORT
+          value: {{ .Values.pipeline.svcStreaming.srtPort | quote }}
+        - name: WEBRTC_UDP_RANGE
+          value: {{ printf "%v-%v" .Values.pipeline.svcStreaming.webrtcRangeStart .Values.pipeline.svcStreaming.webrtcRangeEnd | quote }}
+        - name: STREAM_DATA_DIR
+          value: {{ .Values.pipeline.svcStreaming.streamDataDir | quote }}
+        - name: FFMPEG_PATH
+          value: "/usr/bin/ffmpeg"
+        {{- if .Values.pipeline.svcStreaming.publicBaseUrl }}
+        - name: PUBLIC_BASE_URL
+          value: {{ .Values.pipeline.svcStreaming.publicBaseUrl | quote }}
+        {{- end }}
+        # Recordings land in MinIO (S3-compatible) instead of pod-lifetime emptyDir storage
+        # -- see infrastructure.minio and templates/infrastructure/minio.yaml. Creds reuse
+        # the existing minio Secret keys (MINIO_ROOT_USER/MINIO_ROOT_PASSWORD) rather than
+        # minting new ones.
+        - name: RECORDINGS_BUCKET
+          value: "recordings"
+        - name: S3_ENDPOINT
+          value: {{ printf "http://%s:%v" .Values.infrastructure.minio.service.name .Values.infrastructure.minio.service.apiPort | quote }}
+        - name: S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "waddlebot.fullname" . }}-secrets
+              key: MINIO_ROOT_USER
+        - name: S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "waddlebot.fullname" . }}-secrets
+              key: MINIO_ROOT_PASSWORD
         livenessProbe:
           httpGet:
             path: /health
@@ -88,7 +142,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
+            path: /readyz
             port: http
           initialDelaySeconds: 10
           periodSeconds: 5
@@ -97,18 +151,20 @@ spec:
         resources:
           {{- toYaml .Values.pipeline.svcStreaming.resources | nindent 10 }}
         volumeMounts:
+        # HLS segment scratch space -- tmpfs-backed (Memory medium) since segments are
+        # short-lived and this keeps transcode I/O off the node's disk. Not a durable store;
+        # finished recordings are pushed to MinIO (RECORDINGS_BUCKET above), not read back
+        # from here.
+        - name: stream-data
+          mountPath: {{ .Values.pipeline.svcStreaming.streamDataDir }}
         - name: tmp
           mountPath: /tmp
-        # Real recording output target for `record_enabled` streams (`services/
-        # ffmpeg_engine.py::ensure_recordings_dir`, `Config.recordings_dir`) — emptyDir today
-        # (pod-lifetime only); MinIO/object-store upload of finished segments is documented
-        # follow-up (design spec §8.5), not done here.
-        - name: recordings
-          mountPath: /var/lib/svc-streaming/recordings
       volumes:
+      - name: stream-data
+        emptyDir:
+          medium: Memory
+          sizeLimit: 512Mi
       - name: tmp
-        emptyDir: {}
-      - name: recordings
         emptyDir: {}
 ---
 apiVersion: v1
@@ -125,6 +181,10 @@ spec:
     targetPort: http
     protocol: TCP
     name: http
+  - port: {{ .Values.pipeline.svcStreaming.metricsPort }}
+    targetPort: metrics
+    protocol: TCP
+    name: metrics
   - port: {{ .Values.pipeline.svcStreaming.grpcPort }}
     targetPort: grpc
     protocol: TCP
@@ -132,4 +192,42 @@ spec:
   selector:
     {{- include "waddlebot.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: svc-streaming
+{{- if .Values.pipeline.svcStreaming.nodePort.enabled }}
+---
+# Alpha-only direct media ingest exposure (RTMP push + SRT push + the control HTTP port),
+# mirroring how svc-presentation.yaml templates presentation.service.type/nodePort today.
+# A second, separate Service rather than switching the ClusterIP Service above to NodePort,
+# since only 3 of its 3 ports need node-reachability here and fixed nodePorts (not
+# Helm/K8s-assigned) keep a local dev's OBS/ffmpeg RTMP target and PUBLIC_BASE_URL stable
+# across redeploys. Gated on pipeline.svcStreaming.nodePort.enabled, which only
+# values-alpha.yaml sets true -- base/beta stay ClusterIP-only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "waddlebot.fullname" . }}-svc-streaming-media
+  labels:
+    {{- include "waddlebot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: svc-streaming
+spec:
+  type: NodePort
+  ports:
+  - port: {{ .Values.pipeline.svcStreaming.rtmpPort }}
+    targetPort: rtmp
+    protocol: TCP
+    name: rtmp
+    nodePort: {{ .Values.pipeline.svcStreaming.nodePort.rtmpPort }}
+  - port: {{ .Values.pipeline.svcStreaming.srtPort }}
+    targetPort: srt
+    protocol: UDP
+    name: srt
+    nodePort: {{ .Values.pipeline.svcStreaming.nodePort.srtPort }}
+  - port: {{ .Values.pipeline.svcStreaming.port }}
+    targetPort: http
+    protocol: TCP
+    name: http
+    nodePort: {{ .Values.pipeline.svcStreaming.nodePort.httpPort }}
+  selector:
+    {{- include "waddlebot.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: svc-streaming
+{{- end }}
 {{- end }}

@@ -93,11 +93,23 @@ pipeline:
     resources:
       requests: { cpu: "150m", memory: "192Mi" }
       limits: { cpu: "750m", memory: "768Mi" }
+  # Issue #287 -- transcode-capable tier, higher than the generic pipeline stage tier
+  # above (not the generic pipeline.svcProcess/svcAction resources -- ffmpeg/transcode is
+  # real CPU work). No nodePort override -- base's pipeline.svcStreaming.nodePort.enabled
+  # stays false, beta is ClusterIP-only per devops-kubernetes.md's "no NodePort in
+  # beta/prod" rule (svc-streaming isn't RTMP-reachable from outside dal2 yet).
   svcStreaming:
     replicas: 1
     resources:
-      requests: { cpu: "150m", memory: "192Mi" }
-      limits: { cpu: "750m", memory: "768Mi" }
+      requests: { cpu: "500m", memory: "512Mi" }
+      limits: { cpu: "4000m", memory: "2Gi" }
+
+# Issue #287 -- svc-streaming (Rust) image, CI-built from core/svc_streaming/Dockerfile.rust,
+# published to ghcr.io like every other beta module.
+streaming:
+  image:
+    repository: "ghcr.io/penguintechinc/waddlebot/svc-streaming"
+    tag: ""
 
 # Reputation service (Issue #310) -- CI-built image from ghcr.io, matches
 # modules.hub's beta tier (lightweight internal API).

@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 8 }}
       containers:
         - name: discord-collector
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.modules.collectors.discord.image }}:{{ .Values.modules.collectors.discord.imageTag | default .Values.global.imageTag }}"
+          image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" (.Values.modules.collectors.discord.image) "imageTag" .Values.modules.collectors.discord.imageTag) }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http

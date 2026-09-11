@@ -34,8 +34,19 @@ infrastructure:
     resources:
       requests: { cpu: "50m", memory: "64Mi" }
       limits: { cpu: "250m", memory: "256Mi" }
+  # Issue #287 -- svc-streaming (Rust) recordings target. Min-spec'd for a single-node
+  # laptop; service.name overridden to "waddlebot-minio" so the literal S3_ENDPOINT wired
+  # into svc-streaming's env (templates/svc-streaming.yaml) resolves correctly.
   minio:
-    enabled: false
+    enabled: true
+    service:
+      name: "waddlebot-minio"
+      type: ClusterIP
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: "50m", memory: "128Mi" }
+      limits: { cpu: "300m", memory: "512Mi" }
   ollama:
     enabled: false
   qdrant:
@@ -91,11 +102,21 @@ pipeline:
     resources:
       requests: { cpu: "100m", memory: "128Mi" }
       limits: { cpu: "500m", memory: "512Mi" }
+  # Issue #287 -- transcode-capable min-spec (higher than the generic pipeline tier above)
+  # plus fixed alpha NodePorts for direct RTMP/SRT/HTTP media ingest (OBS/ffmpeg target
+  # localhost:31935 for RTMP push). PUBLIC_BASE_URL uses the node LAN IP + the http
+  # NodePort below so playback URLs resolve off-laptop, matching webui.publicUrl's pattern.
   svcStreaming:
     replicas: 1
+    publicBaseUrl: "http://192.168.10.75:31208"
+    nodePort:
+      enabled: true
+      rtmpPort: 31935
+      srtPort: 30900
+      httpPort: 31208
     resources:
-      requests: { cpu: "100m", memory: "128Mi" }
-      limits: { cpu: "500m", memory: "512Mi" }
+      requests: { cpu: "200m", memory: "256Mi" }
+      limits: { cpu: "2000m", memory: "1Gi" }
 
 presentation:
   image:
@@ -104,6 +125,13 @@ presentation:
   service:
     type: NodePort
     nodePort: 31032
+
+# Issue #287 -- svc-streaming (Rust) image, built locally + pushed to the local registry
+# (no CI image for it yet), same as every other alpha module.
+streaming:
+  image:
+    repository: "localhost:32000/waddlebot/svc-streaming"
+    tag: "alpha"
 
 # Reputation service (Issue #310) -- built locally, pushed to the local
 # registry (no CI image for it yet), same as every other alpha module.

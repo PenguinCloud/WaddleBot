@@ -25,7 +25,7 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
       - name: hub-webui
-        image: "{{ .Values.global.imageRegistry }}/hub-webui:{{ .Values.modules.hubWebui.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "hub-webui" "imageTag" .Values.modules.hubWebui.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

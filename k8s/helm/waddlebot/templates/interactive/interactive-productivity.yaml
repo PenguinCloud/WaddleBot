@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: interactive-productivity
-        image: "{{ .Values.global.imageRegistry }}/interactive-productivity:{{ .Values.modules.interactiveProductivity.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "interactive-productivity" "imageTag" .Values.modules.interactiveProductivity.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

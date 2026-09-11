@@ -195,6 +195,7 @@ infrastructure:
     rootPassword: "REPLACE_ME"
     service:
       name: "infra-minio"
+      type: ClusterIP
       apiPort: 9000
       consolePort: 9001
     replicas: 1
@@ -205,8 +206,15 @@ infrastructure:
       limits:
         cpu: "1000m"
         memory: "1Gi"
+    # name/accessMode/storageClass added alongside the Issue #287 alpha bring-up (missing
+    # here previously -- templates/infrastructure/minio.yaml's PVC needs all three and
+    # every environment that flips infrastructure.minio.enabled=true render-fails the PVC
+    # without them; postgresql/redis above already carry the equivalent keys).
     persistence:
       enabled: true
+      name: "minio-data"
+      accessMode: ReadWriteOnce
+      storageClass: ""
       size: 50Gi
     env:
       MINIO_BROWSER: "on"
@@ -541,6 +549,48 @@ pipeline:
         cpu: "1000m"
         memory: "1Gi"
 
+  # v3.0.x — Rust data-plane rewrite (Issue #287, core/svc_streaming crate). Supersedes the
+  # earlier Python/ffmpeg control+data plane (own DB tables, migration 078). Adds the
+  # media-plane ports (rtmp/srt/webrtc range) and MinIO/S3 recording env alongside the
+  # existing control ports -- see templates/svc-streaming.yaml header for the full
+  # rationale. Gated only on `enabled` here (same pattern as svcPresentation), NOT on
+  # modules.streaming.enabled -- that module doesn't exist in modules.* yet. svc-rtc /
+  # video_proxy_module are untouched (separate, existing containers).
+  # NOTE: this key MUST stay nested directly under `pipeline:` (2-space indent, sibling of
+  # svcPresentation above) -- a prior edit accidentally nested it under the top-level
+  # `presentation:` block instead, which silently made every
+  # `.Values.pipeline.svcStreaming.*` reference in templates/svc-streaming.yaml resolve to
+  # null and rendered the whole file to nothing (caught via `helm template` + `yq
+  # '.pipeline.svcStreaming'` returning null despite `enabled: true` being textually
+  # present). Base/prod resources bumped above beta's tier -- this is a transcode-capable
+  # pod, not a generic pipeline-stage skeleton.
+  svcStreaming:
+    enabled: true
+    port: 8208
+    grpcPort: 50208
+    metricsPort: 9090
+    rtmpPort: 1935
+    srtPort: 9000
+    webrtcRangeStart: 40000
+    webrtcRangeEnd: 40100
+    streamDataDir: "/var/lib/waddlebot/stream"
+    publicBaseUrl: ""
+    replicas: 1
+    # Direct NodePort media exposure (RTMP/SRT/HTTP) -- alpha-only; base/beta stay
+    # ClusterIP-only (see templates/svc-streaming.yaml's second Service block).
+    nodePort:
+      enabled: false
+      rtmpPort: 31935
+      srtPort: 30900
+      httpPort: 31208
+    resources:
+      requests:
+        cpu: "1000m"
+        memory: "1Gi"
+      limits:
+        cpu: "4000m"
+        memory: "4Gi"
+
 # v3.0.x — svc-presentation (8th container, 4th stage-runner). Music overlay + per-community
 # OBS browser-source surfaces. Own image placeholder (core/svc_presentation/ builds with
 # CI once Dockerfile is wired). Image repository structure allows alpha local registry +
@@ -553,27 +603,13 @@ presentation:
     type: ClusterIP
     nodePort: ""
 
-  # v3.0.x — REAL Streaming module control plane + real ffmpeg data plane — see
-  # templates/svc-streaming.yaml header and docs/plans/2026-08-31-svc-streaming-design.md.
-  # Gated only on `enabled` here (same pattern as svcPresentation), NOT on
-  # modules.streaming.enabled — that module doesn't exist in modules.* yet. svc-rtc /
-  # video_proxy_module are untouched (separate, existing containers).
-  # Resource limits bumped from the original scaffold's generic pipeline-stage defaults —
-  # this pod now actually runs ffmpeg (passthrough copy is cheap; TRANSCODE is real CPU work).
-  # A dedicated node pool for transcode-heavy replicas (design spec §7's "beefy-host"
-  # proposal) is follow-up, not done here.
-  svcStreaming:
-    enabled: true
-    port: 8208
-    grpcPort: 50208
-    replicas: 1
-    resources:
-      requests:
-        cpu: "250m"
-        memory: "256Mi"
-      limits:
-        cpu: "2000m"
-        memory: "2Gi"
+# v3.0.x — Rust svc-streaming image (Issue #287). Own Dockerfile
+# (core/svc_streaming/Dockerfile.rust), not the shared pipeline.pythonBaseImage
+# placeholder -- mirrors the presentation.image block's shape above.
+streaming:
+  image:
+    repository: "waddlebot-svc-streaming"
+    tag: ""
 
 # Reputation service (Issue #310, core/reputation_module) -- standalone internal
 # HTTP+gRPC API, not a pipeline stage-runner. Own image (core/reputation_module/

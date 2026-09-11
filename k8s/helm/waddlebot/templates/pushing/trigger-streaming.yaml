@@ -27,7 +27,7 @@ spec:
       {{- include "waddlebot.dbMigrateInitContainer" . | nindent 6 }}
       containers:
       - name: trigger-streaming
-        image: "{{ .Values.global.imageRegistry }}/trigger-streaming:{{ .Values.modules.triggerStreaming.imageTag | default .Values.global.imageTag }}"
+        image: "{{ include "waddlebot.legacyModuleImage" (dict "root" . "module" "trigger-streaming" "imageTag" .Values.modules.triggerStreaming.imageTag) }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}

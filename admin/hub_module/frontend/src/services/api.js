@@ -95,6 +95,11 @@ export const communityApi = {
   getMessageLeaderboard: (id, params) =>
     api.get(`/api/v1/communities/${id}/leaderboard/messages`, { params }),
   getMyActivityStats: (id) => api.get(`/api/v1/communities/${id}/activity/my-stats`),
+  // Reputation visibility (gh-310) -- community + global score/tier for the
+  // caller, and a top-scorers leaderboard (display names only, no ids).
+  getMyReputation: (id) => api.get(`/api/v1/community/${id}/reputation/me`),
+  getReputationLeaderboard: (id, params) =>
+    api.get(`/api/v1/community/${id}/reputation/leaderboard`, { params }),
 };
 
 export const adminApi = {
@@ -250,39 +255,12 @@ export const adminApi = {
     api.post(`/api/v1/admin/${communityId}/loyalty/wipe`),
   getLoyaltyStats: (communityId) =>
     api.get(`/api/v1/admin/${communityId}/loyalty/stats`),
-  // Loyalty giveaways
-  getLoyaltyGiveaways: (communityId, params) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/giveaways`, { params }),
-  createLoyaltyGiveaway: (communityId, data) =>
-    api.post(`/api/v1/admin/${communityId}/loyalty/giveaways`, data),
-  getLoyaltyGiveawayEntries: (communityId, giveawayId) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/giveaways/${giveawayId}/entries`),
-  drawLoyaltyGiveawayWinner: (communityId, giveawayId) =>
-    api.post(`/api/v1/admin/${communityId}/loyalty/giveaways/${giveawayId}/draw`),
-  endLoyaltyGiveaway: (communityId, giveawayId) =>
-    api.put(`/api/v1/admin/${communityId}/loyalty/giveaways/${giveawayId}/end`),
-  // Loyalty games management
-  getLoyaltyGamesConfig: (communityId) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/games/config`),
-  updateLoyaltyGamesConfig: (communityId, data) =>
-    api.put(`/api/v1/admin/${communityId}/loyalty/games/config`, data),
-  getLoyaltyGamesStats: (communityId) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/games/stats`),
-  getLoyaltyGamesRecent: (communityId, params) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/games/recent`, { params }),
-  // Loyalty gear management
-  getLoyaltyGearCategories: (communityId) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/gear/categories`),
-  getLoyaltyGearItems: (communityId, params) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/gear/items`, { params }),
-  createLoyaltyGearItem: (communityId, data) =>
-    api.post(`/api/v1/admin/${communityId}/loyalty/gear/items`, data),
-  updateLoyaltyGearItem: (communityId, itemId, data) =>
-    api.put(`/api/v1/admin/${communityId}/loyalty/gear/items/${itemId}`, data),
-  deleteLoyaltyGearItem: (communityId, itemId) =>
-    api.delete(`/api/v1/admin/${communityId}/loyalty/gear/items/${itemId}`),
-  getLoyaltyGearStats: (communityId) =>
-    api.get(`/api/v1/admin/${communityId}/loyalty/gear/stats`),
+  // NOTE (gh-317): giveaways/games/gear-shop admin routes were removed —
+  // hub-api's `services.community_loyalty` (MVP core-currency schema) has
+  // no tables for them; see `hub_api/blueprints/v1/community_loyalty.py`'s
+  // module docstring. Shop items (`loyalty_shop_items`) have a service-layer
+  // `upsert_item()` but no admin blueprint route yet, so no client function
+  // is added for them either.
   // Announcements
   getAnnouncements: (communityId, params) =>
     api.get(`/api/v1/admin/${communityId}/announcements`, { params }),

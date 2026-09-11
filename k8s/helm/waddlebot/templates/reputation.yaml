@@ -10,9 +10,7 @@
 # not the client-only pattern router.yaml uses. Unlike svc-action's shared
 # pythonBaseImage skeleton placeholder, reputation_module already has its own
 # Dockerfile/image (core/reputation_module/Dockerfile) -- self-contained
-# reputation.image.repository per environment (not global.imageRegistry
-# concatenation), since values-alpha.yaml's global.imageRegistry is "" today and
-# that concatenation renders a broken leading "/" for every other alpha module.
+# reputation.image.repository per environment.
 {{- if .Values.reputation.enabled }}
 ---
 apiVersion: apps/v1
