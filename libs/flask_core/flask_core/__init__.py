@@ -22,7 +22,7 @@ from .platform_version import get_platform_version, platform_version_compatible
 # to release/v3.0.X).
 __version__ = get_platform_version()
 
-from .database import AsyncDAL, init_database
+from .database import AsyncDAL, db_operation, init_database, install_db_resilience
 from .bundle_runtime import (
     BundleContext,
     BundleRuntimeError,
@@ -220,7 +220,9 @@ __all__ = [
     "platform_version_compatible",
     # Database
     "AsyncDAL",
+    "db_operation",
     "init_database",
+    "install_db_resilience",
     # Bundle runtime (DAL + tenant/community context for stateful App Bundles)
     "BundleContext",
     "BundleRuntimeError",

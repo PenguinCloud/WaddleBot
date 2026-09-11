@@ -229,7 +229,15 @@ class ProcessRunner:
 
         envelope_out = StageEnvelope(
             tenant=envelope_in.tenant,
-            community=envelope_in.community,
+            # Carry the RESOLVED community (real activation, or the demo-shim
+            # fallback above) onto the action-stage envelope -- not
+            # envelope_in.community, which is still None for a tenant-wide
+            # activation. Action bundles run outside bundle_context() (they
+            # only see the envelope they're handed), so this is the only
+            # channel a resolved community reaches them through. Always
+            # sourced from pipeline context/the shim, never from event
+            # payload -- same tenancy invariant as target_app_id above.
+            community=community_for_context,
             app_id=envelope_in.app_id,
             stage="action",
             event=event_out,

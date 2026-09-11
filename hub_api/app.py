@@ -25,6 +25,7 @@ from typing import Any
 from flask_core import (
     create_health_blueprint,
     init_database,
+    install_db_resilience,
     install_security_headers,
     setup_aaa_logging,
 )
@@ -175,6 +176,14 @@ def create_app(config: HubAPIConfig | None = None) -> Quart:
     # deny-everything CSP (`flask_core.security_headers.DEFAULT_CSP`) is
     # correct with no override.
     install_security_headers(app)
+
+    # Service-wide safety net for the shared raw-pydal DAL (`app.config["dal"]`,
+    # bound below in startup()) -- rolls back + logs on any request failure so
+    # one bad query can't poison the connection for every request after it.
+    # See flask_core.database.install_db_resilience's docstring (#306,
+    # recurring InFailedSqlTransaction). Registered before the DAL exists is
+    # fine -- the teardown hook reads current_app.config lazily.
+    install_db_resilience(app)
 
     # security.md A04 hardening -- global before_request hook covering
     # every route registered below, not a per-blueprint decorator (see

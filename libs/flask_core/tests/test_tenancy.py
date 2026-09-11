@@ -11,7 +11,9 @@ docs/plans/2026-08-26-v3-scbm-apps.md.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import jwt
 import pytest
@@ -25,7 +27,12 @@ from flask_core.auth import (
     setup_default_roles,
     verify_jwt_token,
 )
-from flask_core.tenancy import TenantContext, TenantIsolationError, tenant_scoped
+from flask_core.tenancy import (
+    TenantContext,
+    TenantIsolationError,
+    resolve_tenant_context,
+    tenant_scoped,
+)
 
 SECRET = "test-secret-key-not-for-production-use-only"
 
@@ -240,3 +247,72 @@ class TestScopeBundles:
                 "'users:admin' scope -- this reopens the C3 tenant-owner-to-"
                 "platform-super-admin privilege escalation"
             )
+
+
+class TestResolveTenantContextDbResilience:
+    """`resolve_tenant_context` is the near-universal per-request chokepoint
+    (`tenant_middleware` + `install_community_scoped_auth` both call it on
+    almost every hub-api route) against the shared, un-pooled raw pydal
+    `dal` -- its `.select()` must roll back the connection (and log the
+    real exception) on failure instead of leaving it poisoned for every
+    request that follows (the recurring `InFailedSqlTransaction` cascade,
+    see `database.db_operation`'s docstring).
+    """
+
+    async def test_db_error_rolls_back_and_logs_then_next_call_succeeds(
+        self, db, two_tenants, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rollback_spy = MagicMock(wraps=db.rollback)
+        db.rollback = rollback_spy
+
+        # Simulate exactly one poisoned-connection failure on the first
+        # resolve_tenant_context call -- e.g. an earlier, unrelated failed
+        # write on this shared connection that never rolled back -- and
+        # prove the SAME dal recovers for the very next call.
+        original_call = type(db).__call__
+        call_count = {"n": 0}
+
+        def _flaky_call(self, *args, **kwargs):
+            query_set = original_call(self, *args, **kwargs)
+            if self is db:
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    query_set.select = MagicMock(
+                        side_effect=RuntimeError(
+                            "InFailedSqlTransaction: current transaction is aborted, "
+                            "commands ignored until end of transaction block"
+                        )
+                    )
+            return query_set
+
+        type(db).__call__ = _flaky_call
+        try:
+            payload = {"tenant": "tenant-a"}
+
+            with caplog.at_level(logging.ERROR):
+                with pytest.raises(RuntimeError, match="InFailedSqlTransaction"):
+                    await resolve_tenant_context(payload, db)
+
+            rollback_spy.assert_called_once()
+            error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert any(
+                "resolve_tenant_context" in r.message and "InFailedSqlTransaction" in r.message
+                for r in error_records
+            ), "the real trigger exception must be logged, not just the downstream cascade"
+
+            # Next call on the SAME dal/connection succeeds -- the connection
+            # self-healed instead of staying poisoned (the "recurs every
+            # ~2 min until restart" symptom this fix closes).
+            ctx = await resolve_tenant_context(payload, db)
+            assert ctx.tenant_slug == "tenant-a"
+        finally:
+            type(db).__call__ = original_call
+
+    async def test_no_db_error_never_rolls_back(self, db, two_tenants) -> None:
+        rollback_spy = MagicMock(wraps=db.rollback)
+        db.rollback = rollback_spy
+
+        ctx = await resolve_tenant_context({"tenant": "tenant-a"}, db)
+
+        assert ctx.tenant_slug == "tenant-a"
+        rollback_spy.assert_not_called()

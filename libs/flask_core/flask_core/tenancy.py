@@ -32,6 +32,7 @@ from typing import Any, Optional
 from pydal.objects import Field, Query, Table
 
 from .auth import DEFAULT_TENANT_SLUG, verify_jwt_token
+from .database import db_operation
 from .secrets import require_secret_key
 
 logger = logging.getLogger(__name__)
@@ -118,12 +119,22 @@ async def resolve_tenant_context(payload: dict[str, Any], dal: Any) -> TenantCon
     tenant fallback (see auth.py), so `payload["tenant"]` is always present
     by the time this runs; a still-missing claim is a hard 403, never a
     second silent default.
+
+    This is the near-universal per-request chokepoint (`tenant_middleware`
+    and `install_community_scoped_auth` both call it on almost every
+    hub-api route), which is exactly why its raw `.select()` is wrapped in
+    `db_operation()`: `dal` is the shared, un-pooled raw pydal DAL (see
+    `database.py`'s docstring), and any exception here -- including the
+    `InFailedSqlTransaction` cascade from some earlier, unrelated failed
+    write that never rolled back -- must not leave the connection
+    poisoned for every request that follows.
     """
     tenant_slug = payload.get("tenant")
     if not tenant_slug:
         raise TenantIsolationError("token carries no tenant claim")
 
-    row = dal(dal.tenants.slug == tenant_slug).select().first()
+    with db_operation(dal, "resolve_tenant_context:tenants.select"):
+        row = dal(dal.tenants.slug == tenant_slug).select().first()
     if row is None:
         raise TenantIsolationError(f"tenant '{tenant_slug}' does not exist")
     if not row.is_active:

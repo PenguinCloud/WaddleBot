@@ -679,6 +679,59 @@ class TestCrossAppRouting:
         env_out = StageEnvelope.from_dict(json.loads(raw_out))
         assert env_out.target_app_id is None
 
+    async def test_target_app_id_with_tenant_wide_community_carries_resolved_community(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: tenant-wide routing must not put `community=None` on the action envelope.
+
+        Before the fix, `_transform_and_enqueue` built the outbound envelope
+        with `envelope_in.community` (still `None` for a tenant-wide
+        activation) instead of the resolved `community_for_context` (the
+        demo-shim value used for `bundle_context()`/`transform_fn` itself).
+        A cross-app-routed action bundle (e.g. `social_music_action`,
+        `community_forums_action`) that requires a real community then
+        rejected or silently mis-persisted the event. This proves the
+        resolved value now rides all the way onto the action envelope.
+        """
+
+        async def _stub_transform(event: PlatformEvent) -> PlatformEvent | None:
+            return dataclasses.replace(
+                event,
+                payload={**event.payload, PROCESS_TARGET_APP_ID_KEY: self._TARGET_APP_ID},
+            )
+
+        import runner as runner_module
+
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: _stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": None,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, None, APP_ID, "process")
+        env_in = _envelope(community=None, stage="process", text="!forum create Title | Body")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1
+
+        target_action_key = bundle_stream_key(TENANT, None, self._TARGET_APP_ID, "action")
+        raw_out = await redis_client.rpop(target_action_key)
+        assert raw_out is not None
+
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.community == str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
+        assert env_out.community is not None
+
     async def test_forum_command_via_real_bot_process_routes_to_forums_action_key(
         self, redis_client: Any, http_client_factory: Any
     ) -> None:
@@ -722,6 +775,122 @@ class TestCrossAppRouting:
         assert env_out.event.payload["forum_title"] == "My Title"
         assert env_out.event.payload["forum_body"] == "My Body"
         assert PROCESS_TARGET_APP_ID_KEY not in env_out.event.payload
+
+    async def test_forum_command_tenant_wide_activation_carries_resolved_community(
+        self, redis_client: Any, http_client_factory: Any
+    ) -> None:
+        """Same as the test above, but the app is activated TENANT-WIDE (`community=None`).
+
+        Proves the fix for `community_forums_action.create_forum_post`,
+        which reads `envelope.community` directly (`community_id=envelope.
+        community`, `core/svc_action/bundles/community_forums_action.py`) --
+        before the fix this landed a `None` `community_id` in
+        `hub_forum_posts` for every tenant-wide activation.
+        """
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": None,
+                    "entrypoint": "bundles.bot_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, None, APP_ID, "process")
+        env_in = _envelope(community=None, stage="process", text="!forum create My Title | My Body")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1
+
+        forums_action_key = bundle_stream_key(TENANT, None, self._TARGET_APP_ID, "action")
+        raw_out = await redis_client.rpop(forums_action_key)
+        assert raw_out is not None
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.community == str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
+
+    async def test_song_request_via_real_bot_process_routes_to_music_action_key(
+        self, redis_client: Any, http_client_factory: Any
+    ) -> None:
+        """End-to-end with the REAL `bot_process` -> `social_music_process` delegation.
+
+        Community-scoped counterpart to the forum tests above, mirroring
+        `!sr`'s real routing shape (`_MUSIC_APP_ID =
+        "waddles.social.music.default"`, `bundles/social_music_process.py`).
+        """
+        music_app_id = "waddles.social.music.default"
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.bot_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        env_in = _envelope(community="42", stage="process", text="!sr some great song")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1
+
+        music_action_key = bundle_stream_key(TENANT, "42", music_app_id, "action")
+        raw_out = await redis_client.rpop(music_action_key)
+        assert raw_out is not None
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.target_app_id == music_app_id
+        assert env_out.community == "42"
+        assert env_out.event.payload["music_query"] == "some great song"
+
+    async def test_song_request_tenant_wide_activation_carries_resolved_community(
+        self, redis_client: Any, http_client_factory: Any
+    ) -> None:
+        """Root-cause proof: `!sr` under a TENANT-WIDE activation (`community=None`).
+
+        Before the fix this is the exact failure from the live trace:
+        `social_music_action.enqueue_song_request` raises
+        `NonRetryableTransportError("...envelope.community is None
+        (tenant-wide activation unsupported)")` because the action-stage
+        envelope carried `community=None` instead of the resolved demo-shim
+        value. Asserts the action envelope now carries a real community.
+        """
+        music_app_id = "waddles.social.music.default"
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": None,
+                    "entrypoint": "bundles.bot_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, None, APP_ID, "process")
+        env_in = _envelope(community=None, stage="process", text="!sr some great song")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1
+
+        music_action_key = bundle_stream_key(TENANT, None, music_app_id, "action")
+        raw_out = await redis_client.rpop(music_action_key)
+        assert raw_out is not None
+        env_out = StageEnvelope.from_dict(json.loads(raw_out))
+        assert env_out.community == str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
+        assert env_out.community is not None
+        assert env_out.event.payload["music_query"] == "some great song"
 
 
 class TestModerationGateWiring:

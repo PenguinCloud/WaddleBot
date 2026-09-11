@@ -23,7 +23,7 @@ guarantee two submissions run on the same worker thread -- see
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 # Field is exported via DAL but imported here for module users
@@ -499,3 +499,130 @@ def init_database(
         migrate=migrate,
         read_replica_uri=converted_replica,
     )
+
+
+@contextmanager
+def db_operation(dal: Any, operation: str):
+    """Guard a raw (non-`AsyncDAL`) pydal call: log the real failure, then
+    roll back `dal`'s connection before re-raising.
+
+    `dal` objects handed out via `app.config["dal"]` (see hub_api/app.py's
+    `startup()`) are the *raw* pydal `DAL`, not `AsyncDAL` -- call sites
+    like `tenancy.resolve_tenant_context` invoke `.select()`/`.insert()`
+    directly rather than through `AsyncDAL.select_async()` etc., so they
+    get none of that class's per-operation commit/rollback (see this
+    module's top docstring, #280). A failed query on this raw DAL leaves
+    its connection idle-in-transaction or aborted; PyDAL never
+    auto-commits, and because this DAL is a single instance reused by
+    every request under Quart (pydal connections are thread-local, and
+    nothing offloads these calls to a per-request thread), a poisoned
+    connection breaks ALL subsequent requests with
+    `InFailedSqlTransaction` until the process restarts. `operation`
+    names the call site in the log line so the actual trigger query is
+    visible instead of only the downstream cascade.
+
+    Usage:
+        with db_operation(dal, "resolve_tenant_context:tenants.select"):
+            row = dal(dal.tenants.slug == tenant_slug).select().first()
+    """
+    try:
+        yield
+    except Exception as exc:
+        logger.error(
+            "DB operation %r failed: %s: %s -- rolling back connection",
+            operation,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        try:
+            dal.rollback()
+        except Exception:  # noqa: BLE001 -- best-effort recovery, must not mask the original error
+            logger.exception("dal.rollback() itself failed after %r", operation)
+        raise
+
+
+def install_db_resilience(app: Any, *, dal_key: str = "dal") -> None:
+    """Wire a global Quart `teardown_request` hook that ends the shared
+    raw-pydal DAL's transaction after every request.
+
+    `app.config[dal_key]` is a single raw pydal `DAL` reused across every
+    request (see `init_database`'s / hub_api/app.py's docstrings). PyDAL
+    never auto-commits, and the ~200 blueprint call sites that query it
+    directly (`dal(query).select()`/`.insert()`/...) don't call
+    `.commit()`/`.rollback()` themselves -- a request that raises partway
+    through a write leaves that shared connection aborted for every later
+    request until the process restarts (the recurring
+    `InFailedSqlTransaction` cascade, reproduced live: `hub_api/blueprints/
+    v1/community_music_queue.py`'s `internal_enqueue_song_request` hit
+    `psycopg2.errors.UndefinedColumn: column communities.license_key does
+    not exist` -- a separate, pre-existing schema-drift bug tracked in
+    `hub_api/services/schema.py`'s own docstring, out of scope here --
+    which aborted the shared connection and cascaded into every other
+    endpoint's `resolve_tenant_context` call failing with
+    `InFailedSqlTransaction` until the pod restarted).
+
+    IMPORTANT -- `teardown_request`'s `exc` argument is *not* a reliable
+    failure signal here: Quart's `handle_user_exception` (app.py) only
+    re-raises (making `exc` visible to teardown) when `app.testing` or
+    `app.debug` is set; in the normal production configuration it catches
+    every unhandled exception itself, logs it via `log_exception`, and
+    returns a 500 response *without* ever raising past `full_dispatch_
+    request` -- so `exc` is `None` at teardown even for a request that
+    just poisoned the connection (verified: hub-api's live logs show
+    `ERROR in app: Exception on request ...` with a full traceback for
+    exactly this case, while this hook's own `exc is not None` branch
+    never fires for it). The commit-every-request branch below is
+    therefore the branch that actually matters in production: unconditionally
+    committing after every request is what self-heals a poisoned
+    connection regardless of whether `exc` was visible, because issuing
+    `COMMIT` against an already-aborted PostgreSQL transaction resolves to
+    an implicit `ROLLBACK` server-side rather than raising client-side.
+    The `exc is not None` branch is kept as an explicit rollback + log
+    path for whenever `PROPAGATE_EXCEPTIONS`/`testing`/`debug` *is* set
+    (e.g. under pytest with `app.testing = True`).
+
+    `db_operation()` above is the primary, always-active defense: it wraps
+    `resolve_tenant_context`'s raw `.select()` directly at the call site
+    (not dependent on Quart's teardown/exc semantics at all) and is what
+    both `tenant_middleware` and `install_community_scoped_auth` run on
+    nearly every request. This hook is the catch-all self-healing net for
+    every other raw `dal` call site. Call once per app -- the hook reads
+    `current_app.config` at teardown time, not at registration time, so
+    it's safe to call before the DAL is actually bound in
+    `app.config[dal_key]`.
+    """
+
+    @app.teardown_request
+    async def _end_shared_dal_transaction(exc: BaseException | None) -> None:
+        from quart import current_app
+
+        dal = current_app.config.get(dal_key)
+        if dal is None:
+            return
+
+        if exc is not None:
+            logger.error(
+                "Request failed with %s: %s -- rolling back shared DAL connection",
+                type(exc).__name__,
+                exc,
+                exc_info=exc,
+            )
+            try:
+                dal.rollback()
+            except Exception:  # noqa: BLE001 -- best-effort recovery during teardown
+                logger.exception("dal.rollback() failed during teardown")
+            return
+
+        try:
+            dal.commit()
+        except Exception as commit_exc:
+            logger.error(
+                "dal.commit() failed at request teardown: %s -- rolling back",
+                commit_exc,
+                exc_info=True,
+            )
+            try:
+                dal.rollback()
+            except Exception:  # noqa: BLE001 -- best-effort recovery during teardown
+                logger.exception("dal.rollback() after failed commit also failed")

@@ -31,6 +31,7 @@ the query is bound to.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import sys
 import types
@@ -46,7 +47,7 @@ if "flask_core" not in sys.modules:
     _stub.__path__ = [str(_PKG_DIR)]
     sys.modules["flask_core"] = _stub
 
-from flask_core.database import AsyncDAL
+from flask_core.database import AsyncDAL, db_operation, install_db_resilience
 
 
 @pytest.fixture
@@ -180,3 +181,172 @@ class TestSelectAsyncEndsItsTransaction:
 
         assert count == 1
         commit_spy.assert_called_once()
+
+
+class TestDbOperation:
+    """`db_operation()` -- the raw (non-`AsyncDAL`) pydal call-site guard.
+
+    `tenancy.resolve_tenant_context` and any future raw `dal(query).select()`
+    caller run through this, not `AsyncDAL`'s own per-method commit/rollback
+    above -- see the module docstring's #306/recurring-`InFailedSqlTransaction`
+    rationale. On failure it must log the real exception (type + message +
+    the named operation, not just a downstream cascade) and roll back the
+    connection *before* re-raising, so the connection self-heals for the
+    next request instead of staying poisoned until the process restarts.
+    """
+
+    def test_success_does_not_roll_back(self) -> None:
+        dal = MagicMock()
+
+        with db_operation(dal, "noop"):
+            pass
+
+        dal.rollback.assert_not_called()
+
+    def test_failure_rolls_back_and_logs_before_reraising(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        dal = MagicMock()
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RuntimeError, match="InFailedSqlTransaction"):
+                with db_operation(dal, "resolve_tenant_context:tenants.select"):
+                    raise RuntimeError("InFailedSqlTransaction: current transaction is aborted")
+
+        dal.rollback.assert_called_once()
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR log line, found none"
+        assert any(
+            "resolve_tenant_context:tenants.select" in r.message
+            and "RuntimeError" in r.message
+            and "InFailedSqlTransaction" in r.message
+            for r in error_records
+        )
+
+    def test_a_subsequent_operation_on_the_same_dal_succeeds_after_rollback(self) -> None:
+        """The connection self-heals: a second `db_operation()` block against
+        the same (now rolled-back) `dal` completes normally instead of
+        inheriting the first block's failure."""
+        dal = MagicMock()
+
+        with pytest.raises(RuntimeError):
+            with db_operation(dal, "first-op-fails"):
+                raise RuntimeError("boom")
+        dal.rollback.assert_called_once()
+
+        with db_operation(dal, "second-op-succeeds"):
+            dal.tenants.select()  # no exception -- proves the block completes cleanly
+
+        dal.rollback.assert_called_once()  # still just the one, from the first block
+
+    def test_rollback_failure_does_not_mask_the_original_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`dal.rollback()` itself failing must not swallow the real error --
+        best-effort recovery, the original exception still propagates."""
+        dal = MagicMock()
+        dal.rollback.side_effect = RuntimeError("rollback also broken")
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RuntimeError, match="original failure"):
+                with db_operation(dal, "op"):
+                    raise RuntimeError("original failure")
+
+        dal.rollback.assert_called_once()
+
+
+class TestInstallDbResilience:
+    """`install_db_resilience()` -- the service-wide `teardown_request` net.
+
+    Covers every raw `dal` call site `db_operation()` doesn't wrap directly
+    (any of the ~200 blueprint queries in hub_api) -- rolls back + logs on
+    an unhandled request failure, commits on success so a bare read doesn't
+    itself leave the shared connection idle-in-transaction.
+    """
+
+    def _make_app(self, dal: Any):
+        from quart import Quart
+
+        app = Quart(__name__)
+        app.config["dal"] = dal
+        install_db_resilience(app)
+
+        @app.route("/ok")
+        async def ok() -> str:
+            return "fine"
+
+        @app.route("/boom")
+        async def boom() -> str:
+            raise RuntimeError("InFailedSqlTransaction: simulated poisoned connection")
+
+        return app
+
+    async def test_commits_on_a_successful_request(self) -> None:
+        dal = MagicMock()
+        app = self._make_app(dal)
+
+        async with app.test_app() as running:
+            response = await running.test_client().get("/ok")
+
+        assert response.status_code == 200
+        dal.commit.assert_called_once()
+        dal.rollback.assert_not_called()
+
+    async def test_default_mode_self_heals_via_commit_even_on_a_failed_request(self) -> None:
+        """In Quart's default (non-testing, non-debug) config,
+        `handle_user_exception` swallows the unhandled exception into a 500
+        response itself and never re-raises it past `full_dispatch_request`
+        -- `teardown_request`'s `exc` is `None` even for this failing
+        request (verified against hub-api's real logs). The unconditional
+        `dal.commit()` in that branch is what actually self-heals the
+        connection here: COMMIT against an aborted PostgreSQL transaction
+        resolves to an implicit ROLLBACK server-side rather than raising."""
+        dal = MagicMock()
+        app = self._make_app(dal)
+
+        async with app.test_app() as running:
+            response = await running.test_client().get("/boom")
+
+        assert response.status_code == 500
+        dal.commit.assert_called_once()
+        dal.rollback.assert_not_called()
+
+    async def test_testing_mode_propagates_exc_and_takes_the_rollback_log_path(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """With `app.testing = True` (or `debug`), Quart's `handle_exception`
+        re-raises instead of swallowing -- `exc` reaches teardown, and this
+        hook takes the explicit rollback + log-the-real-exception branch."""
+        dal = MagicMock()
+        app = self._make_app(dal)
+        app.testing = True
+
+        with caplog.at_level(logging.ERROR):
+            async with app.test_app() as running:
+                response = await running.test_client().get("/boom")
+
+        assert response.status_code == 500
+        dal.rollback.assert_called_once()
+        dal.commit.assert_not_called()
+        assert any(
+            "InFailedSqlTransaction" in r.message and "RuntimeError" in r.message
+            for r in caplog.records
+            if r.levelno == logging.ERROR
+        )
+
+    async def test_next_request_after_a_failure_still_commits_cleanly(self) -> None:
+        """The shared `dal` isn't left in a broken state for the request
+        after the one that failed -- exactly the recurring-cascade bug.
+        Default (production) mode: both requests commit unconditionally."""
+        dal = MagicMock()
+        app = self._make_app(dal)
+
+        async with app.test_app() as running:
+            client = running.test_client()
+            first = await client.get("/boom")
+            second = await client.get("/ok")
+
+        assert first.status_code == 500
+        assert second.status_code == 200
+        assert dal.commit.call_count == 2
+        dal.rollback.assert_not_called()
