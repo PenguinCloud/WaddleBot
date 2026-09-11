@@ -15,10 +15,12 @@ import 'package:gazer/providers/devices_provider.dart';
 import 'package:gazer/providers/license_provider.dart';
 import 'package:gazer/providers/pipeline_provider.dart';
 import 'package:gazer/providers/settings_provider.dart';
+import 'package:gazer/providers/telemetry_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
 import 'package:gazer/screens/status_panel.dart';
 import 'package:gazer/services/pipeline_controller.dart';
 import 'package:gazer/services/reconnect_policy.dart';
+import 'package:gazer/telemetry/telemetry_config.dart';
 import 'package:mocktail/mocktail.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:url_launcher_platform_interface/url_launcher_platform_interface.dart';
@@ -83,6 +85,16 @@ void main() {
     isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
     updateCheckerProvider.overrideWith(
       (Ref ref) async => FakeUpdateChecker(update),
+    ),
+    telemetryConfigProvider.overrideWith(
+      (Ref ref) async => const TelemetryConfig(
+        endpoint: '',
+        protocol: 'http/json',
+        headers: <String, String>{},
+        serviceName: 'gazer',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
     ),
   ];
 
@@ -216,5 +228,16 @@ void main() {
         );
       },
     );
+  });
+
+  testWidgets('telemetry row shows disabled when no endpoint is configured', (
+    WidgetTester tester,
+  ) async {
+    await pumpGazerApp(
+      tester,
+      overrides: overrides(),
+      size: const Size(1280, 800),
+    );
+    expect(find.text('Disabled (no endpoint configured)'), findsOneWidget);
   });
 }

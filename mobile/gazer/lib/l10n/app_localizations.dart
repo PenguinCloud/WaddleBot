@@ -843,6 +843,42 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Open settings'**
   String get permissionOpenSettingsLabel;
+
+  /// No description provided for @telemetryEndpointFieldLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Telemetry endpoint'**
+  String get telemetryEndpointFieldLabel;
+
+  /// No description provided for @telemetryEndpointFieldHint.
+  ///
+  /// In en, this message translates to:
+  /// **'https://otel-collector.example.com:4318'**
+  String get telemetryEndpointFieldHint;
+
+  /// No description provided for @statusPanelTelemetryLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Telemetry'**
+  String get statusPanelTelemetryLabel;
+
+  /// No description provided for @statusPanelTelemetryDisabledLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Disabled (no endpoint configured)'**
+  String get statusPanelTelemetryDisabledLabel;
+
+  /// No description provided for @statusPanelTelemetryExportingLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Exporting'**
+  String get statusPanelTelemetryExportingLabel;
+
+  /// No description provided for @statusPanelTelemetryFailedLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Last export failed'**
+  String get statusPanelTelemetryFailedLabel;
 }
 
 class _AppLocalizationsDelegate

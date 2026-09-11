@@ -92,7 +92,7 @@ pre-commit:
 # Every target below runs inside the gazer-toolchain image -- never on the
 # host. Host Flutter (snap) is never invoked directly; see docs/superpowers/
 # specs/2026-09-07-gazer-mobile-v2-design.md Toolchain, CI, Versioning.
-.PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-build-signed mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
+.PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-build-signed mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile mobile-telemetry-check
 # mobile-test-integration is added later by Task 21; mobile-screenshots and
 # seed-mock-data-mobile are added later by Task 26 -- pre-declared phony here
 # (harmless before those targets exist) so the whole mobile-* target set is
@@ -175,3 +175,13 @@ mobile-codegen:
 
 mobile-clean:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter clean; if [ -d android ]; then cd android && ./gradlew clean; fi"
+
+# OpenTelemetry emission gate (Task 27): runs ONLY the local-OTLP-sink test
+# and greps its printed "telemetry sink received: ..." line for four
+# non-zero counts. set -euo pipefail means a test failure already aborts
+# before the grep runs; the grep is the second, independent check the
+# house Verification Integrity rule requires -- it fails the build if the
+# counts line is somehow missing or shows a zero, not just if the test
+# framework's own exit code says pass.
+mobile-telemetry-check:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test test/telemetry/otlp_sink_test.dart 2>&1 | tee /tmp/gazer-telemetry-check.log; grep -E 'telemetry sink received: logs=[1-9][0-9]* metrics=[1-9][0-9]* histograms=[1-9][0-9]* spans=[1-9][0-9]*' /tmp/gazer-telemetry-check.log"

@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 
+import '../telemetry/gazer_telemetry.dart';
+
 /// Structured, sanitized logging for Gazer.
 ///
 /// Emits one JSON line per call via `dart:developer`'s `log()` — never
@@ -56,13 +58,19 @@ class GazerLog {
   /// [JsonEncoder.toEncodable], instead of propagating a
   /// [JsonUnsupportedObjectError] to the caller.
   static void _emit(String level, String event, Map<String, Object?> fields) {
+    final sanitized = sanitize(fields);
     final record = <String, Object?>{
       'ts': DateTime.now().toIso8601String(),
       'level': level,
       'event': event,
-      ...sanitize(fields),
+      ...sanitized,
     };
     sink(jsonEncode(record, toEncodable: (Object? value) => value.toString()));
+    // Already-sanitized fields only -- GazerTelemetry never re-sanitizes,
+    // so this is the one funnel point that guarantees no secret/PII ever
+    // reaches an attribute. debug() only calls _emit when GazerLog.verbose
+    // is true, so telemetry's debug-level logs stay off by default too.
+    GazerTelemetry.recordLog(level, event, sanitized);
   }
 
   /// Masks [value]: `null`/empty -> `''`; otherwise `'****'` + the last 4

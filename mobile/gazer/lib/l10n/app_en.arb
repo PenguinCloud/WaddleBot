@@ -138,5 +138,11 @@
   "permissionDeniedMessage": "Camera and microphone permission are needed to go live.",
   "permissionDeniedRetryLabel": "Retry",
   "permissionPermanentlyDeniedMessage": "Camera or microphone permission was permanently denied.",
-  "permissionOpenSettingsLabel": "Open settings"
+  "permissionOpenSettingsLabel": "Open settings",
+  "telemetryEndpointFieldLabel": "Telemetry endpoint",
+  "telemetryEndpointFieldHint": "https://otel-collector.example.com:4318",
+  "statusPanelTelemetryLabel": "Telemetry",
+  "statusPanelTelemetryDisabledLabel": "Disabled (no endpoint configured)",
+  "statusPanelTelemetryExportingLabel": "Exporting",
+  "statusPanelTelemetryFailedLabel": "Last export failed"
 }

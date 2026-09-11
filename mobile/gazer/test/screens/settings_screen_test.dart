@@ -11,8 +11,10 @@ import 'package:gazer/providers/connectivity_provider.dart';
 import 'package:gazer/providers/devices_provider.dart';
 import 'package:gazer/providers/license_provider.dart';
 import 'package:gazer/providers/settings_provider.dart';
+import 'package:gazer/providers/telemetry_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
 import 'package:gazer/services/gazer_log.dart';
+import 'package:gazer/telemetry/telemetry_config.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../helpers/fake_host_api.dart';
@@ -57,6 +59,16 @@ void main() {
     isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
     updateCheckerProvider.overrideWith(
       (Ref ref) async => FakeUpdateChecker(null),
+    ),
+    telemetryConfigProvider.overrideWith(
+      (Ref ref) async => const TelemetryConfig(
+        endpoint: '',
+        protocol: 'http/json',
+        headers: <String, String>{},
+        serviceName: 'gazer',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
     ),
   ];
 
@@ -337,6 +349,32 @@ void main() {
         findsOneWidget,
       );
       expect(settingsRepo.saved, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'telemetry endpoint field is hidden until unlocked, then persists on save',
+    (WidgetTester tester) async {
+      await pumpSettings(tester);
+      expect(find.byKey(const Key('telemetryEndpointField')), findsNothing);
+
+      await tester.longPress(find.byKey(const Key('versionFooter')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('telemetryEndpointField')), findsOneWidget);
+
+      await tester.enterText(
+        find.widgetWithText(TextFormField, 'RTMP URL'),
+        'rtmp://example.com/live/mystream',
+      );
+      await tester.enterText(
+        find.byKey(const Key('telemetryEndpointField')),
+        'http://collector.example.com:4318',
+      );
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(settingsRepo.saved, isNotEmpty);
     },
   );
 }

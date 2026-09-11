@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_libs/flutter_libs.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/flag_keys.dart';
 import '../l10n/app_localizations.dart';
@@ -10,8 +11,10 @@ import '../models/quality.dart';
 import '../models/validation_issue.dart';
 import '../providers/license_provider.dart';
 import '../providers/settings_provider.dart';
+import '../providers/telemetry_provider.dart';
 import '../services/feature_flags.dart';
 import '../services/target_validator.dart';
+import '../telemetry/telemetry_config.dart';
 
 /// Validates [settings] against the RTMP/RTMPS target rules plus the
 /// license-gated rtmp-auth flag, returning every failing [ValidationIssue].
@@ -58,8 +61,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final TextEditingController _streamKey = TextEditingController();
   final TextEditingController _username = TextEditingController();
   final TextEditingController _password = TextEditingController();
+  final TextEditingController _telemetryEndpoint = TextEditingController();
   GazerSettings? _draft;
   bool _initialized = false;
+  bool _telemetryInitialized = false;
   bool _devUnlocked = false;
   bool _streamKeyObscured = true;
   bool _passwordObscured = true;
@@ -105,6 +110,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _streamKey.dispose();
     _username.dispose();
     _password.dispose();
+    _telemetryEndpoint.dispose();
     super.dispose();
   }
 
@@ -117,6 +123,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     if (!_initialized && settingsAsync.hasValue) {
       _seed(settingsAsync.requireValue);
       _initialized = true;
+    }
+
+    final AsyncValue<TelemetryConfig> telemetryConfigAsync = ref.watch(
+      telemetryConfigProvider,
+    );
+    if (!_telemetryInitialized && telemetryConfigAsync.hasValue) {
+      _telemetryEndpoint.text = telemetryConfigAsync.requireValue.endpoint;
+      _telemetryInitialized = true;
     }
 
     if (_draft == null) {
@@ -393,6 +407,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 onChanged: (bool v) =>
                     _update((GazerSettings s) => s.copyWith(debugLogs: v)),
               ),
+              TextFormField(
+                key: const Key('telemetryEndpointField'),
+                controller: _telemetryEndpoint,
+                decoration: InputDecoration(
+                  labelText: l10n.telemetryEndpointFieldLabel,
+                  hintText: l10n.telemetryEndpointFieldHint,
+                ),
+              ),
             ],
             const SizedBox(height: 16),
             Semantics(
@@ -404,6 +426,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     ? () async {
                         try {
                           await ref.read(settingsProvider.notifier).save(draft);
+                          await TelemetryConfig.saveEndpointOverride(
+                            SharedPreferencesAsync(),
+                            _telemetryEndpoint.text.trim(),
+                          );
+                          ref.invalidate(telemetryConfigProvider);
+                          await ref.read(telemetryConfigProvider.future);
                         } catch (_) {
                           // Never surface the exception's own text: it may
                           // wrap a secret-bearing value (e.g. secure-storage
