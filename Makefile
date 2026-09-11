@@ -121,7 +121,7 @@ mobile-lint:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter analyze; dart format --set-exit-if-changed .; if [ -d android ]; then cd android && ./gradlew ktlintCheck lint; fi"
 
 mobile-test:
-	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test --coverage; bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov"
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter test --coverage --dart-define=GAZER_SEED=true; bash scripts/coverage_gate.sh 90 coverage/lcov.info lcov"
 
 mobile-test-android:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; cd android && ./gradlew testDebugUnitTest jacocoTestReport && cd .. && bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco"
