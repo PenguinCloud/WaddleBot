@@ -6,6 +6,17 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gazer/telemetry/gazer_telemetry.dart';
 import 'package:gazer/telemetry/telemetry_config.dart';
 
+/// An attribute value whose `toString()` throws, simulating a
+/// caller-supplied value the exporter cannot serialize -- `GazerLog`'s own
+/// `sanitize()` never produces one (it only ever emits String/num/bool/
+/// null), but a direct `GazerTelemetry.recordLog`/`histogram`/`counter`
+/// caller might pass something unexpected, so the exporter's never-throw
+/// guarantee is asserted at that boundary too.
+class _ThrowingToString {
+  @override
+  String toString() => throw StateError('toString() deliberately throws');
+}
+
 void main() {
   tearDown(GazerTelemetry.resetForTest);
 
@@ -166,4 +177,114 @@ void main() {
 
     expect(requestsReceived, 0);
   });
+
+  test('a log attribute whose toString() throws never escapes flush(), and other signals still export', () async {
+    int logRecords = 0;
+    int metricDataPoints = 0;
+
+    final HttpServer server = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    final subscription = server.listen((HttpRequest request) async {
+      final String body = await utf8.decoder.bind(request).join();
+      final Map<String, dynamic> decoded =
+          jsonDecode(body) as Map<String, dynamic>;
+      if (request.uri.path == '/v1/logs') {
+        for (final rl in decoded['resourceLogs'] as List) {
+          for (final sl in (rl as Map<String, dynamic>)['scopeLogs'] as List) {
+            logRecords +=
+                ((sl as Map<String, dynamic>)['logRecords'] as List).length;
+          }
+        }
+      } else if (request.uri.path == '/v1/metrics') {
+        for (final rm in decoded['resourceMetrics'] as List) {
+          for (final sm
+              in (rm as Map<String, dynamic>)['scopeMetrics'] as List) {
+            metricDataPoints +=
+                ((sm as Map<String, dynamic>)['metrics'] as List).length;
+          }
+        }
+      }
+      request.response.statusCode = 200;
+      await request.response.close();
+    });
+    addTearDown(() async {
+      await server.close(force: true);
+      await subscription.cancel();
+    });
+
+    GazerTelemetry.init(
+      TelemetryConfig(
+        endpoint: 'http://127.0.0.1:${server.port}',
+        protocol: 'http/json',
+        headers: const <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    GazerTelemetry.recordLog('info', 'test.log', <String, Object?>{
+      'bad': _ThrowingToString(),
+    });
+    GazerTelemetry.counter('test.counter');
+
+    // The poisoned log batch's encoding throws inside OtlpHttpExporter
+    // .post's guard; flush() itself must still complete normally.
+    await expectLater(GazerTelemetry.flush(), completes);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    // The failed log batch is counted (never thrown) and stays buffered
+    // -- same rule as a network failure -- but the counter, an
+    // unrelated signal type flushed in the same cycle, still exports.
+    expect(GazerTelemetry.exportFailures, greaterThanOrEqualTo(1));
+    expect(metricDataPoints, greaterThanOrEqualTo(1));
+
+    // A second flush() call proves the pipeline itself is not wedged or
+    // crashed by the earlier encoding failure.
+    await expectLater(GazerTelemetry.flush(), completes);
+    expect(logRecords, 0);
+  });
+
+  test(
+    'reloading telemetry config closes the previous exporter\'s Dio client',
+    () async {
+      final Dio firstDio = Dio();
+      GazerTelemetry.init(
+        const TelemetryConfig(
+          endpoint: 'http://127.0.0.1:1',
+          protocol: 'http/json',
+          headers: <String, String>{},
+          serviceName: 'gazer-test',
+          serviceVersion: '0.0.0',
+          deploymentEnvironment: 'test',
+        ),
+        dio: firstDio,
+      );
+
+      GazerTelemetry.init(
+        const TelemetryConfig(
+          endpoint: 'http://127.0.0.1:2',
+          protocol: 'http/json',
+          headers: <String, String>{},
+          serviceName: 'gazer-test',
+          serviceVersion: '0.0.0',
+          deploymentEnvironment: 'test',
+        ),
+        dio: Dio(),
+      );
+
+      // The second init() call replaced GazerTelemetry's exporter and
+      // closed `firstDio` as a side effect -- using `firstDio` directly
+      // now throws (a closed Dio/HttpClient rejects new requests) rather
+      // than attempting a real network call, proving `close()` was
+      // actually invoked on the previous client, not just discarded.
+      await expectLater(
+        firstDio.get<dynamic>('http://127.0.0.1:1/'),
+        throwsA(anything),
+      );
+    },
+  );
 }

@@ -77,14 +77,19 @@ class GazerTelemetry {
   /// Applies [config] and rebuilds the exporter; starts the periodic flush
   /// scheduler on first call. Safe to call repeatedly -- e.g. every time
   /// Settings > Developer > Telemetry endpoint is saved, so a change takes
-  /// effect without an app restart.
+  /// effect without an app restart. The *previous* exporter's [Dio] client
+  /// is closed (aborting any in-flight request) after the new one is
+  /// installed, so repeated reloads never accumulate open HTTP clients or
+  /// keep emitting through a stale client pointed at the old endpoint.
   static void init(TelemetryConfig config, {Dio? dio}) {
     _config = config;
+    final OtlpHttpExporter previousExporter = _exporter;
     _exporter = OtlpHttpExporter(
       dio: dio ?? Dio(),
       endpoint: config.endpoint,
       headers: config.headers,
     );
+    previousExporter.close();
     _timer ??= Timer.periodic(flushInterval, (_) => flush());
   }
 
@@ -196,9 +201,17 @@ class GazerTelemetry {
   static Future<void> _flushLogs(Map<String, Object?> resourceAttrs) async {
     if (_logs.isEmpty) return;
     final List<OtlpLogRecord> batch = List<OtlpLogRecord>.of(_logs);
+    // The body-builder closure is passed to `post`, not invoked here --
+    // `post` evaluates it inside its own never-throw guard, so a batch
+    // that fails to encode (e.g. an attribute value whose `toString()`
+    // throws) counts as an export failure, same as a network error,
+    // rather than escaping this `Timer.periodic`-driven call.
     final bool ok = await _exporter.post(
       '/v1/logs',
-      OtlpHttpExporter.encodeLogs(resourceAttrs: resourceAttrs, records: batch),
+      () => OtlpHttpExporter.encodeLogs(
+        resourceAttrs: resourceAttrs,
+        records: batch,
+      ),
     );
     if (ok) {
       exportSuccesses++;
@@ -213,7 +226,7 @@ class GazerTelemetry {
     final List<OtlpMetricPoint> batch = List<OtlpMetricPoint>.of(_metrics);
     final bool ok = await _exporter.post(
       '/v1/metrics',
-      OtlpHttpExporter.encodeMetrics(
+      () => OtlpHttpExporter.encodeMetrics(
         resourceAttrs: resourceAttrs,
         points: batch,
       ),
@@ -231,7 +244,10 @@ class GazerTelemetry {
     final List<OtlpSpanRecord> batch = List<OtlpSpanRecord>.of(_spans);
     final bool ok = await _exporter.post(
       '/v1/traces',
-      OtlpHttpExporter.encodeSpans(resourceAttrs: resourceAttrs, spans: batch),
+      () => OtlpHttpExporter.encodeSpans(
+        resourceAttrs: resourceAttrs,
+        spans: batch,
+      ),
     );
     if (ok) {
       exportSuccesses++;

@@ -57,12 +57,27 @@ class OtlpHttpExporter {
   final String _endpoint;
   final Map<String, String> _headers;
 
-  /// POSTs [body] (already OTLP-JSON-shaped) to `'$_endpoint$path'`.
-  /// Returns `true` on any 2xx response; `false` on any other status or
-  /// exception -- never throws, so a dead collector never propagates to
-  /// the caller.
-  Future<bool> post(String path, Map<String, Object?> body) async {
+  /// Closes the underlying [Dio] client, aborting any in-flight request.
+  /// Called by `GazerTelemetry.init`/`resetForTest` on the *previous*
+  /// exporter whenever telemetry config is reloaded, so a config reload
+  /// never leaks the old client's connection pool.
+  void close() => _dio.close(force: true);
+
+  /// Builds the OTLP-JSON body via [buildBody] and POSTs it to
+  /// `'$_endpoint$path'`. Returns `true` on any 2xx response; `false` on
+  /// any other status or exception -- **including an exception thrown by
+  /// [buildBody] itself** (e.g. a caller-supplied attribute value whose
+  /// `toString()` throws) -- so a dead collector, a malformed record, or
+  /// an unencodable attribute never propagates to the caller. [buildBody]
+  /// is evaluated lazily, inside this guard, rather than by the caller
+  /// beforehand, specifically so encoding shares the same never-throw
+  /// boundary as the network call.
+  Future<bool> post(
+    String path,
+    Map<String, Object?> Function() buildBody,
+  ) async {
     try {
+      final Map<String, Object?> body = buildBody();
       final Response<dynamic> response = await _dio.post<dynamic>(
         '$_endpoint$path',
         data: jsonEncode(body),
