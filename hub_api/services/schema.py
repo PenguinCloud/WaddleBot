@@ -2676,3 +2676,102 @@ def bind_music_tables(dal: Any, *, migrate: bool = False) -> None:
         Field("created_at", "datetime"),
         migrate=migrate,
     )
+
+
+def bind_loyalty_tables(dal: Any, *, migrate: bool = False) -> None:
+    """Define the loyalty MVP core-currency tables (gh-317).
+
+    New-feature schema (`alembic/versions/0015_loyalty_core_tables.py`),
+    not a Node port -- backs the eventual Python-native loyalty service;
+    `hub_api/services/community_loyalty.py`/`blueprints/v1/
+    community_loyalty.py` remain a pure reverse-proxy to the separate
+    `loyalty-interaction` deployment today and do not query these tables
+    directly (see the migration's own docstring for the full column-
+    naming provenance -- modeled on this file's `bind_token_billing_
+    tables()`/`bind_ai_routing_tables()` ledger precedent, `delta`/
+    `ref`/`balance_after`/`bigint`, not the disused legacy Python
+    module's `transaction_type`/`amount` naming).
+
+    `migrate=False` in production (schema owned by the numbered Alembic
+    migration, same contract as every other `bind_<group>_tables()` in
+    this file); tests pass `migrate=True` against a throwaway sqlite
+    file (`hub_api/PORTING.md` Gotcha #2). Idempotency guard mirrors
+    `bind_music_tables()` above -- not yet wired into `app.py::
+    _bind_reference_tables()` since no v1 blueprint queries hub-api's
+    own DB for loyalty data yet; callers bind lazily once that lands.
+    """
+    if "loyalty_config" in dal.tables:
+        return
+
+    dal.define_table(
+        "loyalty_config",
+        Field("community_id", "integer", notnull=True, unique=True),
+        Field("currency_name", "string", length=50, notnull=True, default="Points"),
+        Field("currency_symbol", "string", length=16, notnull=True, default="\U0001fa99"),
+        Field("earn_chat_points", "integer", notnull=True, default=1),
+        Field("earn_chat_cooldown_s", "integer", notnull=True, default=60),
+        Field("earn_watch_points_per_min", "integer", notnull=True, default=1),
+        Field("earn_watch_enabled", "boolean", notnull=True, default=False),
+        Field("max_balance", "bigint"),
+        Field("enabled", "boolean", notnull=True, default=True),
+        Field("updated_at", "datetime"),
+        migrate=migrate,
+    )
+
+    dal.define_table(
+        "loyalty_balances",
+        Field("community_id", "integer", notnull=True),
+        Field("platform", "string", length=50, notnull=True),
+        Field("platform_user_id", "string", length=255, notnull=True),
+        Field("balance", "bigint", notnull=True, default=0),
+        Field("lifetime_earned", "bigint", notnull=True, default=0),
+        Field("lifetime_spent", "bigint", notnull=True, default=0),
+        Field("updated_at", "datetime"),
+        migrate=migrate,
+    )
+
+    # Append-only -- balance is reconstructable from balance_after, same
+    # ledger contract as bind_token_billing_tables()'s token_transactions.
+    dal.define_table(
+        "loyalty_transactions",
+        Field("community_id", "integer", notnull=True),
+        Field("platform", "string", length=50, notnull=True),
+        Field("platform_user_id", "string", length=255, notnull=True),
+        Field("delta", "bigint", notnull=True),
+        Field("balance_after", "bigint", notnull=True),
+        Field("kind", "string", length=32, notnull=True),
+        Field("ref", "string", length=255),
+        Field("actor_platform_user_id", "string", length=255),
+        Field("created_at", "datetime"),
+        migrate=migrate,
+    )
+
+    dal.define_table(
+        "loyalty_shop_items",
+        Field("community_id", "integer", notnull=True),
+        Field("sku", "string", length=64, notnull=True),
+        Field("name", "string", length=120, notnull=True),
+        Field("description", "text"),
+        Field("cost", "bigint", notnull=True),
+        Field("stock", "integer"),
+        Field("enabled", "boolean", notnull=True, default=True),
+        Field("requires_mod_approval", "boolean", notnull=True, default=False),
+        Field("created_at", "datetime"),
+        Field("updated_at", "datetime"),
+        migrate=migrate,
+    )
+
+    dal.define_table(
+        "loyalty_redemptions",
+        Field("community_id", "integer", notnull=True),
+        Field("item_id", "integer", notnull=True),
+        Field("platform", "string", length=50, notnull=True),
+        Field("platform_user_id", "string", length=255, notnull=True),
+        Field("cost", "bigint", notnull=True),
+        Field("status", "string", length=16, notnull=True, default="pending"),
+        Field("note", "text"),
+        Field("created_at", "datetime"),
+        Field("fulfilled_at", "datetime"),
+        Field("fulfilled_by", "integer"),
+        migrate=migrate,
+    )
