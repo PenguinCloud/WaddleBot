@@ -395,7 +395,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 key: const Key('saveSettingsButton'),
                 onPressed: canSave
                     ? () async {
-                        await ref.read(settingsProvider.notifier).save(draft);
+                        try {
+                          await ref.read(settingsProvider.notifier).save(draft);
+                        } catch (_) {
+                          // Never surface the exception's own text: it may
+                          // wrap a secret-bearing value (e.g. secure-storage
+                          // failures echoing back what they failed to
+                          // write). The draft is left untouched either way —
+                          // this handler never clears `_draft`/the text
+                          // controllers, so a failed save is retryable.
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(l10n.settingsSaveFailed)),
+                          );
+                          return;
+                        }
                         if (!context.mounted) return;
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(content: Text(l10n.settingsSavedMessage)),

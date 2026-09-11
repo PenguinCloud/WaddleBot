@@ -795,6 +795,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Close'**
   String get statusPanelCloseButtonLabel;
+
+  /// No description provided for @settingsSaveFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to save settings. Please try again.'**
+  String get settingsSaveFailed;
 }
 
 class _AppLocalizationsDelegate

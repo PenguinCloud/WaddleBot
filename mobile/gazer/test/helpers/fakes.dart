@@ -20,11 +20,20 @@ class FakeSettingsRepository implements SettingsRepository {
   /// this instead of re-reading through [load].
   final List<GazerSettings> saved = <GazerSettings>[];
 
+  /// When set, [save] throws this instead of persisting — lets tests
+  /// exercise a caller's save-failure error handling without a real
+  /// storage backend.
+  Object? saveError;
+
   @override
   Future<GazerSettings> load() async => _current;
 
   @override
   Future<void> save(GazerSettings s) async {
+    final Object? error = saveError;
+    if (error != null) {
+      throw error;
+    }
     _current = s;
     saved.add(s);
   }

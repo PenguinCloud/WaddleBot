@@ -15,6 +15,13 @@ import 'package:gazer/app.dart';
 /// tests can drive the widget tree at a specific viewport (phone vs.
 /// tablet breakpoints). The view is reset via [addTearDown] so later tests
 /// in the same file are unaffected.
+///
+/// Resets [gazerRouter] to `'/'` before every pump: it is a top-level
+/// singleton, so its current location otherwise persists across every
+/// `testWidgets` in a file (they share one Dart isolate) — without this,
+/// only the first test that navigates away from `'/'` actually starts at
+/// HomeScreen, and every later one resumes wherever the previous test left
+/// navigation.
 Future<void> pumpGazerApp(
   WidgetTester t, {
   List<Override> overrides = const <Override>[],
@@ -25,6 +32,7 @@ Future<void> pumpGazerApp(
     t.view.devicePixelRatio = 1.0;
     addTearDown(t.view.reset);
   }
+  gazerRouter.go('/');
   await t.pumpWidget(
     ProviderScope(overrides: overrides, child: const GazerApp()),
   );

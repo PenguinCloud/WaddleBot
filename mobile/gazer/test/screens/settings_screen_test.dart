@@ -4,7 +4,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 // it moved to `misc.dart` in this pin (see helpers/pump_app.dart).
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
-import 'package:gazer/app.dart';
 import 'package:gazer/models/gazer_settings.dart';
 import 'package:gazer/models/license_state.dart';
 import 'package:gazer/models/quality.dart';
@@ -62,13 +61,6 @@ void main() {
 
   setUp(() {
     settingsRepo = FakeSettingsRepository();
-    // `gazerRouter` (app.dart) is a top-level singleton whose current
-    // location persists across every `testWidgets` in this file (they
-    // share one Dart isolate) — without resetting it, only the first test
-    // actually starts at HomeScreen; every later one resumes wherever the
-    // previous test left navigation, so the `Icons.settings` tap below
-    // finds nothing.
-    gazerRouter.go('/');
   });
 
   Future<void> pumpSettings(
@@ -290,6 +282,28 @@ void main() {
       );
       await tester.tap(find.widgetWithText(FilledButton, 'Save'));
       await tester.pump();
+      expect(settingsRepo.saved, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'a save failure shows an error SnackBar and leaves the draft unsaved',
+    (WidgetTester tester) async {
+      await pumpSettings(tester);
+      await tester.enterText(
+        find.widgetWithText(TextFormField, 'RTMP URL'),
+        'rtmp://example.com/live/mystream',
+      );
+      await tester.pump();
+
+      settingsRepo.saveError = StateError('disk full');
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Failed to save settings. Please try again.'),
+        findsOneWidget,
+      );
       expect(settingsRepo.saved, isEmpty);
     },
   );

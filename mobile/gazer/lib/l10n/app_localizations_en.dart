@@ -408,4 +408,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get statusPanelCloseButtonLabel => 'Close';
+
+  @override
+  String get settingsSaveFailed => 'Failed to save settings. Please try again.';
 }
