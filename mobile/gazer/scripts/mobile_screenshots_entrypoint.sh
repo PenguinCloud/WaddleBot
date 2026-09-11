@@ -84,6 +84,24 @@ wait_for_boot() {
   done
 }
 
+# Tracks the currently-booted emulator's pid so the EXIT trap below can tear
+# it down if this script exits (success, failure, or `set -e` abort) while
+# one is still running -- e.g. a build/drive failure between "start
+# emulator" and the normal "adb emu kill" teardown at the end of
+# run_form_factor would otherwise leak a running emulator process inside
+# the container. Idempotent: a no-op if the emulator already exited or was
+# already torn down normally (kill -0 fails silently either way).
+CURRENT_EMULATOR_PID=""
+
+cleanup_emulator() {
+  if [ -n "$CURRENT_EMULATOR_PID" ] && kill -0 "$CURRENT_EMULATOR_PID" 2>/dev/null; then
+    echo "cleanup: emulator (pid $CURRENT_EMULATOR_PID) still running on exit -- killing it"
+    adb emu kill 2>/dev/null || kill "$CURRENT_EMULATOR_PID" 2>/dev/null || true
+    wait "$CURRENT_EMULATOR_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_emulator EXIT
+
 run_form_factor() {
   local avd_name="$1"
   local emulator_flags="$2"
@@ -102,6 +120,7 @@ run_form_factor() {
     "$EMULATOR_BIN" -avd "$avd_name" -no-window -gpu swiftshader_indirect -no-audio \
     -no-boot-anim -no-snapshot -accel on $emulator_flags &
   local emulator_pid=$!
+  CURRENT_EMULATOR_PID="$emulator_pid"
 
   # Bounded: if the emulator dies during startup, a bare `adb wait-for-device`
   # blocks forever and the failure only ever surfaces as a job-level timeout.
@@ -148,6 +167,7 @@ run_form_factor() {
 
   adb emu kill || echo "emulator for $form_factor already exited"
   wait "$emulator_pid" 2>/dev/null || echo "emulator process for $form_factor already reaped"
+  CURRENT_EMULATOR_PID=""
 }
 
 if [ "$REQUESTED_FORM_FACTOR" = "both" ] || [ "$REQUESTED_FORM_FACTOR" = "phone" ]; then

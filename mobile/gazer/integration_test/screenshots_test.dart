@@ -46,6 +46,25 @@ void main() {
     await tester.pumpWidget(const ProviderScope(child: GazerApp()));
     await tester.pumpAndSettle(const Duration(seconds: 5));
 
+    // Wait for the license/flag fetch to resolve before capturing anything.
+    // DebugOverrides (providers/license_provider.dart) forces the M1 flags
+    // ON once that fetch completes -- success or degraded, it never throws
+    // -- via the --dart-define=GAZER_FLAGS_OVERRIDE set at build time (see
+    // mobile_screenshots_entrypoint.sh's FLAGS_DEFINE). Until it resolves,
+    // Go Live stays disabled and the status panel's License row is stuck on
+    // "Fetching features...". pumpAndSettle cannot wait for a real network
+    // round trip; poll instead, same pattern and timeout as
+    // go_live_unreachable_test.dart's wait for goLiveButton to enable.
+    await _pumpUntil(
+      tester,
+      () =>
+          tester
+              .widget<FilledButton>(find.byKey(const Key('goLiveButton')))
+              .onPressed !=
+          null,
+      timeout: const Duration(seconds: 60),
+    );
+
     // Android renders Flutter into a SurfaceView the screenshot API cannot
     // read back, so integration_test's IOCallbackManager throws
     // `Call convertFlutterSurfaceToImage() before taking a screenshot`
@@ -76,4 +95,22 @@ void main() {
     await tester.pumpAndSettle();
     await binding.takeScreenshot('status-panel-$_formFactor');
   });
+}
+
+/// Pumps in short increments until [predicate] is true or [timeout]
+/// elapses. Mirrors go_live_unreachable_test.dart's helper of the same
+/// name/signature (private to each file — not shared across
+/// integration_test/ entrypoints).
+Future<bool> _pumpUntil(
+  WidgetTester tester,
+  bool Function() predicate, {
+  required Duration timeout,
+  Duration step = const Duration(milliseconds: 250),
+}) async {
+  final Stopwatch sw = Stopwatch()..start();
+  while (sw.elapsed < timeout) {
+    await tester.pump(step);
+    if (predicate()) return true;
+  }
+  return false;
 }

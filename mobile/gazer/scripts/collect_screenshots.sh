@@ -27,6 +27,10 @@ for name in "${NAMES[@]}"; do
     echo "ERROR: expected screenshot missing: $src" >&2
     exit 1
   fi
+  if [ ! -s "$src" ]; then
+    echo "ERROR: expected screenshot is empty (0 bytes): $src" >&2
+    exit 1
+  fi
   cp "$src" "$DEST_DIR/$name.png"
   copied=$((copied + 1))
 done

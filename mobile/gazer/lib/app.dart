@@ -103,6 +103,7 @@ class _GazerAppState extends ConsumerState<GazerApp>
       theme: GazerApp._elderDarkTheme,
       darkTheme: GazerApp._elderDarkTheme,
       themeMode: ThemeMode.system,
+      debugShowCheckedModeBanner: false,
       routerConfig: gazerRouter,
       localizationsDelegates: AppLocalizations.localizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
