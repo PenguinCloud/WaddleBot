@@ -128,6 +128,9 @@ presentation:
   service:
     type: NodePort
     nodePort: 31032
+  # Matches pipeline.svcStreaming.publicBaseUrl above -- same media NodePort host, so
+  # live_stream.py's browser-facing HLS URLs resolve off-laptop like svc-streaming's own.
+  publicStreamingUrl: "http://192.168.10.75:31208"
 
 # Issue #287 -- svc-streaming (Rust) image, built locally + pushed to the local registry
 # (no CI image for it yet), same as every other alpha module.

@@ -69,6 +69,16 @@ spec:
           value: "presentation"
         - name: MODULE_PORT
           value: {{ .Values.pipeline.svcPresentation.port | quote }}
+        # core/svc_presentation/blueprints/live_stream.py: cluster-internal svc-streaming
+        # base URL for server-side `/live/<community_id>` proxy calls -- the browser never
+        # reaches this, only PUBLIC_STREAMING_URL below is embedded into the page.
+        - name: STREAMING_URL
+          value: "http://{{ include "waddlebot.fullname" . }}-svc-streaming:{{ .Values.pipeline.svcStreaming.port }}"
+        # externally-reachable svc-streaming base URL rewritten into HLS playback URLs for
+        # the browser's own HLS.js fetches. Empty by default (live_stream.py degrades to
+        # "offline" rather than guessing a hostname); see values.yaml/values-alpha.yaml.
+        - name: PUBLIC_STREAMING_URL
+          value: {{ .Values.presentation.publicStreamingUrl | default "" | quote }}
         livenessProbe:
           httpGet:
             path: /health

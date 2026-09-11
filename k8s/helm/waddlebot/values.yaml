@@ -620,6 +620,12 @@ presentation:
   service:
     type: ClusterIP
     nodePort: ""
+  # core/svc_presentation/blueprints/live_stream.py PUBLIC_STREAMING_URL -- externally
+  # reachable svc-streaming base URL rewritten into HLS playback URLs for the browser's
+  # own fetches. Empty by default: that file degrades to "offline" rather than guessing a
+  # public hostname when unset (never a broken/empty player src). Alpha overrides to the
+  # svc-streaming media NodePort's LAN URL -- see values-alpha.yaml.
+  publicStreamingUrl: ""
 
 # v3.0.x — Rust svc-streaming image (Issue #287). Own Dockerfile
 # (core/svc_streaming/Dockerfile.rust), not the shared pipeline.pythonBaseImage
