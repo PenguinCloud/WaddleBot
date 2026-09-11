@@ -15908,6 +15908,10 @@ COMMIT_EOF
   ```
   Record: Dart lcov coverage % from `coverage/lcov.info` (`lcov --summary coverage/lcov.info` or the `scripts/coverage_gate.sh` output) — must be >=90%, and record the file count the gate examined (non-zero denominator).
   ```
+  make mobile-telemetry-check
+  ```
+  Record: the printed `telemetry sink received: logs=.. metrics=.. histograms=.. spans=..` line — every count must be >=1; zero on any of the four is a FAIL per the house OpenTelemetry emission gate (Task 27), not a pass.
+  ```
   make mobile-test-android
   ```
   Record: Kotlin JaCoCo coverage % from `android/app/build/reports/jacoco/testDebugUnitTestCoverage/html/index.html` (or the CI-parsed summary) — must be >=90%.
@@ -15951,7 +15955,7 @@ COMMIT_EOF
   ```
   (Use the actual date the manual test is run for both the filename and the note's contents, not necessarily 2026-09-07 if verification happens later.)
 
-  **Merge gate:** Merge to `release/v3.0.X` happens via PR per the `merging-to-release` skill, and only once every gate above — `make mobile-lint`, `make mobile-test` (>=90%), `make mobile-test-android` (>=90%), `make mobile-security` (0 findings, non-zero denominator recorded), `make mobile-build` (all ABIs < 100MB), `make mobile-test-integration` (non-zero test count), CI green on every job, and the manual physical-device recovery test — is green. No direct merge, no `--admin`, no exceptions.
+  **Merge gate:** Merge to `release/v3.0.X` happens via PR per the `merging-to-release` skill, and only once every gate above — `make mobile-lint`, `make mobile-test` (>=90%), `make mobile-telemetry-check` (all four OTLP counts >=1), `make mobile-test-android` (>=90%), `make mobile-security` (0 findings, non-zero denominator recorded), `make mobile-build` (all ABIs < 100MB), `make mobile-test-integration` (non-zero test count), CI green on every job, and the manual physical-device recovery test — is green. No direct merge, no `--admin`, no exceptions.
 
 
 ### Task 27: OpenTelemetry emission
