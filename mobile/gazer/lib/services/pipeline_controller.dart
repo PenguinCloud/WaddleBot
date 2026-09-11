@@ -67,6 +67,28 @@ class PipelineController {
   bool _cancelled = false;
   bool _isDisposed = false;
   bool _goingLive = false;
+
+  /// True from the moment a reconnect retry is scheduled until its re-prepare
+  /// either reaches [ConnectingState] or terminates in [ErrorState]. While
+  /// true, [_onNativeStateEvent] suppresses the native `preparing`/`ready`
+  /// events `GazerPipeline.prepare` fires unconditionally (GazerPipeline.kt:74,
+  /// :133) — applying them would replace the visible [ReconnectingState] with
+  /// Preparing/Ready for the retry's camera-open + codec-configure window.
+  /// `home_screen.dart` renders the Stop button only for
+  /// Connecting/Streaming/Reconnecting, so that window would otherwise hide
+  /// Stop and briefly enable Go Live during the Ready instant — tapping it
+  /// would reset [_reconnectAttempt] and defeat the retry budget.
+  bool _reconnecting = false;
+
+  /// Monotonic counter incremented by every [goLive] and [stop] call,
+  /// identifying the current streaming session. [_retryAfter] captures the
+  /// epoch active when its retry was scheduled and re-checks it after the
+  /// backoff sleep and after its re-prepare call, so a retry left over from a
+  /// session the user already stopped and restarted (Stop during backoff,
+  /// then Go Live again before the old sleeper resolves) becomes a no-op
+  /// instead of issuing a duplicate `prepare()` into the fresh session and
+  /// orphaning an engine.
+  int _sessionEpoch = 0;
   DateTime? _streamStartedAt;
   DateTime? _connectingStartedAt;
 
@@ -147,6 +169,8 @@ class PipelineController {
       }
 
       _cancelled = false;
+      _reconnecting = false;
+      _sessionEpoch += 1;
       _reconnectAttempt = 0;
       _streamStartedAt = null;
       _bitrateSampleSum = 0;
@@ -210,6 +234,8 @@ class PipelineController {
   /// Requests a clean stop and cancels any pending reconnect retry.
   Future<void> stop() async {
     _cancelled = true;
+    _reconnecting = false;
+    _sessionEpoch += 1;
     _emit(const StoppingState());
     final stopSpan = GazerTelemetry.startSpan('gazer.pipeline.stop');
     await _host.stop();
@@ -235,9 +261,9 @@ class PipelineController {
       case NativePipelineState.idle:
         _emit(const IdleState());
       case NativePipelineState.preparing:
-        _emit(const PreparingState());
+        if (!_reconnecting) _emit(const PreparingState());
       case NativePipelineState.ready:
-        _emit(const ReadyState());
+        if (!_reconnecting) _emit(const ReadyState());
       case NativePipelineState.connecting:
         _emit(const ConnectingState());
       case NativePipelineState.streaming:
@@ -283,7 +309,9 @@ class PipelineController {
         'delayMs': delay.inMilliseconds,
       });
       _emit(ReconnectingState(_reconnectAttempt, delay));
-      unawaited(_retryAfter(delay));
+      _reconnecting = true;
+      final epoch = _sessionEpoch;
+      unawaited(_retryAfter(delay, epoch));
     } else {
       _emit(ErrorState(GazerError(code: code, detail: detail)));
     }
@@ -299,10 +327,20 @@ class PipelineController {
   /// loop in [ErrorState]. A prepare failure here is terminal for the same
   /// reason it is in [goLive]: nothing about waiting longer fixes an encoder
   /// or camera that will not open.
-  Future<void> _retryAfter(Duration delay) async {
+  ///
+  /// [epoch] is the [_sessionEpoch] snapshot taken when this retry was
+  /// scheduled. It is re-checked after the backoff sleep and again after the
+  /// re-prepare call: either await can outlast a `stop()` followed by a fresh
+  /// `goLive()` (both bump [_sessionEpoch]), and without this guard a stale
+  /// retry would call `prepare()` into the new session, orphaning an engine
+  /// the new session already owns (native `prepare()` has no state guard of
+  /// its own -- it unconditionally builds a second engine and overwrites
+  /// `engine` without releasing the first).
+  Future<void> _retryAfter(Duration delay, int epoch) async {
     await _sleeper(delay);
     if (_isDisposed ||
         _cancelled ||
+        epoch != _sessionEpoch ||
         _pendingTarget == null ||
         _pendingConfig == null) {
       return;
@@ -310,7 +348,8 @@ class PipelineController {
     final prepareSpan = GazerTelemetry.startSpan('gazer.pipeline.prepare');
     final result = await _host.prepare(_pendingConfig!);
     prepareSpan.end();
-    if (_isDisposed || _cancelled) return;
+    if (_isDisposed || _cancelled || epoch != _sessionEpoch) return;
+    _reconnecting = false;
     if (!result.ok) {
       _emit(
         ErrorState(

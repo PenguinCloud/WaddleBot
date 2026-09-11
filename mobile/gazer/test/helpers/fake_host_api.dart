@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:gazer/pigeon/pipeline.g.dart';
 import 'package:gazer/services/native_event_bridge.dart';
@@ -46,6 +48,14 @@ class FakeGazerHostApi implements GazerHostApi {
 
   /// Value [prepare] resolves to; tests can override to simulate failure.
   PrepareResult prepareResult = PrepareResult(ok: true);
+
+  /// When set, [prepare] awaits this before resolving. Lets a test hold a
+  /// `prepare()` call in flight -- e.g. to inject native `preparing`/`ready`
+  /// events via [bridge] while the real Pigeon round trip is still
+  /// outstanding, deterministically instead of relying on microtask
+  /// scheduling order between the fake's own (unawaited) return and however
+  /// many bridge events a test fires around it.
+  Completer<void>? prepareGate;
 
   /// Value [listVideoDevices] returns; empty by default, tests populate it
   /// to exercise device-dependent UI (e.g. `SourcePicker`, "Go Live"
@@ -102,6 +112,8 @@ class FakeGazerHostApi implements GazerHostApi {
   Future<PrepareResult> prepare(StreamConfig config) async {
     calls.add('prepare');
     prepareCalls.add(config);
+    final gate = prepareGate;
+    if (gate != null) await gate.future;
     return prepareResult;
   }
 

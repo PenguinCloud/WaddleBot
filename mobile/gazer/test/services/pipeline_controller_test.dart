@@ -206,6 +206,90 @@ void main() {
       expect(host.prepareCalls.length, prepareCallsBefore + 1);
     });
 
+    test('holds ReconnectingState across the retry re-prepare, suppressing '
+        'native Preparing/Ready', () async {
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+
+      final seen = <PipelineState>[];
+      final sub = controller.state.listen(seen.add);
+
+      bridge.onStateChanged(
+        StateEvent(
+          state: NativePipelineState.error,
+          error: GazerErrorCode.rtmpConnectFailed,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.current, isA<ReconnectingState>());
+
+      // Gate the retry's re-prepare Pigeon call so it stays in flight while
+      // this test injects the native PREPARING/READY events
+      // GazerPipeline.prepare fires unconditionally (GazerPipeline.kt:74,
+      // :133) during that same window on a real device.
+      final prepareGate = Completer<void>();
+      host.prepareGate = prepareGate;
+      sleeper.resolveNext();
+      await Future<void>.delayed(Duration.zero);
+
+      bridge.onStateChanged(StateEvent(state: NativePipelineState.preparing));
+      bridge.onStateChanged(StateEvent(state: NativePipelineState.ready));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.current, isA<ReconnectingState>());
+      expect(seen, isNot(contains(const PreparingState())));
+      expect(seen, isNot(contains(const ReadyState())));
+
+      prepareGate.complete();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.current, isA<ConnectingState>());
+
+      await sub.cancel();
+    });
+
+    test('a stale retry after stop() then goLive() again does not issue a '
+        'duplicate prepare() into the fresh session', () async {
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+
+      bridge.onStateChanged(
+        StateEvent(
+          state: NativePipelineState.error,
+          error: GazerErrorCode.rtmpConnectFailed,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.current, isA<ReconnectingState>());
+      expect(sleeper.pendingCount, 1);
+
+      await controller.stop();
+      await controller.goLive(
+        settingsWith(),
+        devices: [backCamera],
+        videoDeviceId: 'camera:back',
+        flags: flagsWith(),
+      );
+      final prepareCallsAfterFreshGoLive = host.prepareCalls.length;
+
+      // The stale retry's sleeper resolves after the new session is
+      // already under way -- it must not call prepare() again into the
+      // fresh session (which would orphan an engine behind the new
+      // session's back).
+      sleeper.resolveNext();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(host.prepareCalls.length, prepareCallsAfterFreshGoLive);
+    });
+
     test(
       'a failed re-prepare on retry is terminal, not another retry',
       () async {
