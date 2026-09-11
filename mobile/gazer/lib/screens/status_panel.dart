@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -19,11 +20,17 @@ import '../services/feature_flags.dart';
 import '../services/pipeline_controller.dart';
 import '../widgets/masked_text.dart';
 
+/// Width, in logical pixels, at which [HomeScreen] switches from a single
+/// controls column (with [StatusPanel] behind [showStatusPanel]'s bottom
+/// sheet) to a persistent two-pane layout. Shared as one constant so the
+/// two call sites (here and `home_screen.dart`) can never drift apart.
+const double kTabletBreakpointWidth = 600;
+
 /// Opens the status panel as a modal bottom sheet on phones (<600dp
 /// width). On tablets (≥600dp) this is a no-op — [HomeScreen] already
 /// renders [StatusPanel] as a persistent right pane at that breakpoint.
 void showStatusPanel(BuildContext context) {
-  if (MediaQuery.of(context).size.width >= 600) return;
+  if (MediaQuery.of(context).size.width >= kTabletBreakpointWidth) return;
   showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -228,7 +235,8 @@ class StatusPanel extends ConsumerWidget {
                   update.latestVersion,
                 ),
                 child: InkWell(
-                  onTap: () => launchUrl(update.releaseUrl),
+                  onTap: () =>
+                      _openReleaseUrl(context, update.releaseUrl, l10n),
                   child: Text(
                     l10n.statusPanelUpdateAvailableLabel(update.latestVersion),
                     style: const TextStyle(
@@ -279,5 +287,32 @@ class StatusPanel extends ConsumerWidget {
         ],
       ),
     );
+  }
+
+  /// Opens [url] via `url_launcher`, guarded against both known-unlaunchable
+  /// URLs and launch failure: checks [canLaunchUrl] first, catches any
+  /// [PlatformException] the platform channel itself throws, and also
+  /// checks [launchUrl]'s own returned success flag — any of the three
+  /// failure paths shows a [SnackBar] with [AppLocalizations.updateOpenFailed]
+  /// instead of silently doing nothing. `context.mounted` is re-checked
+  /// after every `await` since this runs from a tap handler that can
+  /// outlive the widget (e.g. the panel's bottom sheet dismissed mid-launch).
+  Future<void> _openReleaseUrl(
+    BuildContext context,
+    Uri url,
+    AppLocalizations l10n,
+  ) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    bool launched = false;
+    try {
+      if (await canLaunchUrl(url)) {
+        launched = await launchUrl(url);
+      }
+    } on PlatformException {
+      launched = false;
+    }
+    if (!launched && context.mounted) {
+      messenger.showSnackBar(SnackBar(content: Text(l10n.updateOpenFailed)));
+    }
   }
 }

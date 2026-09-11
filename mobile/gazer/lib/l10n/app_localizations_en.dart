@@ -418,4 +418,8 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsDebugLogsLabel => 'Debug logs';
+
+  @override
+  String get updateOpenFailed =>
+      'Could not open the release page. Please try again.';
 }

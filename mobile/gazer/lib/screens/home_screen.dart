@@ -167,7 +167,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         ],
       ),
-      body: MediaQuery.of(context).size.width >= 600
+      body: MediaQuery.of(context).size.width >= kTabletBreakpointWidth
           ? Row(
               children: <Widget>[
                 Expanded(flex: 2, child: controls),

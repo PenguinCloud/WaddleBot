@@ -88,6 +88,15 @@ dev_dependencies:
   # strict-inference) requires every directly-imported package to be a direct
   # dependency. Pinned exact version, no ^/~, per Dependency Pinning.
   shared_preferences_platform_interface: 2.4.2
+  # Already resolved transitively (via url_launcher 6.3.2) at these exact
+  # versions per pubspec.lock -- declared directly, not newly introduced,
+  # for the same `depend_on_referenced_packages` reason as
+  # shared_preferences_platform_interface above: status_panel_test.dart
+  # mocks UrlLauncherPlatform.instance directly (url_launcher_platform_interface)
+  # via MockPlatformInterfaceMixin (plugin_platform_interface) to test the
+  # canLaunchUrl/launchUrl failure paths without a real platform channel.
+  url_launcher_platform_interface: 2.3.2
+  plugin_platform_interface: 2.1.8
 
 flutter:
   uses-material-design: true

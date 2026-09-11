@@ -133,5 +133,6 @@
   "statusPanelCloseButtonLabel": "Close",
   "goLiveFailedMessage": "Could not start the stream. Please try again.",
   "settingsSaveFailed": "Failed to save settings. Please try again.",
-  "settingsDebugLogsLabel": "Debug logs"
+  "settingsDebugLogsLabel": "Debug logs",
+  "updateOpenFailed": "Could not open the release page. Please try again."
 }

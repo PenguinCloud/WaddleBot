@@ -813,6 +813,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Debug logs'**
   String get settingsDebugLogsLabel;
+
+  /// No description provided for @updateOpenFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not open the release page. Please try again.'**
+  String get updateOpenFailed;
 }
 
 class _AppLocalizationsDelegate

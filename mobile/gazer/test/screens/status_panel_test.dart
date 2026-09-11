@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gazer/models/gazer_settings.dart';
 import 'package:gazer/models/license_state.dart';
 import 'package:gazer/models/stream_target_settings.dart';
+import 'package:gazer/models/update_info.dart';
 import 'package:gazer/pigeon/pipeline.g.dart';
 import 'package:gazer/providers/connectivity_provider.dart';
 import 'package:gazer/providers/devices_provider.dart';
@@ -18,10 +19,22 @@ import 'package:gazer/providers/update_provider.dart';
 import 'package:gazer/screens/status_panel.dart';
 import 'package:gazer/services/pipeline_controller.dart';
 import 'package:gazer/services/reconnect_policy.dart';
+import 'package:mocktail/mocktail.dart';
+import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+import 'package:url_launcher_platform_interface/url_launcher_platform_interface.dart';
 
 import '../helpers/fake_host_api.dart';
 import '../helpers/fakes.dart';
 import '../helpers/pump_app.dart';
+
+/// Test double for `UrlLauncherPlatform.instance` — lets the update-link
+/// tests drive `canLaunchUrl`/`launchUrl` failure paths without a real
+/// platform channel. `MockPlatformInterfaceMixin` bypasses the token
+/// verification `PlatformInterface` normally enforces against `implements`
+/// (see that mixin's own doc, which names this exact class as its example).
+class _MockUrlLauncherPlatform extends Mock
+    with MockPlatformInterfaceMixin
+    implements UrlLauncherPlatform {}
 
 void main() {
   late FakeGazerHostApi hostApi;
@@ -39,7 +52,7 @@ void main() {
     );
   });
 
-  List<Override> overrides() => <Override>[
+  List<Override> overrides({UpdateInfo? update}) => <Override>[
     settingsRepositoryProvider.overrideWithValue(settingsRepo),
     gazerHostApiProvider.overrideWithValue(hostApi),
     // Wires hostApi.bridge into the controller under test so
@@ -69,7 +82,7 @@ void main() {
     ),
     isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
     updateCheckerProvider.overrideWith(
-      (Ref ref) async => FakeUpdateChecker(null),
+      (Ref ref) async => FakeUpdateChecker(update),
     ),
   ];
 
@@ -136,5 +149,72 @@ void main() {
     );
     expect(find.text('•••••••••0001'), findsOneWidget);
     expect(find.text('demo-key-0001'), findsNothing);
+  });
+
+  group('update link', () {
+    final UpdateInfo update = UpdateInfo(
+      latestVersion: '9.9.9',
+      currentVersion: '1.0.0',
+      releaseUrl: Uri.parse(
+        'https://github.com/penguintechinc/waddlebot/releases/tag/gazer-v9.9.9',
+      ),
+    );
+
+    late _MockUrlLauncherPlatform urlLauncher;
+    late UrlLauncherPlatform originalPlatform;
+
+    setUpAll(() {
+      registerFallbackValue(const LaunchOptions());
+    });
+
+    setUp(() {
+      originalPlatform = UrlLauncherPlatform.instance;
+      urlLauncher = _MockUrlLauncherPlatform();
+      UrlLauncherPlatform.instance = urlLauncher;
+    });
+
+    tearDown(() {
+      UrlLauncherPlatform.instance = originalPlatform;
+    });
+
+    testWidgets(
+      'canLaunchUrl false shows a SnackBar and never calls launchUrl',
+      (WidgetTester tester) async {
+        when(() => urlLauncher.canLaunch(any())).thenAnswer((_) async => false);
+        await pumpGazerApp(
+          tester,
+          overrides: overrides(update: update),
+          size: const Size(1280, 800),
+        );
+        await tester.tap(find.textContaining('Update available'));
+        await tester.pumpAndSettle();
+        expect(
+          find.text('Could not open the release page. Please try again.'),
+          findsOneWidget,
+        );
+        verifyNever(() => urlLauncher.launchUrl(any(), any()));
+      },
+    );
+
+    testWidgets(
+      'canLaunchUrl true calls launchUrl once and shows no SnackBar',
+      (WidgetTester tester) async {
+        when(() => urlLauncher.canLaunch(any())).thenAnswer((_) async => true);
+        when(() => urlLauncher.launchUrl(any(), any()))
+            .thenAnswer((_) async => true);
+        await pumpGazerApp(
+          tester,
+          overrides: overrides(update: update),
+          size: const Size(1280, 800),
+        );
+        await tester.tap(find.textContaining('Update available'));
+        await tester.pumpAndSettle();
+        verify(() => urlLauncher.launchUrl(any(), any())).called(1);
+        expect(
+          find.text('Could not open the release page. Please try again.'),
+          findsNothing,
+        );
+      },
+    );
   });
 }
