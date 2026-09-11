@@ -13,7 +13,7 @@ import logging
 from typing import Any
 
 import pytest
-from flask_core import PlatformEvent
+from flask_core import PROCESS_TARGET_APP_ID_KEY, PlatformEvent
 from flask_core.bundle_runtime import bundle_context
 from moderation_module import Classification, LocalOllamaClassifier
 
@@ -222,6 +222,199 @@ class TestContextScoping:
             )
 
         assert reputation.calls[0]["community_id"] == 42
+
+
+class TestEnforcementEmit:
+    """gh-304 (P4): `moderation_enforcement` + `PROCESS_TARGET_APP_ID_KEY` emission.
+
+    Convention under test: a community opts a category INTO enforcement by
+    including `f"{category}_filter"` (in ADDITION to the bare category
+    itself) in its `enabled_categories` set -- `moderation_config.py`
+    exposes no separate boolean column for this today.
+    """
+
+    async def test_filter_enabled_emits_enforcement_payload_and_target_app_id(
+        self, redis_client: Any
+    ) -> None:
+        match = Classification(category="hate_speech", confidence=0.91, severity="high")
+        classifier = _FakeClassifier(result=match)
+        reputation = _FakeReputationService()
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech", "hate_speech_filter"}
+
+        event = _event("you are trash")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await run_moderation_gate(
+                event,
+                redis_client=redis_client,
+                feature_enabled_fn=_flag_on,
+                get_enabled_categories_fn=_enabled,
+                classifier=classifier,
+                reputation_service=reputation,
+            )
+
+        # Reputation still hit -- enforcement is additive, never a substitute.
+        assert len(reputation.calls) == 1
+
+        enforcement = event.payload["moderation_enforcement"]
+        assert enforcement["category"] == "hate_speech"
+        assert enforcement["score"] == 0.91
+        assert enforcement["timeout_s"] == 600
+        assert enforcement["action"] == "timeout+warn"
+        assert "hate_speech" in enforcement["warn_text"]
+        # The original message text must never leak into the enforcement payload.
+        assert "you are trash" not in str(enforcement.values())
+
+        assert event.payload[PROCESS_TARGET_APP_ID_KEY] == "waddles.community.moderation.default"
+
+    async def test_filter_disabled_does_not_emit_enforcement_but_still_hits_reputation(
+        self, redis_client: Any
+    ) -> None:
+        match = Classification(category="hate_speech", confidence=0.91, severity="high")
+        classifier = _FakeClassifier(result=match)
+        reputation = _FakeReputationService()
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech"}  # category on, filter suffix absent
+
+        event = _event("you are trash")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await run_moderation_gate(
+                event,
+                redis_client=redis_client,
+                feature_enabled_fn=_flag_on,
+                get_enabled_categories_fn=_enabled,
+                classifier=classifier,
+                reputation_service=reputation,
+            )
+
+        assert len(reputation.calls) == 1
+        assert "moderation_enforcement" not in event.payload
+        assert PROCESS_TARGET_APP_ID_KEY not in event.payload
+
+    async def test_filter_skip_is_logged_at_debug(
+        self, redis_client: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        match = Classification(category="hate_speech", confidence=0.9, severity="high")
+        classifier = _FakeClassifier(result=match)
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech"}
+
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            with caplog.at_level(logging.DEBUG):
+                await run_moderation_gate(
+                    _event("you are trash"),
+                    redis_client=redis_client,
+                    feature_enabled_fn=_flag_on,
+                    get_enabled_categories_fn=_enabled,
+                    classifier=classifier,
+                    reputation_service=_FakeReputationService(),
+                )
+
+        assert any(
+            "moderation.enforcement_skipped reason=filter_off" in r.message for r in caplog.records
+        )
+
+    async def test_enforcement_emitted_is_logged_at_debug(
+        self, redis_client: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        match = Classification(category="hate_speech", confidence=0.9, severity="high")
+        classifier = _FakeClassifier(result=match)
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech", "hate_speech_filter"}
+
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            with caplog.at_level(logging.DEBUG):
+                await run_moderation_gate(
+                    _event("you are trash"),
+                    redis_client=redis_client,
+                    feature_enabled_fn=_flag_on,
+                    get_enabled_categories_fn=_enabled,
+                    classifier=classifier,
+                    reputation_service=_FakeReputationService(),
+                )
+
+        assert any(
+            "moderation.enforcement_emitted category=hate_speech timeout_s=600" in r.message
+            for r in caplog.records
+        )
+
+    async def test_enforcement_applies_per_matched_category_not_just_hate_speech(
+        self, redis_client: Any
+    ) -> None:
+        """Same default timeout/target app id for ANY matched+filtered category, not hardcoded."""
+        match = Classification(category="harassment", confidence=0.75, severity="medium")
+        classifier = _FakeClassifier(result=match)
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"harassment", "harassment_filter"}
+
+        event = _event("you are trash")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await run_moderation_gate(
+                event,
+                redis_client=redis_client,
+                feature_enabled_fn=_flag_on,
+                get_enabled_categories_fn=_enabled,
+                classifier=classifier,
+                reputation_service=_FakeReputationService(),
+            )
+
+        enforcement = event.payload["moderation_enforcement"]
+        assert enforcement["category"] == "harassment"
+        assert enforcement["timeout_s"] == 600
+        assert "harassment" in enforcement["warn_text"]
+        assert event.payload[PROCESS_TARGET_APP_ID_KEY] == "waddles.community.moderation.default"
+
+    async def test_no_match_never_emits_enforcement(self, redis_client: Any) -> None:
+        classifier = _FakeClassifier(result=None)
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech", "hate_speech_filter"}
+
+        event = _event("hello there, good game")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await run_moderation_gate(
+                event,
+                redis_client=redis_client,
+                feature_enabled_fn=_flag_on,
+                get_enabled_categories_fn=_enabled,
+                classifier=classifier,
+                reputation_service=_FakeReputationService(),
+            )
+
+        assert "moderation_enforcement" not in event.payload
+        assert PROCESS_TARGET_APP_ID_KEY not in event.payload
+
+    async def test_reputation_adjust_failure_still_evaluates_enforcement(
+        self, redis_client: Any
+    ) -> None:
+        """Enforcement decision runs regardless of reputation write success/failure."""
+        match = Classification(category="hate_speech", confidence=0.9, severity="high")
+        classifier = _FakeClassifier(result=match)
+
+        class _RaisingReputationService:
+            async def adjust(self, **_kwargs: Any) -> Any:
+                raise RuntimeError("db write failed")
+
+        async def _enabled(_cid: int) -> set[str]:
+            return {"hate_speech", "hate_speech_filter"}
+
+        event = _event("you are trash")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            await run_moderation_gate(
+                event,
+                redis_client=redis_client,
+                feature_enabled_fn=_flag_on,
+                get_enabled_categories_fn=_enabled,
+                classifier=classifier,
+                reputation_service=_RaisingReputationService(),
+            )
+
+        assert event.payload[PROCESS_TARGET_APP_ID_KEY] == "waddles.community.moderation.default"
 
 
 class TestDedupe:

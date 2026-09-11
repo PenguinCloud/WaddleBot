@@ -1,15 +1,37 @@
-"""P1 inbound content-moderation gate -- observe-safe, no enforcement.
+"""P1+P4 inbound content-moderation gate -- reputation always, enforcement opt-in.
 
 Per docs/plans/2026-09-08-content-moderation-design.md SS2/SS4: a mandatory
 stage-runner gate `runner.py::_transform_and_enqueue` calls BEFORE any
 process-stage bundle's own `transform()` sees an inbound chat message --
 never a bundle itself, so it can never be individually disabled by a
 community's own app activation state (only the master flag below controls
-it). P1 scope: classify + log + apply a reputation hit on a match; NO
-timeout/warn/ban (design SS12 P1 vs P4) -- the message always continues to
-`transform_fn` regardless of outcome, and this function itself never
-raises into the runner (every external call -- flag check, DB read,
-classifier, reputation write -- is caught and logged, never fatal).
+it). Every match applies a reputation hit (P1, unconditional). gh-304
+(P4) additionally emits enforcement (timeout+warn) onto the SAME event's
+payload -- `moderation_enforce_action.py`'s own `enforce()` contract --
+ONLY when the community opted the matched category INTO enforcement (not
+just classification): `f"{category}_filter"` present in this community's
+`enabled_categories` set (the only per-community config surface
+`community_moderation_config`/`services/moderation_config.py` currently
+expose -- a flat `set[str]`, so the enforcement opt-in is a second,
+distinctly-suffixed string in that same set rather than a separate DB
+column). The message always continues to `transform_fn` regardless of
+outcome, and this function itself never raises into the runner (every
+external call -- flag check, DB read, classifier, reputation write -- is
+caught and logged, never fatal).
+
+Emitting `moderation_enforcement` + `PROCESS_TARGET_APP_ID_KEY` onto
+`event.payload` here mutates the SAME `PlatformEvent` object `runner.py`
+passes into `transform_fn` right after this call returns (`payload` is a
+plain mutable `dict`, `PlatformEvent` carries no `slots`/`frozen`
+guard against it) -- the gate has no `transform_fn`-style return value of
+its own to stamp the routing key onto (unlike `social_music_process.py`'s
+own `PROCESS_TARGET_APP_ID_KEY` usage, which returns a fresh event). Actually
+getting this stamped payload all the way to an enqueued `:action` envelope
+for `waddles.community.moderation.default` depends on the specific
+process-stage bundle's own `transform_fn` preserving/forwarding these
+payload keys into whatever `PlatformEvent` it returns -- that per-bundle
+wiring is tracked separately (gh-304, other chunks), never this module's
+job to guarantee.
 
 Master switch: `_MODERATION_FLAG_KEY`, a PostHog flag via `flask_core.
 feature_flags.feature_enabled` (default OFF). OFF -> total no-op, not even
@@ -37,7 +59,12 @@ import threading
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, cast
 
-from flask_core import BundleRuntimeError, get_bundle_context, get_bundle_dal
+from flask_core import (
+    PROCESS_TARGET_APP_ID_KEY,
+    BundleRuntimeError,
+    get_bundle_context,
+    get_bundle_dal,
+)
 from flask_core.feature_flags import feature_enabled
 from moderation_module import Classification, ClassificationProvider, LocalOllamaClassifier
 
@@ -75,6 +102,34 @@ _CHAT_EVENT_TYPES = frozenset({"message"})
 #: reusing the existing bucket instead of a gate-local constant).
 _REPUTATION_HIT_EVENT_TYPE = "warn"
 _REPUTATION_HIT_MULTIPLIER = 1.0
+
+#: gh-304 (P4) enforcement opt-in convention: a community enables
+#: enforcement for a category by ALSO including `f"{category}_filter"`
+#: (alongside the bare category itself) in its `enabled_categories` set --
+#: `community_moderation_config`/`moderation_config.py` expose no separate
+#: boolean column for this today (see module docstring), so the flag rides
+#: in the same flat `set[str]` the classifier itself consumes.
+_ENFORCEMENT_FILTER_SUFFIX = "_filter"
+
+#: gh-304 default timeout applied to every enforced category alike --
+#: no per-category override exists yet (design SS10 Q1/Q2, open question);
+#: `moderation_enforce_action.py`'s own contract treats `timeout_s <= 0` as
+#: "warn only," so this constant must stay positive.
+_ENFORCEMENT_TIMEOUT_S = 600
+
+#: gh-304 default warn message -- no per-community/per-category template
+#: config exists yet (same SS10 open-question set as the timeout above).
+#: Deliberately generic: never includes the matched message's own text.
+_ENFORCEMENT_WARN_TEXT_TEMPLATE = (
+    "Your message was removed for {category}. Please keep it friendly."
+)
+
+#: `app_catalog.app_id` for the enforcement action bundle
+#: (`moderation_enforce_action.py:enforce`), seeded by migration
+#: `0016_moderation_enforce_app`. `PROCESS_TARGET_APP_ID_KEY` cross-app
+#: routing convention: `flask_core.stream_pipeline`'s own docstring,
+#: `bundles/social_music_process.py`'s existing usage.
+_MODERATION_ENFORCE_APP_ID = "waddles.community.moderation.default"
 
 _DEDUPE_TTL_SECONDS = 30
 
@@ -285,3 +340,44 @@ async def run_moderation_gate(
         )
     except Exception as exc:  # noqa: BLE001 - reputation write must never break the pipeline
         logger.error("moderation_gate.reputation_adjust_failed error=%s", exc)
+
+    _emit_enforcement_if_filter_on(event, match, enabled_categories)
+
+
+def _emit_enforcement_if_filter_on(
+    event: PlatformEvent, match: Classification, enabled_categories: set[str]
+) -> None:
+    """Stamp `moderation_enforcement` + `PROCESS_TARGET_APP_ID_KEY` iff the category's filter is on.
+
+    Enforcement opt-in convention (see module docstring): `f"{category}
+    _filter"` present in this community's OWN `enabled_categories` set --
+    the community must have BOTH `category` (to reach the classifier at
+    all) AND `f"{category}_filter"` (to also enforce) enabled; classifying
+    without the `_filter` suffix present means reputation-only, matching
+    design SS2's "reputation hit is standalone; community may also enable
+    timeout/warn for the category." Mutates `event.payload` in place --
+    see module docstring for why this is a mutation, not a return value.
+    Never raises: this runs after the reputation call inside
+    `run_moderation_gate`'s own no-raise contract, and a malformed/missing
+    config value here must never turn into a dispatch failure.
+    """
+    filter_key = f"{match.category}{_ENFORCEMENT_FILTER_SUFFIX}"
+    if filter_key not in enabled_categories:
+        logger.debug("moderation.enforcement_skipped reason=filter_off")
+        return
+
+    timeout_s = _ENFORCEMENT_TIMEOUT_S
+    warn_text = _ENFORCEMENT_WARN_TEXT_TEMPLATE.format(category=match.category)
+    event.payload["moderation_enforcement"] = {
+        "category": match.category,
+        "score": match.confidence,
+        "timeout_s": timeout_s,
+        "warn_text": warn_text,
+        "action": "timeout+warn",
+    }
+    event.payload[PROCESS_TARGET_APP_ID_KEY] = _MODERATION_ENFORCE_APP_ID
+    logger.debug(
+        "moderation.enforcement_emitted category=%s timeout_s=%s",
+        match.category,
+        timeout_s,
+    )
