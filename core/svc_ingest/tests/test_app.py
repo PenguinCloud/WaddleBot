@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from quart.testing.app import LifespanError
@@ -42,9 +43,41 @@ class TestHealthEndpoints:
             assert body["module"] == "svc-ingest"
 
     async def test_healthz(self, client: Any) -> None:
-        async with client as c:
-            response = await c.get("/healthz")
-            assert response.status_code == 200
+        """Assert `/healthz` returns 200 with mocked, deterministic `psutil` readings.
+
+        `/healthz` (`flask_core.api_utils`) derives from real host CPU/memory via
+        `psutil` -- mock both so this assertion is deterministic regardless of host
+        load. Without this, `psutil.cpu_percent` reading a transient spike (e.g. a
+        heavily loaded shared dev/CI host with unrelated concurrent processes) trips
+        the >95% threshold and flips this test to a flaky, intermittent 503 with no
+        relation to svc-ingest's own health. regression: gh-314
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 10.0
+            async with client as c:
+                response = await c.get("/healthz")
+                assert response.status_code == 200
+
+    async def test_healthz_reports_503_when_resources_degraded(self, client: Any) -> None:
+        """Regression: the degraded-resource branch of `/healthz` must still 503.
+
+        Pinned via mocked `psutil` (independent of real host state) so this can't
+        silently bitrot into an always-200 endpoint while `test_healthz` above is
+        also mocked healthy. regression: gh-314
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 95.0
+            async with client as c:
+                response = await c.get("/healthz")
+                assert response.status_code == 503
+                body = await response.get_json()
+                assert body["status"] == "degraded"
 
     async def test_metrics(self, client: Any) -> None:
         async with client as c:
@@ -239,3 +272,275 @@ class TestStartupFailureLogging:
         assert "RuntimeError" in message
         assert "boom" in message
         assert kwargs["result"] == "FAILED"
+
+
+class TestSlackReceiverRegistration:
+    """`_register_slack_receiver`'s disabled-without-tokens path + the manifest wiring.
+
+    gh-318: without `bundles/slack_gateway_manifest.py` registered into
+    the `AppRegistry`, `fanout.fan_out_event` finds zero consumers for
+    `slack.message` and every inbound Slack event is silently dropped
+    (`gateway.fanout_no_consumers`) regardless of whether the receiver
+    itself is enabled. regression: gh-318
+    """
+
+    async def test_slack_app_manifest_is_registered_even_without_tokens(self) -> None:
+        """`register_slack_bundles` always runs at startup, independent of the receiver.
+
+        The registry entry is what `fanout.fan_out_event` needs present
+        so a `slack.message` event has a resolvable consumer whenever the
+        receiver DOES eventually run -- not just when Slack happens to be
+        configured this particular startup.
+        """
+        async with quart_app.test_app():
+            registry = quart_app.config["registry"]
+            manifest = registry.get("waddles.bot.slack.default")
+            assert manifest.app_id == "waddles.bot.slack.default"
+            assert manifest.stage_specs["ingest"].consumes == ("slack.message",)
+
+    async def test_disabled_and_logs_warning_without_both_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither `SLACK_APP_TOKEN` nor `SLACK_BOT_TOKEN` set -- registers nothing, warns once.
+
+        Test env has both unset by default (`Config`'s own
+        `os.getenv(..., "")` fallback) -- set explicitly here so this
+        test's intent survives a future env change. Matches
+        `_register_discord_receiver`'s own analogous "SKIPPED" precedent
+        for a missing `DISCORD_BOT_TOKEN`.
+        """
+        monkeypatch.setattr(Config, "SLACK_APP_TOKEN", "")
+        monkeypatch.setattr(Config, "SLACK_BOT_TOKEN", "")
+
+        logged: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            app_module.logger,
+            "warning",
+            lambda message, **kwargs: logged.append((message, kwargs)),
+        )
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert "slack_socket" not in registered
+            assert "slack_leased_receiver" not in quart_app.config
+
+        assert len(logged) == 1
+        message, kwargs = logged[0]
+        assert "SLACK_APP_TOKEN" in message
+        assert "SLACK_BOT_TOKEN" in message
+        assert kwargs["result"] == "SKIPPED"
+
+    async def test_registers_under_the_supervisor_when_both_tokens_are_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both tokens set -- a lease-guarded receiver registers under the shared supervisor.
+
+        Matches `test_startup_registers_both_discord_and_twitch_under_the_
+        one_supervisor`'s own precedent: `supervisor.register()` happens
+        before `supervisor.start()` (fire-and-forget `asyncio.
+        ensure_future`), so no real Slack Socket Mode connection (this
+        test env has no live Slack app/bot token) is ever attempted by
+        this assertion.
+        """
+        monkeypatch.setattr(Config, "SLACK_APP_TOKEN", "xapp-fake-app-token")  # noqa: S105
+        monkeypatch.setattr(Config, "SLACK_BOT_TOKEN", "xoxb-fake-bot-token")  # noqa: S105
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert "slack_socket" in registered
+            assert quart_app.config["slack_leased_receiver"] is not None
+
+
+class TestYouTubeLiveReceiverRegistration:
+    """`_register_youtube_live_receiver`'s disabled-without-config path + the manifest wiring.
+
+    gh-318: without `bundles/youtube_live_ingest.py` registered into the
+    `AppRegistry`, `fanout.fan_out_event` finds zero consumers for
+    `youtube.message` and every inbound YouTube Live chat message is
+    silently dropped (`gateway.fanout_no_consumers`) regardless of
+    whether any channel poller is enabled -- matches
+    `TestSlackReceiverRegistration`'s own precedent.
+    """
+
+    async def test_youtube_app_manifest_is_registered_even_without_config(self) -> None:
+        """`register_youtube_bundles` always runs at startup, independent of any poller."""
+        async with quart_app.test_app():
+            registry = quart_app.config["registry"]
+            manifest = registry.get("waddles.bot.youtube.default")
+            assert manifest.app_id == "waddles.bot.youtube.default"
+            assert manifest.stage_specs["ingest"].consumes == ("youtube.message",)
+
+    async def test_disabled_and_logs_skipped_without_channels_or_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No `YOUTUBE_LIVE_CHANNELS`/credentials -- registers nothing, logs one SKIPPED.
+
+        Test env has no channels configured by default (`Config`'s own
+        `os.getenv(..., "")` fallback) -- set explicitly here so this
+        test's intent survives a future env change. Matches
+        `_register_discord_receiver`'s own analogous "SKIPPED" precedent
+        for a missing `DISCORD_BOT_TOKEN`.
+        """
+        monkeypatch.setattr(Config, "YOUTUBE_LIVE_CHANNELS", [])
+
+        logged: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            app_module.logger,
+            "system",
+            lambda message, **kwargs: logged.append((message, kwargs)),
+        )
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert not any(name.startswith("youtube_live_poll:") for name in registered)
+            assert "youtube_leased_receivers" not in quart_app.config
+
+        # `logger.system` also fires for the unrelated Discord/Twitch
+        # "SKIPPED" startup lines (this test env has neither configured
+        # either) and the final "svc-ingest started" SUCCESS line --
+        # filter to this receiver's own line specifically.
+        youtube_skipped = [
+            (message, kwargs)
+            for message, kwargs in logged
+            if kwargs.get("result") == "SKIPPED" and "YouTube" in message
+        ]
+        assert len(youtube_skipped) == 1
+        message, kwargs = youtube_skipped[0]
+        assert "YOUTUBE_LIVE_CHANNELS" in message
+        assert kwargs["action"] == "startup"
+
+    async def test_registers_one_leased_receiver_per_channel_with_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """N configured channels + a usable API key -- N leased receivers register.
+
+        `YouTubeLivePollReceiver` is replaced with a stub whose `receive()`
+        never makes a real Data API v3 call -- `supervisor.register()`
+        happens before `supervisor.start()`'s fire-and-forget tasks are
+        ever awaited by this test (matching `test_startup_registers_both_
+        discord_and_twitch_under_the_one_supervisor`'s own precedent), but
+        unlike Discord/Twitch's socket connections, an unmocked poller
+        would still issue a real outbound HTTP request to
+        `googleapis.com` once the supervisor's background task starts
+        running -- undesirable in a unit test regardless of timing.
+        """
+        monkeypatch.setattr(Config, "YOUTUBE_LIVE_CHANNELS", ["channelA", "channelB"])
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake-youtube-api-key")
+
+        class _StubYouTubeReceiver:
+            """Drop-in `YouTubeLivePollReceiver` replacement -- never calls the real Data API."""
+
+            async def receive(self, config: dict[str, Any]) -> Any:
+                return
+                yield  # pragma: no cover - makes this an async generator, never reached
+
+        monkeypatch.setattr(app_module, "YouTubeLivePollReceiver", _StubYouTubeReceiver)
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert "youtube_live_poll:channelA" in registered
+            assert "youtube_live_poll:channelB" in registered
+            assert len(quart_app.config["youtube_leased_receivers"]) == 2
+
+
+class TestKickReceiverRegistration:
+    """`_register_kick_receivers`'s disabled-without-config path + the manifest wiring.
+
+    gh-318: without `bundles/kick_gateway_manifest.py` registered into the
+    `AppRegistry`, `fanout.fan_out_event` finds zero consumers for
+    `kick.message` and every inbound Kick chat message is silently dropped
+    (`gateway.fanout_no_consumers`) regardless of whether any channel
+    receiver is enabled -- matches `TestYouTubeLiveReceiverRegistration`'s
+    own precedent.
+    """
+
+    async def test_kick_app_manifest_is_registered_even_without_config(self) -> None:
+        """`register_kick_bundles` always runs at startup, independent of any receiver."""
+        async with quart_app.test_app():
+            registry = quart_app.config["registry"]
+            manifest = registry.get("waddles.bot.kick.default")
+            assert manifest.app_id == "waddles.bot.kick.default"
+            assert manifest.stage_specs["ingest"].consumes == ("kick.message",)
+
+    async def test_disabled_and_logs_skipped_without_channels(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No `KICK_CHANNELS` -- registers nothing, logs one SKIPPED.
+
+        Test env has no channels configured by default (`Config`'s own
+        `os.getenv(..., "")` fallback) -- set explicitly here so this
+        test's intent survives a future env change. Matches
+        `_register_youtube_live_receiver`'s own analogous "SKIPPED"
+        precedent for missing channels/credentials.
+        """
+        monkeypatch.setattr(Config, "KICK_CHANNELS", [])
+
+        logged: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            app_module.logger,
+            "system",
+            lambda message, **kwargs: logged.append((message, kwargs)),
+        )
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert not any(name.startswith("kick_pusher:") for name in registered)
+            assert "kick_leased_receivers" not in quart_app.config
+
+        # `logger.system` also fires for the unrelated Discord/Slack/
+        # YouTube "SKIPPED" startup lines (this test env has none of them
+        # configured either) and the final "svc-ingest started" SUCCESS
+        # line -- filter to this receiver's own line specifically.
+        kick_skipped = [
+            (message, kwargs)
+            for message, kwargs in logged
+            if kwargs.get("result") == "SKIPPED" and "Kick" in message
+        ]
+        assert len(kick_skipped) == 1
+        message, kwargs = kick_skipped[0]
+        assert "KICK_CHANNELS" in message
+        assert kwargs["action"] == "startup"
+
+    async def test_registers_one_leased_receiver_per_channel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """N configured channels -- N leased receivers register.
+
+        `KickPusherReceiver` is replaced with a stub whose `receive()`
+        never makes a real Pusher WebSocket connection --
+        `supervisor.register()` happens before `supervisor.start()`'s
+        fire-and-forget tasks are ever awaited by this test (matching
+        `test_registers_one_leased_receiver_per_channel_with_credentials`'s
+        own precedent), but unlike that mocked path, an unmocked receiver
+        would still attempt a real outbound connection to `kick.com`/
+        `pusher.com` once the supervisor's background task starts running
+        -- undesirable in a unit test regardless of timing.
+        """
+        monkeypatch.setattr(Config, "KICK_CHANNELS", ["channelA", "channelB"])
+
+        class _StubKickReceiver:
+            """Drop-in `KickPusherReceiver` replacement -- never calls the real Pusher API."""
+
+            async def receive(self, config: dict[str, Any]) -> Any:
+                return
+                yield  # pragma: no cover - makes this an async generator, never reached
+
+        monkeypatch.setattr(app_module, "KickPusherReceiver", _StubKickReceiver)
+
+        async with quart_app.test_app():
+            supervisor = quart_app.config["supervisor"]
+            registered = set(supervisor._receivers)  # noqa: SLF001 - test-only introspection
+
+            assert "kick_pusher:channelA" in registered
+            assert "kick_pusher:channelB" in registered
+            assert len(quart_app.config["kick_leased_receivers"]) == 2

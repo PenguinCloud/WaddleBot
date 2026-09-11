@@ -18,8 +18,24 @@ single outbound message.
 `receive()`: one **persistent** connection for the duration of iteration
 (connect, auth, join once, then read lines until the caller stops
 iterating or the connection drops) -- yields one dict per `PRIVMSG` seen:
-`{"channel": ..., "sender": ..., "text": ...}`. Real IRC line parsing
-(`:nick!user@host PRIVMSG #channel :message text`), not a stub.
+`{"channel": ..., "sender": ..., "text": ..., "tags": ...}`. Real IRC line
+parsing (`:nick!user@host PRIVMSG #channel :message text`, optionally
+prefixed with a raw IRCv3 `@tag1=val1;tag2=val2 ` message-tags segment
+per the generic IRCv3.2 message-tags spec), not a stub. `tags` is the
+**raw, unparsed** tag string (or `None` when the line carries none) --
+this transport makes no Twitch-or-any-other-network-specific assumptions
+about which tags exist or what they mean; per-network tag interpretation
+(e.g. Twitch's `user-id`/`badges`/`mod` semantics) is the caller's job
+(see `core/svc_ingest/receivers/twitch_irc.py`).
+
+Callers wanting IRCv3 capabilities negotiated at connect (e.g. Twitch's
+own `twitch.tv/tags`/`twitch.tv/commands`) pass `config["cap_requests"]`
+-- an iterable of capability strings sent as one `CAP REQ :<space-joined>`
+right after `NICK`/`USER`, before registration completes. Omitted/empty
+means no `CAP REQ` is sent at all (unchanged prior behavior) -- this
+transport itself has no opinion on which capabilities exist; it is purely
+a generic IRCv3 CAP REQ mechanism, matching this module's own
+Twitch-agnostic design.
 """
 
 from __future__ import annotations
@@ -42,7 +58,12 @@ from waddle_transports.types import Direction
 
 _RPL_WELCOME = " 001 "
 _REGISTRATION_REJECTED = (" 464 ", " 465 ")
-_PRIVMSG_RE = re.compile(r"^:(?P<prefix>\S+) PRIVMSG (?P<channel>\S+) :(?P<text>.*)$")
+#: Optional leading `@tag1=val1;tag2=val2 ` IRCv3 message-tags segment
+#: (generic IRCv3.2 spec, RFC-agnostic to any specific network) captured
+#: as the raw, unsplit `tags` group -- `None` when a line carries none.
+_PRIVMSG_RE = re.compile(
+    r"^(?:@(?P<tags>\S+) )?:(?P<prefix>\S+) PRIVMSG (?P<channel>\S+) :(?P<text>.*)$"
+)
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -134,6 +155,7 @@ class IrcTransport(Transport):
                     "channel": match.group("channel"),
                     "sender": sender,
                     "text": match.group("text"),
+                    "tags": match.group("tags"),
                 }
                 received += 1
                 if max_messages is not None and received >= max_messages:
@@ -185,11 +207,16 @@ class IrcTransport(Transport):
             if sanitized_channel.startswith("#")
             else f"#{sanitized_channel}"
         )
+        cap_requests = config.get("cap_requests")
+
         try:
             if password:
                 writer.write(f"PASS {password}\r\n".encode())
             writer.write(f"NICK {nick}\r\n".encode())
             writer.write(f"USER {nick} 0 * :{nick}\r\n".encode())
+            if isinstance(cap_requests, (list, tuple, set, frozenset)) and cap_requests:
+                caps = " ".join(str(cap) for cap in cap_requests)
+                writer.write(f"CAP REQ :{caps}\r\n".encode())
             await writer.drain()
             await self._wait_for_registration(reader, timeout_seconds=timeout_seconds)
             writer.write(f"JOIN {channel}\r\n".encode())

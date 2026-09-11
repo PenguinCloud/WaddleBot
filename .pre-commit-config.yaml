@@ -58,6 +58,7 @@ repos:
     rev: v8.21.2
     hooks:
       - id: gitleaks
+        args: [--config=.gitleaks.toml]
 
   # ── Python — ruff, scoped to the v3 rewrite modules that already carry a
   #    [tool.ruff] config and are ruff-clean (0 findings as of 2026-09-01).

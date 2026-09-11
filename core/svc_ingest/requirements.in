@@ -22,6 +22,12 @@ hiredis>=2.3.2
 # trigger/receiver/discord_module/requirements.txt's own pin.
 py-cord>=2.4.1
 
+# Slack Socket Mode gateway receiver -- real slack_sdk connection
+# (slack_sdk.socket_mode.aiohttp.SocketModeClient + AsyncWebClient),
+# deliberately NOT slack_bolt (trigger/receiver/slack_module's own
+# dependency -- see receivers/slack_socket.py's own docstring for why).
+slack-sdk>=3.44.1
+
 # Twitch IRC gateway receiver -- no direct dependency here; the wire
 # protocol is libs/waddle_transports' own IrcTransport (raw asyncio TCP/
 # TLS, stdlib only), installed as a separate package step (Dockerfile),

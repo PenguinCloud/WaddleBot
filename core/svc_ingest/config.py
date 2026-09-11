@@ -91,6 +91,15 @@ class Config:
     # own "DISCORD_BOT_TOKEN not configured" skip behavior.
     DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
+    # Slack Socket Mode receiver -- app-level token opens the Socket Mode
+    # WebSocket itself, bot token builds the Web API client (`auth.test`
+    # validation + per-call `apps.connections.open` override -- see
+    # receivers/slack_socket.py's own docstring). Either empty (never
+    # committed, never logged) disables the receiver entirely -- `app.py`'s
+    # startup skips it gracefully, matching Discord's own skip behavior.
+    SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")
+    SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+
     # Twitch IRC receiver -- waddle_transports.transports.irc.IrcTransport's
     # own config shape (`host`/`port`/`nick`/`password_ref`/`use_tls`), one
     # connection per channel (that transport's own single-channel-per-call
@@ -174,3 +183,93 @@ class Config:
             "nick": cls.TWITCH_BOT_NICK,
             "password_ref": cls.TWITCH_BOT_TOKEN_REF or None,
         }
+
+    # YouTube Live poll receiver (receivers/youtube_live_poll.py) -- Data
+    # API v3 polling (no persistent gateway socket, no PubSubHubbub push --
+    # see that receiver's own module docstring for why this MVP polls
+    # instead of reusing the legacy trigger/receiver/youtube_live_module's
+    # webhook approach). One poller per configured channel, socket_lease-
+    # guarded per channel exactly like TWITCH_CHANNELS above --
+    # `community=<channel_id>` (see receivers/youtube_live_poll.py and
+    # bundles/youtube_live_ingest.py's own docstrings). Comma-separated
+    # channel ids -- same "no DB-backed channel list yet" MVP posture as
+    # TWITCH_CHANNELS documents.
+    YOUTUBE_LIVE_CHANNELS = [
+        c.strip() for c in os.getenv("YOUTUBE_LIVE_CHANNELS", "").split(",") if c.strip()
+    ]
+
+    # Credential env var *names* (never raw values) resolved at connect
+    # time via `waddle_transports.signing.resolve_secret` -- fixed to the
+    # Helm chart's own `-secrets` Secret key names (already provisioned
+    # for `hub_api/services/music_providers/youtube.py`'s identical
+    # credential set), not independently configurable the way
+    # TWITCH_BOT_TOKEN_REF's *value* is -- there is only one place these
+    # four secrets live in this deployment. Precedence (API key first,
+    # then the OAuth trio) mirrors that same hub_api module exactly; see
+    # receivers/youtube_live_poll.py's own docstring for the duplicated
+    # (not imported -- a different service/process) refresh-token helper.
+    YOUTUBE_API_KEY_REF = "YOUTUBE_API_KEY"
+    YOUTUBE_CLIENT_ID_REF = "YOUTUBE_CLIENT_ID"
+    YOUTUBE_CLIENT_SECRET_REF = "YOUTUBE_CLIENT_SECRET"  # noqa: S105 - an env var name, not a secret
+    YOUTUBE_REFRESH_TOKEN_REF = "YOUTUBE_REFRESH_TOKEN"  # noqa: S105 - an env var name, not a secret
+
+    # Poll-loop tuning, all overridable per-deployment -- defaults match
+    # receivers/youtube_live_poll.py's own module-level fallback constants
+    # exactly (used whenever this config wiring is bypassed, e.g. a unit
+    # test constructing `YouTubeLivePollReceiver` directly).
+    YOUTUBE_LIVE_POLL_NO_BROADCAST_BACKOFF_S = float(
+        os.getenv("YOUTUBE_LIVE_POLL_NO_BROADCAST_BACKOFF_S", "30.0")
+    )
+    YOUTUBE_LIVE_POLL_MAX_QUOTA_ERRORS = int(os.getenv("YOUTUBE_LIVE_POLL_MAX_QUOTA_ERRORS", "5"))
+    YOUTUBE_LIVE_CHAT_MAX_RESULTS = int(os.getenv("YOUTUBE_LIVE_CHAT_MAX_RESULTS", "200"))
+
+    @classmethod
+    def youtube_credentials_configured(cls) -> bool:
+        """Presence-only check (no network I/O) -- a usable API key or a full OAuth trio.
+
+        Mirrors `hub_api/services/music_providers/youtube.py`'s
+        `youtube_credentials_configured()` precedence exactly (API key
+        first, then ALL three OAuth env vars); duplicated rather than
+        imported since hub_api is a separate service/process from
+        svc-ingest. Used by `app.py`'s `_register_youtube_live_receiver`
+        to decide whether to register any poller at all -- missing creds
+        skip registration with a WARN, matching Discord/Twitch's own
+        empty-token skip behavior.
+        """
+        if os.getenv(cls.YOUTUBE_API_KEY_REF):
+            return True
+        return bool(
+            os.getenv(cls.YOUTUBE_CLIENT_ID_REF)
+            and os.getenv(cls.YOUTUBE_CLIENT_SECRET_REF)
+            and os.getenv(cls.YOUTUBE_REFRESH_TOKEN_REF)
+        )
+
+    # Kick Pusher chat receiver (receivers/kick_pusher.py) -- one Pusher
+    # WebSocket connection per channel slug, matching TWITCH_CHANNELS'
+    # identical "no DB-backed channel list yet" MVP posture (see that env
+    # var's own comment above). Comma-separated channel *slugs* (Kick's
+    # username-shaped channel identifier, not a numeric id -- resolved to
+    # a chatroom id by the receiver itself at connect time). Empty list
+    # disables Kick ingest entirely -- a future app.py wiring would skip
+    # registering any receiver, matching Discord/Twitch/Slack's own
+    # empty-config skip behavior.
+    KICK_CHANNELS = [
+        c.strip().lower() for c in os.getenv("KICK_CHANNELS", "").split(",") if c.strip()
+    ]
+
+    # Kick Pusher app key/cluster overrides -- see receivers/kick_pusher.py's
+    # own module docstring for why the default (Kick's own PUBLIC Pusher
+    # client key) is not a secret and is never resolved via resolve_secret.
+    # Empty string leaves receivers/kick_pusher.py's own DEFAULT_PUSHER_KEY/
+    # DEFAULT_CLUSTER constants in effect.
+    KICK_PUSHER_KEY = os.getenv("KICK_PUSHER_KEY", "")
+    KICK_PUSHER_CLUSTER = os.getenv("KICK_PUSHER_CLUSTER", "")
+
+    # Kick webhook (mod/sub/stream lifecycle events -- StreamStart/
+    # StreamEnd/Subscription/etc. -- a SEPARATE delivery path from Pusher
+    # chat). Empty secret disables the endpoint's signature verification
+    # path entirely -- see bundles/kick_ingest.py's own
+    # handle_kick_webhook()/verify_kick_webhook_signature() docstrings;
+    # NOT yet mounted by app.py (out of this PR's scope, see that
+    # module's own docstring for where it should be mounted).
+    KICK_WEBHOOK_SECRET = os.getenv("KICK_WEBHOOK_SECRET", "")

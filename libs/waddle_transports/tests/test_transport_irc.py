@@ -217,7 +217,26 @@ class TestReceive:
         finally:
             await server.stop()
 
-        assert items == [{"channel": "#testchannel", "sender": "alice", "text": "hello there"}]
+        assert items == [
+            {"channel": "#testchannel", "sender": "alice", "text": "hello there", "tags": None}
+        ]
+
+    async def test_yields_raw_tags_string_when_present(self) -> None:
+        """A leading `@tag=val;...` segment is captured raw (unsplit) as `tags`."""
+        raw_tags = "badges=moderator/1;display-name=Alice;id=abc-123;mod=1;user-id=12345"
+        server = _FakeIrcServer(
+            push_privmsg_after_join=f"@{raw_tags} :alice!alice@host PRIVMSG #testchannel :hi"
+        )
+        await server.start()
+        try:
+            transport = IrcTransport()
+            items = [item async for item in transport.receive(_config(server, _max_messages=1))]
+        finally:
+            await server.stop()
+
+        assert items == [
+            {"channel": "#testchannel", "sender": "alice", "text": "hi", "tags": raw_tags}
+        ]
 
     async def test_stops_iterating_after_max_messages(self) -> None:
         server = _FakeIrcServer(
@@ -236,3 +255,37 @@ class TestReceive:
         with pytest.raises(NonRetryableTransportError, match="channel"):
             async for _item in transport.receive(_config(fake_irc_server, channel=None)):
                 pass
+
+
+class TestCapRequests:
+    """`config["cap_requests"]` -- generic IRCv3 CAP REQ negotiation, no Twitch knowledge."""
+
+    async def test_cap_req_sent_when_configured(self, fake_irc_server) -> None:
+        transport = IrcTransport()
+        await transport.send(
+            _config(fake_irc_server, cap_requests=["twitch.tv/tags", "twitch.tv/commands"]),
+            {"text": "hi"},
+        )
+        await asyncio.wait_for(fake_irc_server.quit_seen.wait(), timeout=3.0)
+        assert "CAP REQ :twitch.tv/tags twitch.tv/commands" in fake_irc_server.received_lines
+
+    async def test_cap_req_sent_after_user_before_join(self, fake_irc_server) -> None:
+        transport = IrcTransport()
+        await transport.send(_config(fake_irc_server, cap_requests=["some.cap"]), {"text": "hi"})
+        await asyncio.wait_for(fake_irc_server.quit_seen.wait(), timeout=3.0)
+        lines = fake_irc_server.received_lines
+        assert lines.index("USER waddlebot 0 * :waddlebot") < lines.index("CAP REQ :some.cap")
+        assert lines.index("CAP REQ :some.cap") < lines.index("JOIN #testchannel")
+
+    async def test_no_cap_req_when_absent(self, fake_irc_server) -> None:
+        """Unchanged prior behavior -- omitted `cap_requests` sends no `CAP` line at all."""
+        transport = IrcTransport()
+        await transport.send(_config(fake_irc_server), {"text": "hi"})
+        await asyncio.wait_for(fake_irc_server.quit_seen.wait(), timeout=3.0)
+        assert not any(line.startswith("CAP") for line in fake_irc_server.received_lines)
+
+    async def test_empty_cap_requests_sends_no_cap_line(self, fake_irc_server) -> None:
+        transport = IrcTransport()
+        await transport.send(_config(fake_irc_server, cap_requests=[]), {"text": "hi"})
+        await asyncio.wait_for(fake_irc_server.quit_seen.wait(), timeout=3.0)
+        assert not any(line.startswith("CAP") for line in fake_irc_server.received_lines)

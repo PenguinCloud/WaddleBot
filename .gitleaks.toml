@@ -1,0 +1,17 @@
+# gitleaks configuration for waddlebot
+# Extended from default rules with allowlists for known false positives.
+
+[extend]
+useDefault = true
+
+[allowlist]
+# Kick's PUBLIC Pusher application key (not a credential).
+# Every Kick chat viewer's browser connects with this exact key.
+# See trigger/receiver/kick_module_flask/services/chat_client.py:26-27
+# for the original commit where this was established as public, not secret.
+description = "Kick's public Pusher app key allowlist"
+regexes = ["eb1d5f283081a78b932c"]
+paths = [
+  "core/svc_ingest/receivers/kick_pusher\\.py",
+  "core/svc_ingest/tests/test_receivers_kick_pusher\\.py",
+]

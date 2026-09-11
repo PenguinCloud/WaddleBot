@@ -72,15 +72,24 @@ from flask_core.stage_runner import BundlePoller
 from quart import Blueprint, Quart, request
 
 from bundles.discord_gateway_manifest import register_default_bundles as register_discord_bundles
+from bundles.kick_gateway_manifest import register_default_bundles as register_kick_bundles
+from bundles.slack_gateway_manifest import register_default_bundles as register_slack_bundles
 from bundles.twitch_gateway_manifest import register_default_bundles as register_twitch_bundles
+from bundles.youtube_live_ingest import register_default_bundles as register_youtube_bundles
 from config import Config
 from eventsub import TwitchEventSubHandler
 from fanout import fan_out_event
 from outbound_drain import DRAIN_SOCKET_TIMEOUT_S, TwitchOutboundDrain
 from receivers.discord_gateway import CONSUMES_TAG as DISCORD_CONSUMES_TAG
 from receivers.discord_gateway import DiscordGatewayReceiver
+from receivers.kick_pusher import CONSUMES_TAG as KICK_CONSUMES_TAG
+from receivers.kick_pusher import KickPusherReceiver
+from receivers.slack_socket import CONSUMES_TAG as SLACK_CONSUMES_TAG
+from receivers.slack_socket import SlackSocketReceiver
 from receivers.twitch_irc import CONSUMES_TAG as TWITCH_CONSUMES_TAG
 from receivers.twitch_irc import TwitchIrcReceiver
+from receivers.youtube_live_poll import CONSUMES_TAG as YOUTUBE_CONSUMES_TAG
+from receivers.youtube_live_poll import YouTubeLivePollReceiver
 from runner import IngestRunner
 from socket_lease import PLATFORM_COMMUNITY, LeasedReceiver
 from supervisor import ReceiverSupervisor
@@ -217,6 +226,219 @@ def _register_discord_receiver(
     supervisor.register("discord_gateway", leased_discord.run, transport=discord_receiver)
     logger.system(
         "svc-ingest registered Discord gateway receiver", action="startup", replica_id=replica_id
+    )
+
+
+def _register_slack_receiver(
+    supervisor: ReceiverSupervisor,
+    *,
+    redis_client: Any,
+    registry: AppRegistry,
+) -> None:
+    """Build + lease-guard + supervise the Slack Socket Mode receiver, if configured."""
+    if not (Config.SLACK_APP_TOKEN and Config.SLACK_BOT_TOKEN):
+        logger.warning(
+            "slack disabled: SLACK_APP_TOKEN/SLACK_BOT_TOKEN not set",
+            action="startup",
+            result="SKIPPED",
+        )
+        return
+
+    replica_id = uuid.uuid4().hex
+    slack_receiver = SlackSocketReceiver()
+
+    async def _on_slack_item(item: Mapping[str, Any]) -> None:
+        """Fan one normalized Slack event dict out to every consuming bundle.
+
+        T9: `community=None` (tenant-wide) for this demo, matching
+        Discord/Twitch's own deferred channel->community mapping slot --
+        see this module's own docstring.
+        """
+        await fan_out_event(
+            item,
+            consumes_tag=SLACK_CONSUMES_TAG,
+            tenant=Config.RUNNER_TENANT_SLUG,
+            community=None,
+            redis_client=redis_client,
+            registry=registry,
+        )
+
+    leased_slack = LeasedReceiver(
+        transport=slack_receiver,
+        # `*_token_ref` are env var *names*, resolved by `receive()` via
+        # `waddle_transports.signing.resolve_secret` -- never raw tokens
+        # in this config dict.
+        config={  # nosec B105 -- env var names, not token values
+            "app_token_ref": "SLACK_APP_TOKEN",
+            "bot_token_ref": "SLACK_BOT_TOKEN",
+        },
+        on_item=_on_slack_item,
+        redis_client=redis_client,
+        provider="slack",
+        community=PLATFORM_COMMUNITY,
+        owner_id=replica_id,
+        ttl_s=Config.SOCKET_LEASE_TTL_S,
+        renew_interval_s=Config.SOCKET_LEASE_RENEW_INTERVAL_S,
+        claim_timeout_s=Config.SOCKET_LEASE_CLAIM_TIMEOUT_S,
+        run_without_lease_on_unavailable=Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE,
+    )
+    app.config["slack_leased_receiver"] = leased_slack
+    supervisor.register("slack_socket", leased_slack.run, transport=slack_receiver)
+    logger.system(
+        "svc-ingest registered Slack Socket Mode receiver", action="startup", replica_id=replica_id
+    )
+
+
+def _register_youtube_live_receiver(
+    supervisor: ReceiverSupervisor,
+    *,
+    redis_client: Any,
+    registry: AppRegistry,
+) -> None:
+    """Build + lease-guard + supervise one YouTube Live poll receiver per channel, if configured."""
+    if not (Config.YOUTUBE_LIVE_CHANNELS and Config.youtube_credentials_configured()):
+        logger.system(
+            "svc-ingest starting with no YouTube Live poll receivers -- "
+            "YOUTUBE_LIVE_CHANNELS/credentials not configured",
+            action="startup",
+            result="SKIPPED",
+        )
+        return
+
+    replica_id = uuid.uuid4().hex
+    leased_receivers = []
+
+    async def _on_youtube_item(item: Mapping[str, Any]) -> None:
+        """Fan one normalized YouTube Live chat message dict out to every consuming bundle.
+
+        T9: `community=None` (tenant-wide) for this demo -- see this
+        module's own docstring for the deferred channel->community
+        mapping slot (the lease itself is still per-channel, `community=
+        channel_id`, below -- matches Twitch's own split between lease
+        scope and fan-out scope).
+        """
+        await fan_out_event(
+            item,
+            consumes_tag=YOUTUBE_CONSUMES_TAG,
+            tenant=Config.RUNNER_TENANT_SLUG,
+            community=None,
+            redis_client=redis_client,
+            registry=registry,
+        )
+
+    for channel_id in Config.YOUTUBE_LIVE_CHANNELS:
+        youtube_receiver = YouTubeLivePollReceiver()
+        # ONE lease per channel -- YouTubeLivePollReceiver.receive() polls
+        # a single channel per call, so two replicas must never both poll
+        # the SAME channel, but different channels are entirely
+        # independent (never contend for the same lease key). Matches
+        # TwitchIrcReceiver's own per-channel precedent.
+        leased = LeasedReceiver(
+            transport=youtube_receiver,
+            config={
+                "channel_id": channel_id,
+                "api_key_ref": Config.YOUTUBE_API_KEY_REF,
+                "client_id_ref": Config.YOUTUBE_CLIENT_ID_REF,
+                "client_secret_ref": Config.YOUTUBE_CLIENT_SECRET_REF,
+                "refresh_token_ref": Config.YOUTUBE_REFRESH_TOKEN_REF,
+                "no_broadcast_backoff_s": Config.YOUTUBE_LIVE_POLL_NO_BROADCAST_BACKOFF_S,
+                "max_consecutive_quota_errors": Config.YOUTUBE_LIVE_POLL_MAX_QUOTA_ERRORS,
+                "chat_max_results": Config.YOUTUBE_LIVE_CHAT_MAX_RESULTS,
+            },
+            on_item=_on_youtube_item,
+            redis_client=redis_client,
+            provider="youtube",
+            community=channel_id,
+            owner_id=replica_id,
+            ttl_s=Config.SOCKET_LEASE_TTL_S,
+            renew_interval_s=Config.SOCKET_LEASE_RENEW_INTERVAL_S,
+            claim_timeout_s=Config.SOCKET_LEASE_CLAIM_TIMEOUT_S,
+            run_without_lease_on_unavailable=Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE,
+        )
+        leased_receivers.append(leased)
+        supervisor.register(
+            f"youtube_live_poll:{channel_id}", leased.run, transport=youtube_receiver
+        )
+
+    app.config["youtube_leased_receivers"] = leased_receivers
+    logger.system(
+        "svc-ingest registered YouTube Live poll receivers",
+        action="startup",
+        replica_id=replica_id,
+        channels=len(Config.YOUTUBE_LIVE_CHANNELS),
+    )
+
+
+def _register_kick_receivers(
+    supervisor: ReceiverSupervisor,
+    *,
+    redis_client: Any,
+    registry: AppRegistry,
+) -> None:
+    """Build + lease-guard + supervise one Kick Pusher chat receiver per channel, if configured."""
+    if not Config.KICK_CHANNELS:
+        logger.system(
+            "svc-ingest starting with no Kick Pusher receivers -- KICK_CHANNELS not configured",
+            action="startup",
+            result="SKIPPED",
+        )
+        return
+
+    replica_id = uuid.uuid4().hex
+    leased_receivers = []
+
+    async def _on_kick_item(item: Mapping[str, Any]) -> None:
+        """Fan one normalized Kick chat message dict out to every consuming bundle.
+
+        T9: `community=None` (tenant-wide) for this demo -- see this
+        module's own docstring for the deferred channel->community
+        mapping slot (the lease itself is still per-channel, `community=
+        channel_slug`, below -- matches Twitch/YouTube's own split between
+        lease scope and fan-out scope).
+        """
+        await fan_out_event(
+            item,
+            consumes_tag=KICK_CONSUMES_TAG,
+            tenant=Config.RUNNER_TENANT_SLUG,
+            community=None,
+            redis_client=redis_client,
+            registry=registry,
+        )
+
+    for channel in Config.KICK_CHANNELS:
+        kick_receiver = KickPusherReceiver()
+        # ONE lease per channel -- KickPusherReceiver.receive() resolves +
+        # connects a single channel's Pusher chatroom per call, so two
+        # replicas must never both hold the SAME channel's connection, but
+        # different channels are entirely independent (never contend for
+        # the same lease key). Matches TwitchIrcReceiver/
+        # YouTubeLivePollReceiver's own per-channel precedent.
+        leased = LeasedReceiver(
+            transport=kick_receiver,
+            config={
+                "channel_slug": channel,
+                "pusher_key": Config.KICK_PUSHER_KEY or None,
+                "cluster": Config.KICK_PUSHER_CLUSTER or None,
+            },
+            on_item=_on_kick_item,
+            redis_client=redis_client,
+            provider="kick",
+            community=channel,
+            owner_id=replica_id,
+            ttl_s=Config.SOCKET_LEASE_TTL_S,
+            renew_interval_s=Config.SOCKET_LEASE_RENEW_INTERVAL_S,
+            claim_timeout_s=Config.SOCKET_LEASE_CLAIM_TIMEOUT_S,
+            run_without_lease_on_unavailable=Config.SOCKET_LEASE_RUN_WITHOUT_ON_UNAVAILABLE,
+        )
+        leased_receivers.append(leased)
+        supervisor.register(f"kick_pusher:{channel}", leased.run, transport=kick_receiver)
+
+    app.config["kick_leased_receivers"] = leased_receivers
+    logger.system(
+        "svc-ingest registered Kick Pusher receivers",
+        action="startup",
+        replica_id=replica_id,
+        channels=len(Config.KICK_CHANNELS),
     )
 
 
@@ -388,6 +610,9 @@ async def startup() -> None:
     # this module's own docstring and socket_lease.py for the full design.
     registry = AppRegistry()
     register_discord_bundles(registry)
+    register_slack_bundles(registry)
+    register_youtube_bundles(registry)
+    register_kick_bundles(registry)
     register_twitch_bundles(registry)
     app.config["registry"] = registry
 
@@ -410,6 +635,9 @@ async def startup() -> None:
     # never actually registered.
     try:
         _register_discord_receiver(supervisor, redis_client=redis_client, registry=registry)
+        _register_slack_receiver(supervisor, redis_client=redis_client, registry=registry)
+        _register_youtube_live_receiver(supervisor, redis_client=redis_client, registry=registry)
+        _register_kick_receivers(supervisor, redis_client=redis_client, registry=registry)
         _register_twitch_receivers(supervisor, redis_client=redis_client, registry=registry)
         _register_twitch_eventsub(redis_client=redis_client, registry=registry)
         await supervisor.start()
