@@ -3,6 +3,13 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gazer/services/gazer_log.dart';
 
+/// A field value `jsonEncode` cannot natively encode (no `toJson()`), used
+/// to prove `_emit`'s `toEncodable` fallback never throws.
+class _Unencodable {
+  @override
+  String toString() => 'unencodable-value';
+}
+
 void main() {
   late void Function(String line) originalSink;
   late bool originalVerbose;
@@ -97,5 +104,24 @@ void main() {
       final decoded = jsonDecode(lines.single) as Map<String, dynamic>;
       expect(decoded['level'], 'debug');
     });
+
+    test(
+      'non-encodable field values fall back to toString() instead of throwing',
+      () {
+        final lines = <String>[];
+        GazerLog.sink = lines.add;
+
+        expect(
+          () => GazerLog.info('diagnostic', <String, Object?>{
+            'weird': _Unencodable(),
+          }),
+          returnsNormally,
+        );
+
+        expect(lines, hasLength(1));
+        final decoded = jsonDecode(lines.single) as Map<String, dynamic>;
+        expect(decoded['weird'], 'unencodable-value');
+      },
+    );
   });
 }

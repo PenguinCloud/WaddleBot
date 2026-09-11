@@ -290,6 +290,10 @@ class PipelineController {
     _statsController.add(_statsSnapshot);
   }
 
+  /// Updates [_current], notifies [state] subscribers, and logs the
+  /// transition (`from`/`to` runtime type names, plus `errorCode` when
+  /// [next] is an [ErrorState]) at [GazerLog.debug] level — a no-op once
+  /// [dispose] has run.
   void _emit(PipelineState next) {
     if (_isDisposed) return;
     GazerLog.debug('pipeline.state', <String, Object?>{

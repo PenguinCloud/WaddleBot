@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gazer/models/gazer_settings.dart';
 import 'package:gazer/providers/settings_provider.dart';
+import 'package:gazer/services/gazer_log.dart';
 import 'package:gazer/services/settings_repository.dart';
 
 class _FakeSettingsRepository implements SettingsRepository {
@@ -19,6 +20,13 @@ class _FakeSettingsRepository implements SettingsRepository {
 }
 
 void main() {
+  tearDown(() {
+    // Every test here builds/saves through the real SettingsNotifier, which
+    // sets GazerLog.verbose from GazerSettings.debugLogs — reset so a
+    // future test with debugLogs: true never leaks into a later test.
+    GazerLog.resetForTest();
+  });
+
   test('SettingsNotifier.build loads from the repository', () async {
     final repo = _FakeSettingsRepository();
     final container = ProviderContainer(

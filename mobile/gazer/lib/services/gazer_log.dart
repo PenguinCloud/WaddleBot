@@ -18,14 +18,19 @@ class GazerLog {
   /// cannot be intercepted directly.
   static void Function(String line) sink = _developerSink;
 
+  /// Default [sink]: writes through `dart:developer`'s `log()` under the
+  /// `gazer` name, the normal production path.
   static void _developerSink(String line) => developer.log(line, name: 'gazer');
 
+  /// Emits an `info`-level JSON line for [event] with [fields] (sanitized).
   static void info(String event, [Map<String, Object?> fields = const {}]) =>
       _emit('info', event, fields);
 
+  /// Emits a `warn`-level JSON line for [event] with [fields] (sanitized).
   static void warn(String event, [Map<String, Object?> fields = const {}]) =>
       _emit('warn', event, fields);
 
+  /// Emits an `error`-level JSON line for [event] with [fields] (sanitized).
   static void error(String event, [Map<String, Object?> fields = const {}]) =>
       _emit('error', event, fields);
 
@@ -35,6 +40,21 @@ class GazerLog {
     _emit('debug', event, fields);
   }
 
+  /// Test-only: restores [verbose] and [sink] to their production defaults
+  /// (`false` and [_developerSink]). Call from `tearDown` in any test that
+  /// flips [verbose] or overrides [sink] — directly, or indirectly via a
+  /// real notifier/controller — so the mutation never leaks into a later
+  /// test.
+  static void resetForTest() {
+    verbose = false;
+    sink = _developerSink;
+  }
+
+  /// Builds the JSON record (`ts`/`level`/`event` plus sanitized [fields])
+  /// and writes it through [sink]. Never throws: a field value `jsonEncode`
+  /// can't natively encode falls back to its `toString()`, via
+  /// [JsonEncoder.toEncodable], instead of propagating a
+  /// [JsonUnsupportedObjectError] to the caller.
   static void _emit(String level, String event, Map<String, Object?> fields) {
     final record = <String, Object?>{
       'ts': DateTime.now().toIso8601String(),
@@ -42,7 +62,7 @@ class GazerLog {
       'event': event,
       ...sanitize(fields),
     };
-    sink(jsonEncode(record));
+    sink(jsonEncode(record, toEncodable: (Object? value) => value.toString()));
   }
 
   /// Masks [value]: `null`/empty -> `''`; otherwise `'****'` + the last 4
@@ -73,6 +93,9 @@ class GazerLog {
     });
   }
 
+  /// Masks only the last path segment of [url] via [maskSecret], preserving
+  /// scheme/host/earlier segments; returns [url] unchanged if it can't be
+  /// parsed or has no path segments to mask.
   static String _maskUrlLastSegment(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null || uri.pathSegments.isEmpty) return url;

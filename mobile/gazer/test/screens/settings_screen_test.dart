@@ -12,6 +12,7 @@ import 'package:gazer/providers/devices_provider.dart';
 import 'package:gazer/providers/license_provider.dart';
 import 'package:gazer/providers/settings_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
+import 'package:gazer/services/gazer_log.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../helpers/fake_host_api.dart';
@@ -61,6 +62,13 @@ void main() {
 
   setUp(() {
     settingsRepo = FakeSettingsRepository();
+  });
+
+  tearDown(() {
+    // The "debug logs" test flips `GazerLog.verbose` through the real
+    // `SettingsNotifier.save` — reset so it never leaks into a later test
+    // in this file (or a later file, if a runner shares an isolate).
+    GazerLog.resetForTest();
   });
 
   Future<void> pumpSettings(
