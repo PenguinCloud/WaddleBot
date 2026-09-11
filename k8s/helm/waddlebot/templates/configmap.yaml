@@ -100,6 +100,13 @@ data:
   # hosted default. See templates/infrastructure/posthog/_helpers.tpl.
   POSTHOG_HOST: {{ include "waddlebot.posthog.effectiveHost" . | quote }}
 
+  # Connector channel configuration (svc-ingest receivers)
+  TWITCH_CHANNELS: {{ .Values.config.twitchChannels | default "" | quote }}
+  KICK_CHANNELS: {{ .Values.config.kickChannels | default "" | quote }}
+  KICK_PUSHER_KEY: {{ .Values.config.kickPusherKey | default "" | quote }}
+  KICK_PUSHER_CLUSTER: {{ .Values.config.kickPusherCluster | default "" | quote }}
+  YOUTUBE_LIVE_CHANNELS: {{ .Values.config.youtubeLiveChannels | default "" | quote }}
+
   # Service Discovery URLs
   HUB_API_URL: "http://{{ include "waddlebot.fullname" . }}-hub-api-v3:8204"
   PUBLIC_WEBUI_URL: {{ .Values.webui.publicUrl | quote }}

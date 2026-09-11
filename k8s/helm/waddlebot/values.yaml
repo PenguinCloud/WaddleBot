@@ -1442,6 +1442,7 @@ oauth:
     clientSecret: ""
     botToken: ""
     signingSecret: ""
+    appToken: ""
   youtube:
     apiKey: ""
     clientId: ""
@@ -1456,6 +1457,7 @@ oauth:
     clientId: ""
     clientSecret: ""
     webhookSecret: ""
+    accessToken: ""
   teams:
     appId: ""
     appPassword: ""
@@ -1490,6 +1492,19 @@ openwhisk:
 waddleai:
   baseUrl: ""
   apiKey: ""
+
+# Connector Configuration (svc-ingest channels and overrides)
+config:
+  # Twitch IRC receiver — comma-separated list of channel names to monitor
+  twitchChannels: ""
+  # Kick Pusher receiver — comma-separated list of channel slugs to monitor
+  kickChannels: ""
+  # Kick Pusher PUBLIC client key (not a secret, Kick's public key for websocket)
+  kickPusherKey: ""
+  # Kick Pusher cluster (e.g. "mt1" — empty uses Kick's default)
+  kickPusherCluster: ""
+  # YouTube Live poll receiver — comma-separated list of channel IDs to monitor
+  youtubeLiveChannels: ""
 
 # Dependencies Configuration
 dependencies:
