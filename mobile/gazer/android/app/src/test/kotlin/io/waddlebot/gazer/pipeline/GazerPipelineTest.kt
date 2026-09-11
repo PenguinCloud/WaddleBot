@@ -1,5 +1,6 @@
 package io.waddlebot.gazer.pipeline
 
+import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.sources.audio.AudioSource
 import com.pedro.encoder.input.sources.video.VideoSource
 import io.mockk.clearMocks
@@ -130,6 +131,52 @@ class GazerPipelineTest {
         pipeline.onDisconnect()
 
         assertEquals(NativePipelineState.ERROR, pipeline.state)
+        verify(exactly = 0) { listener.onState(NativePipelineState.IDLE) }
+    }
+
+    @Test
+    fun `a late onDisconnect from a superseded generation's engine is dropped, not misread as idle`() {
+        val checkers = mutableListOf<ConnectChecker>()
+        val engine2 = mockk<StreamEngine>(relaxed = true)
+        every { engine2.prepareVideo(any(), any(), any(), any(), any()) } returns true
+        every { engine2.prepareAudio(any(), any(), any()) } returns true
+        every { engine2.hasCongestion(20f) } returns false
+        val engines = listOf(engine, engine2).iterator()
+        pipeline =
+            GazerPipeline(
+                engineFactory = { checker, _, _ ->
+                    checkers.add(checker)
+                    engines.next()
+                },
+                videoSources = videoSources,
+                audioSources = audioSources,
+                listener = listener,
+                statsSampler = statsSampler,
+            )
+
+        // Generation 1: connects, then fails terminally -- the engine is released and the real
+        // GazerPipeline.onDisconnect() correctly stays quiet for the trailing callback (state is
+        // already ERROR). RootEncoder can still deliver a *second*, delayed onDisconnect for this
+        // same released engine well after that, once a reconnect retry has moved on.
+        pipeline.prepare(validConfig)
+        pipeline.start(StreamTarget(url = "rtmp://example.com/live/key"))
+        val firstGenerationChecker = checkers[0]
+        firstGenerationChecker.onConnectionFailed("Connection timeout")
+        assertEquals(NativePipelineState.ERROR, pipeline.state)
+
+        clearMocks(listener, answers = false)
+
+        // The Dart-side reconnect retry re-prepares: a fresh engine, a fresh generation, moving
+        // state to READY.
+        pipeline.prepare(validConfig)
+        assertEquals(NativePipelineState.READY, pipeline.state)
+
+        // The late onDisconnect for the FIRST (already superseded) engine arrives only now. Keyed
+        // on state alone (the pre-7c-fix behaviour) this would match neither wasStreaming nor
+        // alreadyFailed and fall into the IDLE branch, overwriting the new session's READY state.
+        firstGenerationChecker.onDisconnect()
+
+        assertEquals(NativePipelineState.READY, pipeline.state)
         verify(exactly = 0) { listener.onState(NativePipelineState.IDLE) }
     }
 

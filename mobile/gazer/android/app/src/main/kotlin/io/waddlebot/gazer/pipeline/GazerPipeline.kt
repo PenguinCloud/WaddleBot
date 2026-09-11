@@ -12,6 +12,7 @@ import io.waddlebot.gazer.pigeon.StreamConfig
 import io.waddlebot.gazer.pigeon.StreamTarget
 import io.waddlebot.gazer.pipeline.sources.AudioSourceFactory
 import io.waddlebot.gazer.pipeline.sources.VideoSourceFactory
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Owns the native streaming state machine: builds sources and a StreamEngine from a
@@ -59,6 +60,16 @@ class GazerPipeline(
     private var adaptiveBitrate = false
 
     /**
+     * Identifies which `prepare()` call's engine is current. Every `ConnectChecker` handed to
+     * `engineFactory` is a [GenerationGuardedChecker] stamped with the generation active when it
+     * was built, so a trailing callback from an engine a later `prepare()` has already superseded
+     * is dropped instead of being misread as belonging to the current session - see
+     * [GenerationGuardedChecker] and item 4 of the 7c review (GazerPipeline.kt onDisconnect used
+     * to key off current `state` alone, which a same-shaped but stale callback can still match).
+     */
+    private val generationCounter = AtomicInteger(0)
+
+    /**
      * Validates [config], builds the video/audio sources and a fresh StreamEngine, and
      * prepares both the video and audio pipelines. Returns a failed PrepareResult (never
      * throws) if the config is out of range or RootEncoder rejects it.
@@ -73,9 +84,16 @@ class GazerPipeline(
         synchronized(lock) { state = NativePipelineState.PREPARING }
         listener.onState(NativePipelineState.PREPARING)
 
+        // Superseding the generation here - before the new engine exists - means a trailing
+        // callback from whatever engine this prepare() is about to replace (e.g. RootEncoder's
+        // onDisconnect, which always follows a terminal onConnectionFailed) is dropped by its own
+        // now-stale GenerationGuardedChecker rather than reaching this pipeline's real onXxx
+        // methods and being misapplied to the new session's state.
+        val myGeneration = generationCounter.incrementAndGet()
+
         val videoSource = videoSources.create(config.videoDeviceId)
         val audioSource = audioSources.create(config.audioDeviceId)
-        val newEngine = engineFactory(this, videoSource, audioSource)
+        val newEngine = engineFactory(GenerationGuardedChecker(myGeneration), videoSource, audioSource)
 
         val rotation = if (config.orientation == OutputOrientation.PORTRAIT) 90 else 0
         val videoOk =
@@ -229,6 +247,12 @@ class GazerPipeline(
     // ConnectChecker (RootEncoder callbacks) - see ErrorMapper for reason-string classification.
     // RootEncoder invokes these from its own internal thread(s), concurrently with caller-thread
     // prepare/start/stop/setVideoBitrate calls - see the class KDoc locking contract above.
+    //
+    // These methods are also this pipeline's real, unconditional handlers: GenerationGuardedChecker
+    // (below) delegates into them only when its stamped generation is still current, but they
+    // remain public ConnectChecker overrides in their own right so a directly-held reference to a
+    // GazerPipeline (as tests hold) can still drive them straight, without going through a
+    // generation check of its own.
 
     override fun onConnectionStarted(url: String) {
         synchronized(lock) { state = NativePipelineState.CONNECTING }
@@ -276,6 +300,13 @@ class GazerPipeline(
         // status chip drops back to "Idle" mid-reconnect and the Stop button - only rendered while
         // connecting/streaming/reconnecting - disappears, leaving no way to cancel the retry loop.
         // The failure was already reported by the callback that classified it; stay quiet here.
+        //
+        // This state-keyed check alone is not sufficient once a reconnect retry has re-prepared: a
+        // still-in-flight onDisconnect from the released engine can arrive after prepare() has
+        // moved state to READY/CONNECTING for a fresh engine, matching neither wasStreaming nor
+        // alreadyFailed and falling into the IDLE branch above - overwriting the new session.
+        // GenerationGuardedChecker is what actually prevents that: a callback from a superseded
+        // generation never reaches this method at all.
     }
 
     override fun onAuthError() {
@@ -302,6 +333,51 @@ class GazerPipeline(
         }
         if (shouldAdapt && currentEngine != null) {
             adapter?.adaptBitrate(bitrate, currentEngine.hasCongestion(CONGESTION_THRESHOLD_PERCENT))
+        }
+    }
+
+    /**
+     * The `ConnectChecker` actually handed to a new engine via `engineFactory`, stamped with the
+     * generation active when it was built. Every callback checks that its stamp still matches
+     * [generationCounter] before delegating into the outer pipeline's real onXxx handlers above -
+     * a callback that arrives after a later `prepare()` has moved the generation on is dropped
+     * silently, exactly like RootEncoder dropping delivery to an engine nobody references anymore.
+     * A reporting-layer guard only (ruling: Dart owns reconnect decisions; this class only reports
+     * facts) - it changes nothing about which errors are retryable or how, only which engine's
+     * facts this pipeline is willing to report right now.
+     */
+    private inner class GenerationGuardedChecker(
+        private val myGeneration: Int,
+    ) : ConnectChecker {
+        private val isCurrent: Boolean
+            get() = myGeneration == generationCounter.get()
+
+        override fun onConnectionStarted(url: String) {
+            if (isCurrent) this@GazerPipeline.onConnectionStarted(url)
+        }
+
+        override fun onConnectionSuccess() {
+            if (isCurrent) this@GazerPipeline.onConnectionSuccess()
+        }
+
+        override fun onConnectionFailed(reason: String) {
+            if (isCurrent) this@GazerPipeline.onConnectionFailed(reason)
+        }
+
+        override fun onDisconnect() {
+            if (isCurrent) this@GazerPipeline.onDisconnect()
+        }
+
+        override fun onAuthError() {
+            if (isCurrent) this@GazerPipeline.onAuthError()
+        }
+
+        override fun onAuthSuccess() {
+            if (isCurrent) this@GazerPipeline.onAuthSuccess()
+        }
+
+        override fun onNewBitrate(bitrate: Long) {
+            if (isCurrent) this@GazerPipeline.onNewBitrate(bitrate)
         }
     }
 }

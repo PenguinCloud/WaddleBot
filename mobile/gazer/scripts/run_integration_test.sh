@@ -100,9 +100,9 @@ flutter drive \
   -d emulator-5554 \
   --timeout=900 \
   --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE" \
-  | tee /tmp/integration_test.log
+  | tee /tmp/flutter_integration.log
 
-grep -qE '\+[1-9][0-9]*' /tmp/integration_test.log
+grep -qE '\+[1-9][0-9]*' /tmp/flutter_integration.log
 
 python3 scripts/decode_screenshots.py
 
