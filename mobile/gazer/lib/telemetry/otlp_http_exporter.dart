@@ -28,6 +28,27 @@ typedef OtlpSpanRecord = ({
   Map<String, Object?> attributes,
 });
 
+/// Outcome of one [OtlpHttpExporter.post] attempt -- deliberately a
+/// three-way result, not a bool, because the two failure modes call for
+/// opposite caller behavior: an [encodeFailure] batch will fail identically
+/// forever if retried (the record itself is malformed) and should be
+/// dropped, while a [transportFailure] batch is likely transient (a dead
+/// or slow collector) and should be retried on the next scheduled flush.
+enum PostResult {
+  /// The body encoded and the collector responded 2xx.
+  success,
+
+  /// Building or JSON-encoding the body threw -- e.g. a caller-supplied
+  /// attribute value whose `toString()` throws, or a value `jsonEncode`
+  /// cannot represent (`NaN`/`Infinity`). Retrying the same batch would
+  /// fail identically every time.
+  encodeFailure,
+
+  /// The body encoded fine but sending it failed: timeout, connection
+  /// refused, or a non-2xx response. Transient -- worth retrying later.
+  transportFailure,
+}
+
 /// Minimal OTLP/HTTP JSON exporter: encodes batched log/metric/span records
 /// per the OTLP spec's JSON Protobuf Encoding mapping
 /// (https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding --
@@ -64,23 +85,29 @@ class OtlpHttpExporter {
   void close() => _dio.close(force: true);
 
   /// Builds the OTLP-JSON body via [buildBody] and POSTs it to
-  /// `'$_endpoint$path'`. Returns `true` on any 2xx response; `false` on
-  /// any other status or exception -- **including an exception thrown by
-  /// [buildBody] itself** (e.g. a caller-supplied attribute value whose
-  /// `toString()` throws) -- so a dead collector, a malformed record, or
-  /// an unencodable attribute never propagates to the caller. [buildBody]
-  /// is evaluated lazily, inside this guard, rather than by the caller
-  /// beforehand, specifically so encoding shares the same never-throw
-  /// boundary as the network call.
-  Future<bool> post(
+  /// `'$_endpoint$path'`. Never throws -- every failure mode (an
+  /// exception from [buildBody]/`jsonEncode`, a network error, a non-2xx
+  /// response) resolves to a [PostResult], never propagates to the
+  /// caller. [buildBody] is evaluated lazily, inside this method's own
+  /// guard, rather than by the caller beforehand, specifically so
+  /// encoding shares a never-throw boundary with the network call --
+  /// but that boundary is split in two ([PostResult.encodeFailure] vs.
+  /// [PostResult.transportFailure]) so the caller can tell a
+  /// permanently-malformed batch from a transient network failure.
+  Future<PostResult> post(
     String path,
     Map<String, Object?> Function() buildBody,
   ) async {
+    final String encoded;
     try {
-      final Map<String, Object?> body = buildBody();
+      encoded = jsonEncode(buildBody());
+    } catch (_) {
+      return PostResult.encodeFailure;
+    }
+    try {
       final Response<dynamic> response = await _dio.post<dynamic>(
         '$_endpoint$path',
-        data: jsonEncode(body),
+        data: encoded,
         options: Options(
           headers: <String, String>{
             'Content-Type': 'application/json',
@@ -91,9 +118,11 @@ class OtlpHttpExporter {
         ),
       );
       final int status = response.statusCode ?? 0;
-      return status >= 200 && status < 300;
+      return status >= 200 && status < 300
+          ? PostResult.success
+          : PostResult.transportFailure;
     } catch (_) {
-      return false;
+      return PostResult.transportFailure;
     }
   }
 

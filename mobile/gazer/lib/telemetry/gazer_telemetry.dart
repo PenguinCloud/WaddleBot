@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 
+import '../services/gazer_log.dart';
 import 'otlp_http_exporter.dart';
 import 'telemetry_config.dart';
 
@@ -67,12 +68,20 @@ class GazerTelemetry {
   static final List<OtlpMetricPoint> _metrics = <OtlpMetricPoint>[];
   static final List<OtlpSpanRecord> _spans = <OtlpSpanRecord>[];
 
-  /// Count of export POST attempts that did not succeed (timeout,
-  /// connection refused, non-2xx) -- surfaced by the status panel.
+  /// Count of export POST attempts that did not succeed for a transient
+  /// (transport-level) reason -- timeout, connection refused, non-2xx --
+  /// surfaced by the status panel. The batch is retained and retried on
+  /// the next scheduled flush.
   static int exportFailures = 0;
 
   /// Count of export POST attempts that succeeded (2xx).
   static int exportSuccesses = 0;
+
+  /// Count of batches dropped because they could not be encoded (e.g. an
+  /// attribute value whose `toString()` throws, or a value `jsonEncode`
+  /// cannot represent) -- distinct from [exportFailures] because retrying
+  /// an un-encodable batch fails identically forever; see [_dropOnEncodeFailure].
+  static int encodeFailures = 0;
 
   /// Applies [config] and rebuilds the exporter; starts the periodic flush
   /// scheduler on first call. Safe to call repeatedly -- e.g. every time
@@ -180,10 +189,12 @@ class GazerTelemetry {
 
   /// Batches whatever is currently buffered per signal type and POSTs each
   /// non-empty batch as OTLP/HTTP JSON. A no-op (no HTTP calls at all)
-  /// when [isExporting] is false. Each signal type's batch is removed from
-  /// the buffer only on a successful (2xx) POST; a failed POST leaves the
-  /// records buffered for the next scheduled flush (still subject to the
-  /// ring buffer's drop-oldest cap).
+  /// when [isExporting] is false. Each signal type's batch is removed
+  /// from the buffer on a successful (2xx) POST *or* on an encode
+  /// failure (a malformed batch would fail identically forever if kept,
+  /// see [_dropOnEncodeFailure]); only a transient transport failure
+  /// leaves the batch buffered for the next scheduled flush (still
+  /// subject to the ring buffer's drop-oldest cap).
   static Future<void> flush() async {
     if (!isExporting) return;
     final Map<String, Object?> resourceAttrs = OtlpHttpExporter.resource(
@@ -202,59 +213,89 @@ class GazerTelemetry {
     if (_logs.isEmpty) return;
     final List<OtlpLogRecord> batch = List<OtlpLogRecord>.of(_logs);
     // The body-builder closure is passed to `post`, not invoked here --
-    // `post` evaluates it inside its own never-throw guard, so a batch
-    // that fails to encode (e.g. an attribute value whose `toString()`
-    // throws) counts as an export failure, same as a network error,
-    // rather than escaping this `Timer.periodic`-driven call.
-    final bool ok = await _exporter.post(
+    // `post` evaluates it inside its own never-throw guard and reports
+    // which half (encode vs. transport) failed, so this switch can tell
+    // a permanently-malformed batch from a transient network error.
+    final PostResult result = await _exporter.post(
       '/v1/logs',
       () => OtlpHttpExporter.encodeLogs(
         resourceAttrs: resourceAttrs,
         records: batch,
       ),
     );
-    if (ok) {
-      exportSuccesses++;
-      _logs.removeRange(0, batch.length);
-    } else {
-      exportFailures++;
+    switch (result) {
+      case PostResult.success:
+        exportSuccesses++;
+        _logs.removeRange(0, batch.length);
+      case PostResult.encodeFailure:
+        _logs.removeRange(0, batch.length);
+        _dropOnEncodeFailure('logs', batch.length);
+      case PostResult.transportFailure:
+        exportFailures++;
     }
   }
 
   static Future<void> _flushMetrics(Map<String, Object?> resourceAttrs) async {
     if (_metrics.isEmpty) return;
     final List<OtlpMetricPoint> batch = List<OtlpMetricPoint>.of(_metrics);
-    final bool ok = await _exporter.post(
+    final PostResult result = await _exporter.post(
       '/v1/metrics',
       () => OtlpHttpExporter.encodeMetrics(
         resourceAttrs: resourceAttrs,
         points: batch,
       ),
     );
-    if (ok) {
-      exportSuccesses++;
-      _metrics.removeRange(0, batch.length);
-    } else {
-      exportFailures++;
+    switch (result) {
+      case PostResult.success:
+        exportSuccesses++;
+        _metrics.removeRange(0, batch.length);
+      case PostResult.encodeFailure:
+        _metrics.removeRange(0, batch.length);
+        _dropOnEncodeFailure('metrics', batch.length);
+      case PostResult.transportFailure:
+        exportFailures++;
     }
   }
 
   static Future<void> _flushSpans(Map<String, Object?> resourceAttrs) async {
     if (_spans.isEmpty) return;
     final List<OtlpSpanRecord> batch = List<OtlpSpanRecord>.of(_spans);
-    final bool ok = await _exporter.post(
+    final PostResult result = await _exporter.post(
       '/v1/traces',
       () => OtlpHttpExporter.encodeSpans(
         resourceAttrs: resourceAttrs,
         spans: batch,
       ),
     );
-    if (ok) {
-      exportSuccesses++;
-      _spans.removeRange(0, batch.length);
-    } else {
-      exportFailures++;
+    switch (result) {
+      case PostResult.success:
+        exportSuccesses++;
+        _spans.removeRange(0, batch.length);
+      case PostResult.encodeFailure:
+        _spans.removeRange(0, batch.length);
+        _dropOnEncodeFailure('spans', batch.length);
+      case PostResult.transportFailure:
+        exportFailures++;
     }
+  }
+
+  /// Counts and logs (once, at DEBUG) a batch dropped because it could
+  /// not be encoded -- an un-encodable record (e.g. a `toString()` that
+  /// throws) would fail identically on every future retry, so the batch
+  /// is dropped rather than left to block every later record of the same
+  /// signal type (buffered and incoming) until the ring buffer's
+  /// drop-oldest cap eventually evicts it -- effectively an unbounded
+  /// blackout for that signal. Logs [signal] and [count] only, never
+  /// attribute values, since the value that failed to encode may not be
+  /// sanitized (it never reached `GazerLog.sanitize`). A no-op beyond the
+  /// counter increment unless `GazerLog.verbose` is on, per
+  /// `GazerLog.debug`'s normal gating.
+  static void _dropOnEncodeFailure(String signal, int count) {
+    encodeFailures++;
+    GazerLog.debug('telemetry.encodeFailure', <String, Object?>{
+      'signal': signal,
+      'count': count,
+    });
   }
 
   /// Test/teardown hook: cancels the flush scheduler and clears every
@@ -268,6 +309,7 @@ class GazerTelemetry {
     _spans.clear();
     exportFailures = 0;
     exportSuccesses = 0;
+    encodeFailures = 0;
     _config = const TelemetryConfig(
       endpoint: '',
       protocol: 'http/json',

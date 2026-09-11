@@ -178,7 +178,7 @@ void main() {
     expect(requestsReceived, 0);
   });
 
-  test('a log attribute whose toString() throws never escapes flush(), and other signals still export', () async {
+  test('a poisoned log batch is dropped after one encode failure, and a later good record still exports', () async {
     int logRecords = 0;
     int metricDataPoints = 0;
 
@@ -232,20 +232,111 @@ void main() {
     GazerTelemetry.counter('test.counter');
 
     // The poisoned log batch's encoding throws inside OtlpHttpExporter
-    // .post's guard; flush() itself must still complete normally.
+    // .post's guard; flush() itself must still complete normally, and
+    // an encode failure -- unlike a transport failure -- drops the
+    // batch instead of retaining it for a doomed-to-repeat retry.
     await expectLater(GazerTelemetry.flush(), completes);
     await Future<void>.delayed(const Duration(milliseconds: 50));
 
-    // The failed log batch is counted (never thrown) and stays buffered
-    // -- same rule as a network failure -- but the counter, an
-    // unrelated signal type flushed in the same cycle, still exports.
-    expect(GazerTelemetry.exportFailures, greaterThanOrEqualTo(1));
+    // Dropped, not retried: exactly one encode failure, nothing
+    // reached the log sink (the batch never survived encoding), and
+    // the counter -- an unrelated signal type flushed in the same
+    // cycle -- still exported normally.
+    expect(GazerTelemetry.encodeFailures, 1);
+    expect(logRecords, 0);
     expect(metricDataPoints, greaterThanOrEqualTo(1));
 
-    // A second flush() call proves the pipeline itself is not wedged or
-    // crashed by the earlier encoding failure.
+    // The poisoned batch is gone from the buffer (dropped, not kept),
+    // so a newly appended, well-formed log record exports cleanly on
+    // the very next flush -- proving the earlier failure did not
+    // permanently wedge this signal type.
+    GazerTelemetry.recordLog('info', 'test.log.good', const <String, Object?>{
+      'k': 'v',
+    });
     await expectLater(GazerTelemetry.flush(), completes);
-    expect(logRecords, 0);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(logRecords, greaterThanOrEqualTo(1));
+    // No new encode failure from the second, well-formed flush.
+    expect(GazerTelemetry.encodeFailures, 1);
+  });
+
+  test('a transport failure (connection refused) retains the batch, which exports once the collector is reachable', () async {
+    // Bind then immediately close a server to obtain a port nothing is
+    // listening on -- guarantees a real connection-refused, not a
+    // flaky guessed-unused-port.
+    final HttpServer probe = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    final int deadPort = probe.port;
+    await probe.close(force: true);
+
+    GazerTelemetry.init(
+      TelemetryConfig(
+        endpoint: 'http://127.0.0.1:$deadPort',
+        protocol: 'http/json',
+        headers: const <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    GazerTelemetry.recordLog('info', 'test.log', const <String, Object?>{
+      'k': 'v',
+    });
+    await expectLater(GazerTelemetry.flush(), completes);
+
+    // Transient failure: retained for retry, not dropped -- the
+    // opposite of an encode failure.
+    expect(GazerTelemetry.exportFailures, greaterThanOrEqualTo(1));
+    expect(GazerTelemetry.encodeFailures, 0);
+
+    // The collector "comes back": point telemetry at a real server and
+    // flush again -- the same retained record now exports.
+    int logRecords = 0;
+    final HttpServer server = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    final subscription = server.listen((HttpRequest request) async {
+      final String body = await utf8.decoder.bind(request).join();
+      final Map<String, dynamic> decoded =
+          jsonDecode(body) as Map<String, dynamic>;
+      if (request.uri.path == '/v1/logs') {
+        for (final rl in decoded['resourceLogs'] as List) {
+          for (final sl in (rl as Map<String, dynamic>)['scopeLogs'] as List) {
+            logRecords +=
+                ((sl as Map<String, dynamic>)['logRecords'] as List).length;
+          }
+        }
+      }
+      request.response.statusCode = 200;
+      await request.response.close();
+    });
+    addTearDown(() async {
+      await server.close(force: true);
+      await subscription.cancel();
+    });
+
+    GazerTelemetry.init(
+      TelemetryConfig(
+        endpoint: 'http://127.0.0.1:${server.port}',
+        protocol: 'http/json',
+        headers: const <String, String>{},
+        serviceName: 'gazer-test',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
+      dio: Dio(),
+    );
+
+    await GazerTelemetry.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(logRecords, greaterThanOrEqualTo(1));
   });
 
   test(
