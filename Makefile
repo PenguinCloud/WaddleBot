@@ -92,18 +92,23 @@ pre-commit:
 # Every target below runs inside the gazer-toolchain image -- never on the
 # host. Host Flutter (snap) is never invoked directly; see docs/superpowers/
 # specs/2026-09-07-gazer-mobile-v2-design.md Toolchain, CI, Versioning.
-.PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
+.PHONY: mobile-toolchain mobile-run mobile-lint mobile-test mobile-test-android mobile-build mobile-build-signed mobile-security mobile-codegen mobile-clean mobile-test-integration mobile-screenshots seed-mock-data-mobile
 # mobile-test-integration is added later by Task 21; mobile-screenshots and
 # seed-mock-data-mobile are added later by Task 26 -- pre-declared phony here
 # (harmless before those targets exist) so the whole mobile-* target set is
 # uniformly a .PHONY gate from the very first commit.
 
 MOBILE_IMAGE := gazer-toolchain:3.47.2
-MOBILE_RUN := docker run --rm --user $(shell id -u):$(shell id -g) \
+# MOBILE_RUN_EXTRA_ARGS is empty by default; mobile-build-signed sets it (target-specific
+# variable, below) to pass -e GAZER_REQUIRE_SIGNING=1 to the container. It must land BEFORE
+# $(MOBILE_IMAGE) -- docker run only parses flags preceding the image argument -- so MOBILE_RUN
+# is `=` (recursive, re-expanded per use) rather than `:=`, and the hook sits ahead of `-w /work`.
+MOBILE_RUN_EXTRA_ARGS ?=
+MOBILE_RUN = docker run --rm --user $(shell id -u):$(shell id -g) \
 	-v $(CURDIR)/mobile/gazer:/work \
 	-v gazer-pub-cache:/home/appuser/.pub-cache \
 	-v gazer-gradle:/home/appuser/.gradle \
-	-w /work $(MOBILE_IMAGE)
+	$(MOBILE_RUN_EXTRA_ARGS) -w /work $(MOBILE_IMAGE)
 
 mobile-toolchain:
 	docker build -t $(MOBILE_IMAGE) mobile/gazer
@@ -122,6 +127,11 @@ mobile-test-android:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; cd android && ./gradlew testDebugUnitTest jacocoTestReport && cd .. && bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco"
 
 mobile-build:
+	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
+
+mobile-build-signed: MOBILE_RUN_EXTRA_ARGS := -e GAZER_REQUIRE_SIGNING=1
+mobile-build-signed:
+	@test -f mobile/gazer/android/key.properties || { echo "mobile-build-signed requires mobile/gazer/android/key.properties -- see docs/superpowers/plans/2026-09-07-gazer-mobile-v2-m1.md Task 25 Step 4 (one-time keystore procedure) or Step 8c (throwaway local keystore for testing)" >&2; exit 1; }
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
 
 # Gates on android/app/gradle.lockfile, which locks only the classpaths :app actually ships

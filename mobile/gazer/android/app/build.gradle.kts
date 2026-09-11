@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -30,6 +31,19 @@ kotlin {
     }
 }
 
+// Release signing. mobile/gazer/android/key.properties is never committed (see .gitignore) --
+// it is either written by a developer for a local signed build (Task 25 Step 8c) or by CI from
+// the ANDROID_UPLOAD_KEY_STORE_B64/ANDROID_UPLOAD_KEY_STORE_PASSWORD/ANDROID_UPLOAD_KEY_ALIAS/
+// ANDROID_UPLOAD_KEY_ALIAS_PASSWORD secrets (see .github/workflows/gazer-mobile.yml `build` job)
+// and deleted again in an `if: always()` step immediately after the build. storeFile is
+// resolved with rootProject.file(...) because key.properties lives at android/key.properties
+// (the Gradle root project for this module), not android/app/.
+val keyPropsFile = rootProject.file("key.properties")
+val keyProps = Properties()
+if (keyPropsFile.exists()) {
+    keyPropsFile.inputStream().use { keyProps.load(it) }
+}
+
 android {
     namespace = "io.waddlebot.gazer"
     compileSdk = 36
@@ -49,9 +63,33 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (keyPropsFile.exists()) {
+            create("upload") {
+                storeFile = rootProject.file(keyProps.getProperty("storeFile"))
+                storePassword = keyProps.getProperty("storePassword")
+                keyAlias = keyProps.getProperty("keyAlias")
+                keyPassword = keyProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            // Tag builds (gazer-v*) must never ship debug-signed -- fail closed before any
+            // signingConfig decision below. See .github/workflows/gazer-mobile.yml `build` job,
+            // which sets GAZER_REQUIRE_SIGNING=1 only when github.ref starts with refs/tags/gazer-v.
+            if (System.getenv("GAZER_REQUIRE_SIGNING") == "1" && !keyPropsFile.exists()) {
+                throw GradleException("GAZER_REQUIRE_SIGNING=1 but key.properties is missing")
+            }
+            if (keyPropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("upload")
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
+                // Single, unmistakable line -- asserted by Task 25 Step 8a to appear exactly
+                // once per `flutter build`/Gradle invocation of this buildType.
+                println("WARNING: release build is debug-signed (no key.properties)")
+            }
         }
         debug {
             enableUnitTestCoverage = true

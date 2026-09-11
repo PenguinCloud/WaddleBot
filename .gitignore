@@ -210,3 +210,5 @@ mobile/flutter_gazer/android/build/
 mobile/gazer/.dart_tool/
 mobile/gazer/coverage/
 mobile/gazer/android/local.properties
+mobile/gazer/android/key.properties
+mobile/gazer/android/*.jks

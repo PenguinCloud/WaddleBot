@@ -252,17 +252,67 @@ jobs:
           working-directory: mobile/gazer
           command: flutter pub get
 
+      # Never inline ${{ secrets.* }} inside `run:` (zizmor template-injection rule) -- every
+      # secret value crosses into the shell only via `env:`. Runs as root (this job container's
+      # default user -- see options: --user 0:0 above), unlike the run-as-appuser steps around
+      # it, because the final `chown` here must run as root to hand the files to appuser; every
+      # later step that reads key.properties/the keystore (the two `flutter build` steps below)
+      # runs as appuser via run-as-appuser and needs read access to what this step writes.
+      - name: Decode upload keystore and write key.properties
+        if: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_B64 != '' }}
+        working-directory: mobile/gazer/android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_B64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "${KEYSTORE_B64}" | base64 -d > upload-keystore.jks
+          cat > key.properties <<KEYPROPS_EOF
+          storeFile=upload-keystore.jks
+          storePassword=${KEY_STORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_ALIAS_PASSWORD}
+          KEYPROPS_EOF
+          chown appuser:appuser upload-keystore.jks key.properties
+
+      # GAZER_REQUIRE_SIGNING is passed as a `VAR=value` prefix baked into the composite action's
+      # `command:` input (evaluated via `eval` inside the runuser'd appuser shell -- see
+      # .github/actions/run-as-appuser/action.yml), not via this step's own `env:`, because a
+      # step-level `env:` set on a `uses:` call to a composite action is not reliably exposed to
+      # that composite's own internal steps (the action only forwards its declared `working-
+      # directory`/`command` inputs, nothing else). The interpolated value is always the literal
+      # string `0` or `1` (never attacker-influenced ref content), so this is not the zizmor
+      # template-injection pattern the note above warns about.
       - name: flutter build apk --split-per-abi
         uses: ./.github/actions/run-as-appuser  # zizmor: ignore[self-repository] -- repo's pinned pre-commit zizmor (1.25.2) predates the $/ self-repository syntax (GH feature 2026-07-30) and fails to parse it at all; ./... is the form both that hook and older zizmor understand
         with:
           working-directory: mobile/gazer
-          command: flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols
+          command: >-
+            GAZER_REQUIRE_SIGNING=${{ startsWith(github.ref, 'refs/tags/gazer-v') && '1' || '0' }}
+            flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols
 
       - name: flutter build appbundle
         uses: ./.github/actions/run-as-appuser  # zizmor: ignore[self-repository] -- repo's pinned pre-commit zizmor (1.25.2) predates the $/ self-repository syntax (GH feature 2026-07-30) and fails to parse it at all; ./... is the form both that hook and older zizmor understand
         with:
           working-directory: mobile/gazer
-          command: flutter build appbundle --obfuscate --split-debug-info=build/symbols
+          command: >-
+            GAZER_REQUIRE_SIGNING=${{ startsWith(github.ref, 'refs/tags/gazer-v') && '1' || '0' }}
+            flutter build appbundle --obfuscate --split-debug-info=build/symbols
+
+      # apksigner ships in the pinned build-tools;36.0.0 package (Task 1 Dockerfile) at
+      # $ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner (= /opt/android-sdk/build-tools/36.0.0/
+      # apksigner in this image; also already on PATH per Task 1's ENV PATH line). Runs as root
+      # (read-only verification of the already-built APK; no appuser privilege needed).
+      - name: Verify APK is signed with exactly one certificate
+        working-directory: mobile/gazer
+        run: |
+          set -euo pipefail
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          COUNT=$("${APKSIGNER}" verify --print-certs build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | grep -c 'Signer #1 certificate SHA-256')
+          echo "signer count: ${COUNT}"
+          test "${COUNT}" -eq 1
 
       - name: Upload APKs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -277,6 +327,13 @@ jobs:
           name: gazer-aab
           path: mobile/gazer/build/app/outputs/bundle/**/*.aab
           retention-days: 30
+
+      - name: Remove keystore and key.properties
+        if: always()
+        working-directory: mobile/gazer/android
+        run: |
+          set -euo pipefail
+          rm -f upload-keystore.jks key.properties
 
   security:
     name: Security scans
@@ -336,18 +393,26 @@ jobs:
 
   # NOTE for writer E's Task 21: once the `integration` job exists (added after `security`, per
   # Task 21 Step 15), this job's `needs:` list below MUST be extended to
-  # `[build, test, android-unit, security, integration]` in that same task -- otherwise a tag
-  # push creates a GitHub release without ever waiting for the emulator integration test to pass.
-  # Not added here because `integration` does not exist yet at this point in the plan (Task 3
-  # predates Task 21) -- a `needs:` reference to a job that doesn't exist yet would be an invalid
-  # workflow.
+  # `[toolchain, build, test, android-unit, security, integration]` in that same task --
+  # otherwise a tag push creates a GitHub release without ever waiting for the emulator
+  # integration test to pass. `integration` is not added here because it does not exist yet at
+  # this point in the plan (Task 3 predates Task 21) -- a `needs:` reference to a job that
+  # doesn't exist yet would be an invalid workflow. `toolchain` IS added here (Task 25) so this
+  # job can pull the toolchain image for its apksigner verification step below.
   release:
     name: GitHub Release
-    needs: [build, test, android-unit, security]
+    needs: [toolchain, build, test, android-unit, security]
     if: startsWith(github.ref, 'refs/tags/gazer-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: read  # added so this job's new container: step below can pull the toolchain image
+    container:
+      image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
+      # root ONLY for the runner's own checkout/download-artifact steps and the read-only
+      # apksigner verification below -- see the `analyze` job's comment above for why job
+      # containers here run as root; nothing in this job needs the appuser privilege drop.
+      options: --user 0:0
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -365,6 +430,22 @@ jobs:
         with:
           name: gazer-aab
           path: release-artifacts
+
+      - name: Verify no downloaded APK is debug-signed
+        run: |
+          set -euo pipefail
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          FOUND=0
+          while IFS= read -r -d '' apk; do
+            echo "checking: ${apk}"
+            OUTPUT=$("${APKSIGNER}" verify --print-certs "${apk}")
+            echo "${OUTPUT}"
+            if echo "${OUTPUT}" | grep -q 'CN=Android Debug'; then
+              echo "FAIL: ${apk} is signed with the well-known Android debug certificate" >&2
+              FOUND=1
+            fi
+          done < <(find release-artifacts -name '*.apk' -print0)
+          test "${FOUND}" -eq 0
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3  # zizmor: ignore[superfluous-actions] -- action + SHA pinned verbatim per Task 3 brief; gh CLI needs separate token/auth wiring that is out of scope here
