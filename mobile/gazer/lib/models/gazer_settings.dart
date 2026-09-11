@@ -30,6 +30,7 @@ abstract class GazerSettings with _$GazerSettings {
     required QualitySettings quality,
     required AudioSourceChoice audio,
     required bool forceLibuvc,
+    required bool debugLogs,
   }) = _GazerSettings;
 
   /// Deserializes a [GazerSettings] from JSON (round-trip tests only —
@@ -38,11 +39,12 @@ abstract class GazerSettings with _$GazerSettings {
       _$GazerSettingsFromJson(json);
 
   /// First-launch defaults: empty target, default quality, auto audio,
-  /// developer toggle off.
+  /// developer toggles (force libuvc, debug logs) off.
   factory GazerSettings.defaults() => GazerSettings(
     target: StreamTargetSettings.empty(),
     quality: QualitySettings.defaults(),
     audio: AudioSourceChoice.auto,
     forceLibuvc: false,
+    debugLogs: false,
   );
 }

@@ -386,6 +386,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 onChanged: (bool v) =>
                     _update((GazerSettings s) => s.copyWith(forceLibuvc: v)),
               ),
+              SwitchListTile(
+                key: const Key('debugLogsSwitch'),
+                title: Text(l10n.settingsDebugLogsLabel),
+                value: draft.debugLogs,
+                onChanged: (bool v) =>
+                    _update((GazerSettings s) => s.copyWith(debugLogs: v)),
+              ),
             ],
             const SizedBox(height: 16),
             Semantics(

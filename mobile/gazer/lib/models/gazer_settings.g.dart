@@ -13,6 +13,7 @@ _GazerSettings _$GazerSettingsFromJson(
   quality: QualitySettings.fromJson(json['quality'] as Map<String, dynamic>),
   audio: $enumDecode(_$AudioSourceChoiceEnumMap, json['audio']),
   forceLibuvc: json['forceLibuvc'] as bool,
+  debugLogs: json['debugLogs'] as bool,
 );
 
 Map<String, dynamic> _$GazerSettingsToJson(_GazerSettings instance) =>
@@ -21,6 +22,7 @@ Map<String, dynamic> _$GazerSettingsToJson(_GazerSettings instance) =>
       'quality': instance.quality.toJson(),
       'audio': _$AudioSourceChoiceEnumMap[instance.audio]!,
       'forceLibuvc': instance.forceLibuvc,
+      'debugLogs': instance.debugLogs,
     };
 
 const _$AudioSourceChoiceEnumMap = {

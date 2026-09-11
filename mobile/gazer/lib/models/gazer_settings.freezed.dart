@@ -16,7 +16,7 @@ T _$identity<T>(T value) => value;
 /// @nodoc
 mixin _$GazerSettings {
 
- StreamTargetSettings get target; QualitySettings get quality; AudioSourceChoice get audio; bool get forceLibuvc;
+ StreamTargetSettings get target; QualitySettings get quality; AudioSourceChoice get audio; bool get forceLibuvc; bool get debugLogs;
 /// Create a copy of GazerSettings
 /// with the given fields replaced by the non-null parameter values.
 @JsonKey(includeFromJson: false, includeToJson: false)
@@ -30,20 +30,20 @@ $GazerSettingsCopyWith<GazerSettings> get copyWith => _$GazerSettingsCopyWithImp
 @override
 bool operator ==(Object other) {
   final _this = this as GazerSettings;
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is GazerSettings&&(identical(other.target, _this.target) || other.target == _this.target)&&(identical(other.quality, _this.quality) || other.quality == _this.quality)&&(identical(other.audio, _this.audio) || other.audio == _this.audio)&&(identical(other.forceLibuvc, _this.forceLibuvc) || other.forceLibuvc == _this.forceLibuvc));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is GazerSettings&&(identical(other.target, _this.target) || other.target == _this.target)&&(identical(other.quality, _this.quality) || other.quality == _this.quality)&&(identical(other.audio, _this.audio) || other.audio == _this.audio)&&(identical(other.forceLibuvc, _this.forceLibuvc) || other.forceLibuvc == _this.forceLibuvc)&&(identical(other.debugLogs, _this.debugLogs) || other.debugLogs == _this.debugLogs));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
   final _this = this as GazerSettings;
-  return Object.hash(runtimeType,_this.target,_this.quality,_this.audio,_this.forceLibuvc);
+  return Object.hash(runtimeType,_this.target,_this.quality,_this.audio,_this.forceLibuvc,_this.debugLogs);
 }
 
 @override
 String toString() {
   final _this = this as GazerSettings;
-  return 'GazerSettings(target: ${_this.target}, quality: ${_this.quality}, audio: ${_this.audio}, forceLibuvc: ${_this.forceLibuvc})';
+  return 'GazerSettings(target: ${_this.target}, quality: ${_this.quality}, audio: ${_this.audio}, forceLibuvc: ${_this.forceLibuvc}, debugLogs: ${_this.debugLogs})';
 }
 
 
@@ -54,7 +54,7 @@ abstract mixin class $GazerSettingsCopyWith<$Res>  {
   factory $GazerSettingsCopyWith(GazerSettings value, $Res Function(GazerSettings) _then) = _$GazerSettingsCopyWithImpl;
 @useResult
 $Res call({
- StreamTargetSettings target, QualitySettings quality, AudioSourceChoice audio, bool forceLibuvc
+ StreamTargetSettings target, QualitySettings quality, AudioSourceChoice audio, bool forceLibuvc, bool debugLogs
 });
 
 
@@ -71,12 +71,13 @@ class _$GazerSettingsCopyWithImpl<$Res>
 
 /// Create a copy of GazerSettings
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? target = null,Object? quality = null,Object? audio = null,Object? forceLibuvc = null,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? target = null,Object? quality = null,Object? audio = null,Object? forceLibuvc = null,Object? debugLogs = null,}) {
   return _then(GazerSettings(
 target: null == target ? _self.target : target // ignore: cast_nullable_to_non_nullable
 as StreamTargetSettings,quality: null == quality ? _self.quality : quality // ignore: cast_nullable_to_non_nullable
 as QualitySettings,audio: null == audio ? _self.audio : audio // ignore: cast_nullable_to_non_nullable
 as AudioSourceChoice,forceLibuvc: null == forceLibuvc ? _self.forceLibuvc : forceLibuvc // ignore: cast_nullable_to_non_nullable
+as bool,debugLogs: null == debugLogs ? _self.debugLogs : debugLogs // ignore: cast_nullable_to_non_nullable
 as bool,
   ));
 }
@@ -180,10 +181,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc,  bool debugLogs)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _GazerSettings() when $default != null:
-return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _:
+return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc,_that.debugLogs);case _:
   return orElse();
 
 }
@@ -201,10 +202,10 @@ return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc,  bool debugLogs)  $default,) {final _that = this;
 switch (_that) {
 case _GazerSettings():
-return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _:
+return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc,_that.debugLogs);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -221,10 +222,10 @@ return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( StreamTargetSettings target,  QualitySettings quality,  AudioSourceChoice audio,  bool forceLibuvc,  bool debugLogs)?  $default,) {final _that = this;
 switch (_that) {
 case _GazerSettings() when $default != null:
-return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _:
+return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc,_that.debugLogs);case _:
   return null;
 
 }
@@ -236,13 +237,14 @@ return $default(_that.target,_that.quality,_that.audio,_that.forceLibuvc);case _
 @JsonSerializable()
 
 class _GazerSettings implements GazerSettings {
-  const _GazerSettings({required this.target, required this.quality, required this.audio, required this.forceLibuvc});
+  const _GazerSettings({required this.target, required this.quality, required this.audio, required this.forceLibuvc, required this.debugLogs});
   factory _GazerSettings.fromJson(Map<String, dynamic> json) => _$GazerSettingsFromJson(json);
 
 @override final  StreamTargetSettings target;
 @override final  QualitySettings quality;
 @override final  AudioSourceChoice audio;
 @override final  bool forceLibuvc;
+@override final  bool debugLogs;
 
 /// Create a copy of GazerSettings
 /// with the given fields replaced by the non-null parameter values.
@@ -257,18 +259,18 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-    return identical(this, other) || (other.runtimeType == runtimeType&&other is _GazerSettings&&(identical(other.target, target) || other.target == target)&&(identical(other.quality, quality) || other.quality == quality)&&(identical(other.audio, audio) || other.audio == audio)&&(identical(other.forceLibuvc, forceLibuvc) || other.forceLibuvc == forceLibuvc));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _GazerSettings&&(identical(other.target, target) || other.target == target)&&(identical(other.quality, quality) || other.quality == quality)&&(identical(other.audio, audio) || other.audio == audio)&&(identical(other.forceLibuvc, forceLibuvc) || other.forceLibuvc == forceLibuvc)&&(identical(other.debugLogs, debugLogs) || other.debugLogs == debugLogs));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
-    return Object.hash(runtimeType,target,quality,audio,forceLibuvc);
+    return Object.hash(runtimeType,target,quality,audio,forceLibuvc,debugLogs);
 }
 
 @override
 String toString() {
-    return 'GazerSettings(target: $target, quality: $quality, audio: $audio, forceLibuvc: $forceLibuvc)';
+    return 'GazerSettings(target: $target, quality: $quality, audio: $audio, forceLibuvc: $forceLibuvc, debugLogs: $debugLogs)';
 }
 
 
@@ -279,7 +281,7 @@ abstract mixin class _$GazerSettingsCopyWith<$Res> implements $GazerSettingsCopy
   factory _$GazerSettingsCopyWith(_GazerSettings value, $Res Function(_GazerSettings) _then) = __$GazerSettingsCopyWithImpl;
 @override @useResult
 $Res call({
- StreamTargetSettings target, QualitySettings quality, AudioSourceChoice audio, bool forceLibuvc
+ StreamTargetSettings target, QualitySettings quality, AudioSourceChoice audio, bool forceLibuvc, bool debugLogs
 });
 
 
@@ -296,12 +298,13 @@ class __$GazerSettingsCopyWithImpl<$Res>
 
 /// Create a copy of GazerSettings
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? target = null,Object? quality = null,Object? audio = null,Object? forceLibuvc = null,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? target = null,Object? quality = null,Object? audio = null,Object? forceLibuvc = null,Object? debugLogs = null,}) {
   return _then(_GazerSettings(
 target: null == target ? _self.target : target // ignore: cast_nullable_to_non_nullable
 as StreamTargetSettings,quality: null == quality ? _self.quality : quality // ignore: cast_nullable_to_non_nullable
 as QualitySettings,audio: null == audio ? _self.audio : audio // ignore: cast_nullable_to_non_nullable
 as AudioSourceChoice,forceLibuvc: null == forceLibuvc ? _self.forceLibuvc : forceLibuvc // ignore: cast_nullable_to_non_nullable
+as bool,debugLogs: null == debugLogs ? _self.debugLogs : debugLogs // ignore: cast_nullable_to_non_nullable
 as bool,
   ));
 }

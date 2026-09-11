@@ -3,6 +3,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/gazer_settings.dart';
+import '../services/gazer_log.dart';
 import '../services/settings_repository.dart';
 
 part 'settings_provider.g.dart';
@@ -32,10 +33,18 @@ SettingsRepository settingsRepository(Ref ref) => SecureSettingsRepository(
 @Riverpod(keepAlive: true)
 class SettingsNotifier extends _$SettingsNotifier {
   @override
-  Future<GazerSettings> build() => ref.watch(settingsRepositoryProvider).load();
+  Future<GazerSettings> build() async {
+    final GazerSettings settings = await ref
+        .watch(settingsRepositoryProvider)
+        .load();
+    GazerLog.verbose = settings.debugLogs;
+    return settings;
+  }
 
   /// Persists [s] via the repository and updates provider state so every
   /// listener (HomeScreen enablement, StatusPanel) sees the new settings.
+  /// Also re-applies [GazerLog.verbose] so toggling Settings > Developer
+  /// > Debug logs takes effect immediately, without an app restart.
   ///
   /// Named `save`, not `update`: `$AsyncNotifier`/`$AsyncClassModifier`
   /// (riverpod 3.4.3) already defines a protected mutation helper method
@@ -47,6 +56,7 @@ class SettingsNotifier extends _$SettingsNotifier {
   /// method.
   Future<void> save(GazerSettings s) async {
     await ref.read(settingsRepositoryProvider).save(s);
+    GazerLog.verbose = s.debugLogs;
     state = AsyncData(s);
   }
 }

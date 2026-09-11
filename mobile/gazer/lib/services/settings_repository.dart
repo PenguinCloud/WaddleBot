@@ -48,6 +48,7 @@ class SecureSettingsRepository implements SettingsRepository {
   static const String _kQualityAdaptive = 'gazer.quality.adaptive';
   static const String _kAudioSource = 'gazer.audio.source';
   static const String _kDeveloperForceLibuvc = 'gazer.developer.forceLibuvc';
+  static const String _kDeveloperDebugLogs = 'gazer.developer.debugLogs';
 
   @override
   Future<GazerSettings> load() async {
@@ -82,6 +83,8 @@ class SecureSettingsRepository implements SettingsRepository {
     );
     final forceLibuvc =
         await _prefs.getBool(_kDeveloperForceLibuvc) ?? defaults.forceLibuvc;
+    final debugLogs =
+        await _prefs.getBool(_kDeveloperDebugLogs) ?? defaults.debugLogs;
 
     return GazerSettings(
       target: StreamTargetSettings(
@@ -98,6 +101,7 @@ class SecureSettingsRepository implements SettingsRepository {
       ),
       audio: audio,
       forceLibuvc: forceLibuvc,
+      debugLogs: debugLogs,
     );
   }
 
@@ -114,6 +118,7 @@ class SecureSettingsRepository implements SettingsRepository {
     await _prefs.setBool(_kQualityAdaptive, s.quality.adaptiveBitrate);
     await _prefs.setString(_kAudioSource, s.audio.name);
     await _prefs.setBool(_kDeveloperForceLibuvc, s.forceLibuvc);
+    await _prefs.setBool(_kDeveloperDebugLogs, s.debugLogs);
   }
 
   Future<void> _writeOrDeleteSecure(String key, String? value) {

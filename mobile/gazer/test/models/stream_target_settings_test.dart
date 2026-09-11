@@ -100,6 +100,7 @@ void main() {
         quality: QualitySettings.defaults(),
         audio: AudioSourceChoice.auto,
         forceLibuvc: false,
+        debugLogs: false,
       );
       final rendered = settings.toString();
       expect(rendered, isNot(contains(secretPassword)));

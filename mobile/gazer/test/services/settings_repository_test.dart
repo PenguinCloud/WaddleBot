@@ -76,6 +76,7 @@ void main() {
         ),
         audio: AudioSourceChoice.usbAudio,
         forceLibuvc: true,
+        debugLogs: true,
       );
 
       await repository.save(original);
@@ -97,6 +98,7 @@ void main() {
         quality: QualitySettings.defaults(),
         audio: AudioSourceChoice.auto,
         forceLibuvc: false,
+        debugLogs: false,
       );
 
       await repository.save(original);

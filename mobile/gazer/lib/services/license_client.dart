@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../config/constants.dart';
 import '../models/license_state.dart';
 import 'device_id.dart';
+import 'gazer_log.dart';
 
 /// Persists the most recent [LicenseState] as JSON in shared_preferences.
 class LicenseCache {
@@ -110,6 +111,7 @@ class LicenseClient {
         deviceId: deviceId,
       );
       await _cache.write(state);
+      _logFetchOutcome(state, deviceId);
       return state;
     } on DioException catch (e) {
       final statusCode = e.response?.statusCode;
@@ -125,12 +127,23 @@ class LicenseClient {
           deviceId: deviceId,
         );
         await _cache.write(invalid);
+        _logFetchOutcome(invalid, deviceId);
         return invalid;
       }
       return _offlineFallback(cached, deviceId);
     } catch (_) {
       return _offlineFallback(cached, deviceId);
     }
+  }
+
+  /// Logs the fetch outcome (status, flag count) — never the device id
+  /// in full; [GazerLog.maskSecret] shows only its last 4 characters.
+  void _logFetchOutcome(LicenseState state, String deviceId) {
+    GazerLog.info('license.fetch', <String, Object?>{
+      'status': state.status.name,
+      'flagCount': state.flags.length,
+      'deviceId': GazerLog.maskSecret(deviceId),
+    });
   }
 
   /// Fire-and-forget keepalive ping; failures — including a device-id
@@ -162,16 +175,20 @@ class LicenseClient {
   /// otherwise `unknown` with whatever flags [cached] holds (or empty, if
   /// there is no usable cache at all).
   LicenseState _offlineFallback(LicenseState? cached, String deviceId) {
+    final LicenseState state;
     if (cached?.lastFetched != null &&
         _now().difference(cached!.lastFetched!) < kLicenseGracePeriod) {
-      return cached.copyWith(status: LicenseStatus.gracePeriod);
+      state = cached.copyWith(status: LicenseStatus.gracePeriod);
+    } else {
+      state = LicenseState(
+        status: LicenseStatus.unknown,
+        flags: cached?.flags ?? const {},
+        lastFetched: cached?.lastFetched,
+        deviceId: deviceId,
+      );
     }
-    return LicenseState(
-      status: LicenseStatus.unknown,
-      flags: cached?.flags ?? const {},
-      lastFetched: cached?.lastFetched,
-      deviceId: deviceId,
-    );
+    _logFetchOutcome(state, deviceId);
+    return state;
   }
 
   /// Builds the request body sent to `/validate`, `/features`, and

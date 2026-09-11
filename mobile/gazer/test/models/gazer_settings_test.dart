@@ -5,13 +5,17 @@ import 'package:gazer/models/stream_target_settings.dart';
 
 void main() {
   group('GazerSettings.defaults', () {
-    test('is an empty target, default quality, auto audio, libuvc off', () {
-      final defaults = GazerSettings.defaults();
-      expect(defaults.target, StreamTargetSettings.empty());
-      expect(defaults.quality, QualitySettings.defaults());
-      expect(defaults.audio, AudioSourceChoice.auto);
-      expect(defaults.forceLibuvc, isFalse);
-    });
+    test(
+      'is an empty target, default quality, auto audio, both dev toggles off',
+      () {
+        final defaults = GazerSettings.defaults();
+        expect(defaults.target, StreamTargetSettings.empty());
+        expect(defaults.quality, QualitySettings.defaults());
+        expect(defaults.audio, AudioSourceChoice.auto);
+        expect(defaults.forceLibuvc, isFalse);
+        expect(defaults.debugLogs, isFalse);
+      },
+    );
   });
 
   group('GazerSettings JSON round-trip', () {
@@ -29,6 +33,7 @@ void main() {
         ),
         audio: AudioSourceChoice.usbAudio,
         forceLibuvc: true,
+        debugLogs: true,
       );
       final restored = GazerSettings.fromJson(original.toJson());
       expect(restored, original);

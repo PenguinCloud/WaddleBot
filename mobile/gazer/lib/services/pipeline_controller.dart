@@ -8,6 +8,7 @@ import '../models/stream_stats.dart';
 import '../models/validation_issue.dart';
 import '../pigeon/pipeline.g.dart';
 import 'feature_flags.dart';
+import 'gazer_log.dart';
 import 'native_event_bridge.dart';
 import 'reconnect_policy.dart';
 import 'target_validator.dart';
@@ -167,6 +168,10 @@ class PipelineController {
         password: sendCredentials ? settings.target.password : null,
       );
 
+      GazerLog.info('pipeline.goLive', <String, Object?>{
+        'host': Uri.tryParse(_pendingTarget!.url)?.host ?? '',
+      });
+
       _emit(const PreparingState());
       final result = await _host.prepare(config);
       if (!result.ok) {
@@ -248,6 +253,10 @@ class PipelineController {
         reconnectCount: _statsSnapshot.reconnectCount + 1,
       );
       _statsController.add(_statsSnapshot);
+      GazerLog.info('pipeline.reconnect', <String, Object?>{
+        'attempt': _reconnectAttempt,
+        'delayMs': delay.inMilliseconds,
+      });
       _emit(ReconnectingState(_reconnectAttempt, delay));
       unawaited(_retryAfter(delay));
     } else {
@@ -283,6 +292,11 @@ class PipelineController {
 
   void _emit(PipelineState next) {
     if (_isDisposed) return;
+    GazerLog.debug('pipeline.state', <String, Object?>{
+      'from': _current.runtimeType.toString(),
+      'to': next.runtimeType.toString(),
+      if (next is ErrorState) 'errorCode': next.error.code.name,
+    });
     _current = next;
     _stateController.add(next);
   }

@@ -53,6 +53,7 @@ void main() {
         quality: QualitySettings.defaults(),
         audio: AudioSourceChoice.auto,
         forceLibuvc: false,
+        debugLogs: false,
       );
 
   FeatureFlags flagsWith({bool adaptiveBitrate = true, bool rtmpAuth = true}) =>

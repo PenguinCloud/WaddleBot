@@ -131,7 +131,7 @@ final class SettingsNotifierProvider
   SettingsNotifier create() => SettingsNotifier();
 }
 
-String _$settingsNotifierHash() => r'd63ff50da5bd374dbb07829293d8c9d9bd56baa6';
+String _$settingsNotifierHash() => r'f32da68cd31363428ef6796de056fbc25bb4fa91';
 
 /// Loads, holds, and persists the user's [GazerSettings].
 ///

@@ -256,6 +256,30 @@ void main() {
     },
   );
 
+  testWidgets(
+    'debug logs switch is hidden until the version footer is long-pressed, then saves',
+    (WidgetTester tester) async {
+      await pumpSettings(tester);
+      expect(find.byKey(const Key('debugLogsSwitch')), findsNothing);
+
+      await tester.longPress(find.byKey(const Key('versionFooter')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('debugLogsSwitch')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('debugLogsSwitch')));
+      await tester.enterText(
+        find.widgetWithText(TextFormField, 'RTMP URL'),
+        'rtmp://example.com/live/mystream',
+      );
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(settingsRepo.saved, isNotEmpty);
+      expect(settingsRepo.saved.last.debugLogs, isTrue);
+    },
+  );
+
   testWidgets('shows the fetched app version in the footer', (
     WidgetTester tester,
   ) async {
