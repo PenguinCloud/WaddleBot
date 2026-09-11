@@ -796,6 +796,12 @@ abstract class AppLocalizations {
   /// **'Close'**
   String get statusPanelCloseButtonLabel;
 
+  /// No description provided for @goLiveFailedMessage.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not start the stream. Please try again.'**
+  String get goLiveFailedMessage;
+
   /// No description provided for @settingsSaveFailed.
   ///
   /// In en, this message translates to:
