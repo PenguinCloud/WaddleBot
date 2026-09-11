@@ -9,6 +9,7 @@ config fallback.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -17,6 +18,8 @@ import httpx
 from flask_core import StageEnvelope, get_bundle_dal
 from waddle_transports import NonRetryableTransportError, TransportResult
 from waddle_transports.transports.irc_relay import RelayOutboundIrcTransport
+
+logger = logging.getLogger(__name__)
 
 #: Lazily-built, process-wide Valkey client for IRC relay (same pattern as twitch_send_action.py)
 _redis_client: Any | None = None
@@ -128,7 +131,11 @@ async def send_message(
 
     api_base = config.get("api_base", "https://discord.com/api/v10")
     url = f"{api_base}/channels/{channel}/messages"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # Discord's Bot API requires the `Bot` auth scheme, never `Bearer` (that
+    # scheme is for OAuth2 user access tokens) -- a valid bot token sent as
+    # `Bearer` is rejected with 401 even though the token itself is fine.
+    # Matches discord_send_action.py:send_message's own header.
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     body = {"content": text}
 
     try:
@@ -145,8 +152,17 @@ async def send_message(
 
         raise RetryableTransportError("discord API rate limited", http_status=429)
     if response.status_code in (401, 403):
+        logger.warning(
+            "social_quote_action.discord_send_rejected community_id=%s bot_token_ref=%s "
+            "channel=%s status=%s",
+            envelope.community,
+            token_ref,
+            channel,
+            response.status_code,
+        )
         raise NonRetryableTransportError(
-            f"discord API rejected auth: HTTP {response.status_code}",
+            f"discord API rejected auth for bot_token_ref={token_ref!r}: "
+            f"HTTP {response.status_code}",
             http_status=response.status_code,
         )
     if 400 <= response.status_code < 500:

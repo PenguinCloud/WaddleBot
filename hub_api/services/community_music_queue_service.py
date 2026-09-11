@@ -61,7 +61,15 @@ class TrackDTO:
 
 @dataclass(slots=True, frozen=True)
 class QueueItemDTO:
-    """One `music_station_queue` row, with its resolved track embedded."""
+    """One `music_station_queue` row, with its resolved track embedded.
+
+    `etaSeconds`: seconds until this item is expected to start playing --
+    the sum of `track.durationMs` for every currently-`queued` item ahead
+    of this one (by `position`), plus the remaining playtime of whatever's
+    currently `playing`, if anything. `None` when not computed for this
+    call site (only `enqueue_request()` populates it today -- see
+    `_compute_eta_seconds()`); `0` means "next up".
+    """
 
     id: int
     communityId: int
@@ -74,6 +82,7 @@ class QueueItemDTO:
     addedAt: str | None
     startedAt: str | None
     endedAt: str | None
+    etaSeconds: int | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -110,7 +119,9 @@ async def _get_track_row(async_dal: Any, dal: Any, *, track_id: int) -> Any:
     return rows.first()
 
 
-def _queue_item_dto(queue_row: Any, track_row: Any) -> QueueItemDTO:
+def _queue_item_dto(
+    queue_row: Any, track_row: Any, *, eta_seconds: int | None = None
+) -> QueueItemDTO:
     return QueueItemDTO(
         id=queue_row.id,
         communityId=queue_row.community_id,
@@ -123,6 +134,7 @@ def _queue_item_dto(queue_row: Any, track_row: Any) -> QueueItemDTO:
         addedAt=_iso(queue_row.added_at),
         startedAt=_iso(queue_row.started_at),
         endedAt=_iso(queue_row.ended_at),
+        etaSeconds=eta_seconds,
     )
 
 
@@ -357,6 +369,69 @@ async def _get_or_create_track_id(async_dal: Any, dal: Any, *, tenant_id: int, t
     return int(new_id)
 
 
+async def _sum_duration_ms_ahead(
+    async_dal: Any, dal: Any, *, community_id: int, position: int
+) -> int:
+    """Sum `music_tracks.duration_ms` for every still-`queued` item ahead of `position`.
+
+    Selects only `music_tracks.duration_ms` (a single table's field) even
+    though the query joins `music_station_queue` -- mirrors
+    `_is_live_music_category()`'s own single-table-select-with-join-filter
+    pattern above, which keeps `Rows` flat (`row.duration_ms`, no per-table
+    nesting) rather than depending on pydal's multi-table select row shape.
+    """
+    query = (
+        (dal.music_station_queue.community_id == community_id)
+        & (dal.music_station_queue.status == "queued")
+        & (dal.music_station_queue.position < position)
+        & (dal.music_station_queue.track_id == dal.music_tracks.id)
+    )
+    rows = await async_dal.select_async(dal(query), dal.music_tracks.duration_ms)
+    return sum(int(row.duration_ms or 0) for row in rows)
+
+
+async def _compute_eta_seconds(
+    async_dal: Any, dal: Any, *, community_id: int, position: int
+) -> int:
+    """ETA (seconds) until `position` starts playing: queued-ahead durations + playing remainder.
+
+    `0` means "next up" (nothing queued ahead AND nothing currently
+    playing). The currently-`playing` item's remaining time is derived
+    from `started_at` + its track's `duration_ms`, clamped to >=0 (a
+    `playing` row with a stale/missing `started_at` degrades to counting
+    its full duration rather than raising).
+    """
+    total_ms = await _sum_duration_ms_ahead(
+        async_dal, dal, community_id=community_id, position=position
+    )
+
+    playing_query = (dal.music_station_queue.community_id == community_id) & (
+        dal.music_station_queue.status == "playing"
+    )
+    playing_rows = await async_dal.select_async(dal(playing_query))
+    if playing_rows:
+        playing_row = playing_rows.first()
+        track_row = await _get_track_row(async_dal, dal, track_id=playing_row.track_id)
+        duration_ms = int(track_row.duration_ms or 0)
+        started_at = playing_row.started_at
+        if isinstance(started_at, datetime):
+            elapsed_ms = max(0, int((datetime.now(UTC) - started_at).total_seconds() * 1000))
+            remaining_ms = max(0, duration_ms - elapsed_ms)
+        else:
+            remaining_ms = duration_ms
+        total_ms += remaining_ms
+
+    return total_ms // 1000
+
+
+async def queue_length(async_dal: Any, dal: Any, *, community_id: int) -> int:
+    """Count of `queued` + `playing` items for a community -- backs `!sr status`."""
+    query = (dal.music_station_queue.community_id == community_id) & (
+        dal.music_station_queue.status.belongs(("queued", "playing"))
+    )
+    return int(await async_dal.count_async(query))
+
+
 async def _next_queue_position(async_dal: Any, dal: Any, *, community_id: int) -> int:
     query = (dal.music_station_queue.community_id == community_id) & (
         dal.music_station_queue.status == "queued"
@@ -417,7 +492,10 @@ async def enqueue_request(
     )
     queue_rows = await async_dal.select_async(dal(dal.music_station_queue.id == int(new_id)))
     track_row = await _get_track_row(async_dal, dal, track_id=track_id)
-    return _queue_item_dto(queue_rows.first(), track_row)
+    eta_seconds = await _compute_eta_seconds(
+        async_dal, dal, community_id=community_id, position=position
+    )
+    return _queue_item_dto(queue_rows.first(), track_row, eta_seconds=eta_seconds)
 
 
 async def enqueue_playlist(

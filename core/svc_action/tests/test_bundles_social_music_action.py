@@ -17,35 +17,48 @@ import pytest
 from flask_core import PlatformEvent, StageEnvelope
 from waddle_transports import NonRetryableTransportError
 
-from bundles.social_music_action import enqueue_song_request
+from bundles.social_music_action import (
+    _STATUS_CHECK_KEY,
+    _STATUS_ENABLED_REPLY,
+    _STATUS_OFFLINE_REPLY,
+    _format_time_till_played,
+    enqueue_song_request,
+)
 
 _ENQUEUE_URL_FRAGMENT = "/api/v1/internal/music/queue/requests"
+_STATUS_URL_FRAGMENT = "/api/v1/internal/music/status"
 
-_HUB_API_ITEM: dict[str, Any] = {
-    "success": True,
-    "item": {
-        "id": 1,
-        "communityId": 42,
-        "track": {
-            "provider": "youtube",
-            "externalId": "dQw4w9WgXcQ",
-            "title": "Never Gonna Give You Up",
-            "artist": "Rick Astley",
-            "durationMs": 213000,
-            "artworkUrl": None,
-            "url": "https://youtu.be/dQw4w9WgXcQ",
+
+def _hub_api_item(eta_seconds: int | None = 187) -> dict[str, Any]:
+    return {
+        "success": True,
+        "item": {
+            "id": 1,
+            "communityId": 42,
+            "track": {
+                "provider": "youtube",
+                "externalId": "dQw4w9WgXcQ",
+                "title": "Never Gonna Give You Up",
+                "artist": "Rick Astley",
+                "durationMs": 213000,
+                "artworkUrl": None,
+                "url": "https://youtu.be/dQw4w9WgXcQ",
+            },
+            "position": 3,
+            "status": "queued",
+            "source": "request",
+            "playlistId": None,
+            "requestedBy": None,
+            "addedAt": None,
+            "startedAt": None,
+            "endedAt": None,
+            "etaSeconds": eta_seconds,
         },
-        "position": 3,
-        "status": "queued",
-        "source": "request",
-        "playlistId": None,
-        "requestedBy": None,
-        "addedAt": None,
-        "startedAt": None,
-        "endedAt": None,
-    },
-}
-_SUCCESS_TEXT = "\U0001f3b5 Added Never Gonna Give You Up — Rick Astley (#3 in queue)"
+    }
+
+
+_HUB_API_ITEM: dict[str, Any] = _hub_api_item()
+_SUCCESS_TEXT = "added to the queue: Never Gonna Give You Up - Rick Astley - ~3m 07s"
 
 
 def _envelope(
@@ -102,6 +115,32 @@ def _relay_transport(sent: dict[str, Any]) -> AsyncMock:
 
     transport.send = _send
     return transport
+
+
+class TestFormatTimeTillPlayed:
+    """`_format_time_till_played()` -- the `<time-till-played>` field, every branch."""
+
+    def test_next_up_when_eta_zero(self) -> None:
+        assert _format_time_till_played(0, position=1) == "next up"
+
+    def test_next_up_when_eta_negative(self) -> None:
+        """Defensive: a clock-skew/stale `started_at` must never render a negative time."""
+        assert _format_time_till_played(-5, position=1) == "next up"
+
+    def test_seconds_only_under_a_minute(self) -> None:
+        assert _format_time_till_played(45, position=2) == "~45s"
+
+    def test_minutes_and_seconds(self) -> None:
+        assert _format_time_till_played(220, position=3) == "~3m 40s"
+
+    def test_hours_and_minutes_no_seconds(self) -> None:
+        assert _format_time_till_played(3720, position=5) == "~1h 02m"
+
+    def test_none_eta_falls_back_to_position_count(self) -> None:
+        assert _format_time_till_played(None, position=4) == "3 ahead"
+
+    def test_none_eta_position_one_is_zero_ahead(self) -> None:
+        assert _format_time_till_played(None, position=1) == "0 ahead"
 
 
 class TestEnqueuePayload:
@@ -179,7 +218,188 @@ class TestEnqueueSuccess:
 
         assert result.transport == "bundle"
         assert discord_call["body"]["content"] == _SUCCESS_TEXT
-        assert discord_call["auth"] == "Bearer tok"
+        assert discord_call["auth"] == "Bot tok"
+
+    async def test_success_reply_next_up_when_eta_zero(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=_hub_api_item(eta_seconds=0))
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _envelope(platform="twitch"), _config(), http_client=client
+                )
+
+        assert sent["message"]["text"] == (
+            "added to the queue: Never Gonna Give You Up - Rick Astley - next up"
+        )
+
+    async def test_success_reply_falls_back_to_position_count_when_eta_missing(self) -> None:
+        """Schema/response gap: hub-api didn't/couldn't compute `etaSeconds` -> `<N> ahead`."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=_hub_api_item(eta_seconds=None))
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(
+                    _envelope(platform="twitch"), _config(), http_client=client
+                )
+
+        assert sent["message"]["text"] == (
+            "added to the queue: Never Gonna Give You Up - Rick Astley - 2 ahead"
+        )
+
+
+class TestStatusCheck:
+    """`!sr status` dispatch -- `music_status_check` payload flag routes here, not `_enqueue()`."""
+
+    def _status_envelope(self, *, platform: str = "twitch") -> StageEnvelope:
+        return _envelope(
+            payload={
+                _STATUS_CHECK_KEY: True,
+                "channel_id": "123",
+                "channel_name": "testchannel",
+                "author_id": "platform-user-1",
+            },
+            platform=platform,
+        )
+
+    async def test_enabled_state_replies_enabled(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "state": "enabled",
+                        "cause": None,
+                        "provider": "spotify",
+                        "queue_length": 2,
+                    },
+                    "meta": {"version": 1},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == _STATUS_ENABLED_REPLY
+
+    async def test_error_state_replies_with_cause(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "state": "error",
+                        "cause": "spotify oauth token didn't work (401)",
+                        "provider": "spotify",
+                        "queue_length": 0,
+                    },
+                    "meta": {"version": 1},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == (
+            "song requests: error - spotify oauth token didn't work (401)"
+        )
+
+    async def test_hub_api_unreachable_replies_offline(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == _STATUS_OFFLINE_REPLY
+
+    async def test_non_2xx_replies_offline(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"success": False, "error": {"message": "boom"}})
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == _STATUS_OFFLINE_REPLY
+
+    async def test_malformed_response_replies_offline(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "data": {}})
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert sent["message"]["text"] == _STATUS_OFFLINE_REPLY
+
+    async def test_status_check_requests_get_not_post(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["method"] = request.method
+            captured["url"] = str(request.url)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "state": "enabled",
+                        "cause": None,
+                        "provider": "spotify",
+                        "queue_length": 0,
+                    },
+                    "meta": {"version": 1},
+                },
+            )
+
+        sent: dict[str, Any] = {}
+        async with _client(handler) as client:
+            with patch(
+                "bundles.social_music_action.RelayOutboundIrcTransport",
+                return_value=_relay_transport(sent),
+            ):
+                await enqueue_song_request(self._status_envelope(), _config(), http_client=client)
+
+        assert captured["method"] == "GET"
+        assert _STATUS_URL_FRAGMENT in captured["url"]
+        assert "community_id=42" in captured["url"]
 
 
 class TestEnqueueFriendlyReplies:
@@ -308,5 +528,57 @@ class TestValidation:
                 await enqueue_song_request(
                     _envelope(payload={"music_query": "x"}, platform="twitch"),
                     _config(channel=None, channel_id=None),
+                    http_client=client,
+                )
+
+
+class TestDiscordSendFailures:
+    """Discord send-step failures -- regression coverage for gh live-incident 401.
+
+    A valid bot token sent with the wrong `Authorization` scheme (`Bearer`
+    instead of `Bot`) is rejected by Discord with a bare 401 that looks
+    identical to an actually-invalid/missing token. These assert both the
+    correct `Bot` scheme is used (see `TestEnqueueSuccess.
+    test_success_reply_sent_via_discord`) and that a genuine 401 raises a
+    specific, non-retryable error naming the `bot_token_ref` that failed --
+    never a bare "HTTP 401".
+    """
+
+    async def test_discord_401_raises_non_retryable_naming_token_ref(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3tvalue12345")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if _ENQUEUE_URL_FRAGMENT in str(request.url):
+                return httpx.Response(201, json=_HUB_API_ITEM)
+            return httpx.Response(401, json={"message": "401: Unauthorized"})
+
+        async with _client(handler) as client:
+            with (
+                caplog.at_level("WARNING"),
+                pytest.raises(
+                    NonRetryableTransportError,
+                    match=r"bot_token_ref='TEST_DISCORD_TOKEN'.*HTTP 401",
+                ),
+            ):
+                await enqueue_song_request(
+                    _envelope(platform="discord"), _config(), http_client=client
+                )
+
+        assert "social_music_action.discord_send_rejected" in caplog.text
+        assert "TEST_DISCORD_TOKEN" in caplog.text
+        # the resolved secret VALUE (not its env-var name) must never log
+        assert "s3cr3tvalue12345" not in caplog.text
+
+    async def test_missing_bot_token_ref_raises_specific_env_error(self) -> None:
+        async with _client(lambda _r: httpx.Response(201, json=_HUB_API_ITEM)) as client:
+            with pytest.raises(
+                NonRetryableTransportError,
+                match=r"secret_ref 'UNSET_DISCORD_TOKEN' is not set in the environment",
+            ):
+                await enqueue_song_request(
+                    _envelope(platform="discord"),
+                    _config(bot_token_ref="UNSET_DISCORD_TOKEN"),
                     http_client=client,
                 )

@@ -83,7 +83,12 @@ def _dal() -> Any:
 
 class TestSendMessage:
     async def test_sends_discord_message_with_auth(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """sends_message sends Discord message with Bearer token auth."""
+        """sends_message sends Discord message with Bot token auth.
+
+        regression: discord Bot auth scheme -- Discord's REST API requires
+        `Authorization: Bot <token>`; `Bearer` is the OAuth2 user scheme and
+        is rejected with 401 even for a valid bot token.
+        """
         monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
         captured = {}
 
@@ -95,7 +100,7 @@ class TestSendMessage:
         async with _client(handler) as client:
             result = await send_message(_envelope(), _config(), http_client=client)
 
-        assert captured["auth"] == "Bearer s3cr3t"
+        assert captured["auth"] == "Bot s3cr3t"
         assert result.transport == "bundle"
 
     async def test_resolves_channel_id_from_payload_discord(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,6 +175,26 @@ class TestSendMessage:
         async with _client(lambda r: httpx.Response(401)) as client:
             with pytest.raises(NonRetryableTransportError, match="auth"):
                 await send_message(_envelope(), _config(), http_client=client)
+
+    async def test_401_rejection_logs_token_ref(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """HTTP 401 logs a discord_send_rejected warning naming the token ref.
+
+        regression: discord Bot auth scheme -- a 401/403 must be logged with
+        the failing bot_token_ref (never the token value) so a stale/invalid
+        bot token is diagnosable without exposing the secret.
+        """
+        monkeypatch.setenv("TEST_DISCORD_TOKEN", "s3cr3t")
+
+        with caplog.at_level("WARNING"):
+            async with _client(lambda r: httpx.Response(401)) as client:
+                with pytest.raises(NonRetryableTransportError):
+                    await send_message(_envelope(), _config(), http_client=client)
+
+        assert "social_quote_action.discord_send_rejected" in caplog.text
+        assert "TEST_DISCORD_TOKEN" in caplog.text
+        assert "s3cr3t" not in caplog.text
 
     async def test_500_server_error_is_retryable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """HTTP 5xx server error raises RetryableTransportError."""

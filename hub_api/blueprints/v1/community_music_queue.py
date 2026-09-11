@@ -22,12 +22,13 @@ True`, policy + all moderation actions) scope is required.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
 from flask_core.api_utils import error_response
 from flask_core.tenancy import get_tenant_context, tenant_middleware
-from quart import Blueprint, current_app, request
+from quart import Blueprint, current_app, jsonify, request
 from quart_schema import validate_request, validate_response
 
 from services import community_music_queue_service as svc
@@ -36,6 +37,9 @@ from services.community_common import is_valid_service_key
 from services.current_user import get_current_user_id, get_optional_current_user_id
 from services.dto_response import jsonify_dto
 from services.errors import ApiError, bad_request, not_found
+from services.music_status_service import check_spotify_health
+
+logger = logging.getLogger(__name__)
 
 music_queue_bp = Blueprint("v1_community_music_queue", __name__, url_prefix="/api/v1/admin")
 
@@ -452,21 +456,37 @@ async def internal_enqueue_song_request() -> Any:
 
     async_dal, dal = _dal()
 
-    community_row = dal(dal.communities.id == community_id).select().first()
-    if community_row is None:
-        return _err(not_found("Community not found"))
-    tenant_id = int(community_row.tenant_id)
-
-    platform = body.get("platform")
-    platform_user_id = body.get("platformUserId")
-    requested_by = await _resolve_requester(
-        dal,
-        community_id=community_id,
-        platform=platform if isinstance(platform, str) else None,
-        platform_user_id=platform_user_id if isinstance(platform_user_id, str) else None,
-    )
-
     try:
+        # `select(dal.communities.id, dal.communities.tenant_id)` -- deliberately
+        # NOT a bare `.select()`. `communities` also binds `about_extended`/
+        # `social_links`/`website_url`/`discord_invite_url`/`visibility`, a
+        # pre-existing pydal-vs-Postgres schema gap documented in
+        # `services/schema.py`'s module docstring (gap 4): those columns are
+        # bound for pydal query-building but were never added by any numbered
+        # migration. A bare `.select()` pulls every bound field and 500s with
+        # `psycopg2.errors.UndefinedColumn` the moment it runs -- this route
+        # is the first `communities` caller to do a full-row select, so it's
+        # the first to trip the gap. Restricting to the two columns this
+        # handler actually needs avoids the gap entirely without requiring a
+        # schema migration here.
+        community_row = (
+            dal(dal.communities.id == community_id)
+            .select(dal.communities.id, dal.communities.tenant_id)
+            .first()
+        )
+        if community_row is None:
+            return _err(not_found("Community not found"))
+        tenant_id = int(community_row.tenant_id)
+
+        platform = body.get("platform")
+        platform_user_id = body.get("platformUserId")
+        requested_by = await _resolve_requester(
+            dal,
+            community_id=community_id,
+            platform=platform if isinstance(platform, str) else None,
+            platform_user_id=platform_user_id if isinstance(platform_user_id, str) else None,
+        )
+
         item = await svc.enqueue_request(
             async_dal,
             dal,
@@ -479,7 +499,77 @@ async def internal_enqueue_song_request() -> Any:
         )
     except ApiError as exc:
         return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_enqueue_song_request.unhandled_error",
+            extra={"community_id": community_id},
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
     return jsonify_dto(QueueItemResponse(success=True, item=item), 201)
+
+
+@music_internal_bp.route("/music/status", methods=["GET"])
+async def internal_music_status() -> Any:
+    """`GET /api/v1/internal/music/status?community_id=<id>` -- service-to-service only.
+
+    Backs `!sr status` (`core/svc_action/bundles/social_music_action.py`).
+    Deliberately does NOT check `music_policy.song_requests_allowed` --
+    that's a separate per-community admin toggle from the PostHog
+    `waddles.social.music` feature flag this endpoint's caller already
+    resolved itself before ever reaching hub-api (`social_music_process.
+    py`'s `disabled` short-circuit). This endpoint answers one question
+    only: is the Spotify provider usable right now, and how big is the
+    queue -- both real signals `music_policy` can't answer.
+
+    `state` in the response body is always `"enabled"` or `"error"` (with
+    a specific, secret-free `cause`) -- never `"offline"`. `"offline"` is
+    a caller-side interpretation of an unreachable hub-api or a non-2xx
+    response, not a state this handler can observe about itself; see
+    `social_music_action._check_status()`'s own docstring.
+    """
+    if not is_valid_service_key(request):
+        return {"success": False, "error": "Invalid service key"}, 401
+
+    raw_community_id = request.args.get("community_id")
+    try:
+        community_id = int(raw_community_id) if raw_community_id is not None else None
+    except (TypeError, ValueError):
+        community_id = None
+    if community_id is None:
+        return {"success": False, "error": "community_id query param is required"}, 400
+
+    async_dal, dal = _dal()
+    try:
+        community_row = dal(dal.communities.id == community_id).select(dal.communities.id).first()
+        if community_row is None:
+            return _err(not_found("Community not found"))
+
+        length = await svc.queue_length(async_dal, dal, community_id=community_id)
+        health = await check_spotify_health()
+    except ApiError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - last-resort 500 must still be JSON, never an empty body
+        logger.exception(
+            "internal_music_status.unhandled_error", extra={"community_id": community_id}
+        )
+        return error_response(f"Internal error: {exc}", 500, "INTERNAL_ERROR")
+
+    state = "enabled" if health.healthy else "error"
+    return (
+        jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "state": state,
+                    "cause": health.cause,
+                    "provider": "spotify",
+                    "queue_length": length,
+                },
+                "meta": {"version": 1},
+            }
+        ),
+        200,
+    )
 
 
 BLUEPRINTS: list[Blueprint] = [music_queue_bp, music_internal_bp]

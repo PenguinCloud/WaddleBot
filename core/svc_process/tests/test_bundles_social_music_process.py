@@ -7,7 +7,14 @@ from typing import Any
 import pytest
 from flask_core import PROCESS_TARGET_APP_ID_KEY, PlatformEvent, bundle_context
 
-from bundles.social_music_process import _MUSIC_APP_ID, _SR_USAGE, transform
+from bundles.social_music_process import (
+    _MUSIC_APP_ID,
+    _SET_UNAVAILABLE_REPLY,
+    _SR_USAGE,
+    _STATUS_CHECK_KEY,
+    _STATUS_DISABLED_REPLY,
+    transform,
+)
 
 TENANT = "global"
 COMMUNITY = "42"
@@ -174,7 +181,82 @@ class TestTransformFeatureFlag:
         assert captured["flag_key"] == "waddles.social.music"
         assert captured["tenant"] == TENANT
         assert captured["community"] == 42
-        assert captured["default"] is False
+        assert captured["default"] is True
+
+
+class TestTransformStatus:
+    """`!sr status` -- always answers, flag on or off."""
+
+    async def test_status_enabled_routes_to_action_with_status_check_flag(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr status"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload[_STATUS_CHECK_KEY] is True
+        assert result.payload[PROCESS_TARGET_APP_ID_KEY] == _MUSIC_APP_ID
+
+    async def test_status_alias_songrequest_also_routes(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!songrequest status"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload[_STATUS_CHECK_KEY] is True
+
+    async def test_status_case_insensitive(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr STATUS"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload[_STATUS_CHECK_KEY] is True
+
+    async def test_status_disabled_replies_directly_without_target_app_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one subcommand that must still answer when the flag is off."""
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_off)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr status"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _STATUS_DISABLED_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+        assert _STATUS_CHECK_KEY not in result.payload
+
+    async def test_status_preserves_channel_and_requester(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr status"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["channel_id"] == "123"
+        assert result.payload["author_id"] == "platform-user-1"
+
+
+class TestTransformSet:
+    """`!sr set ...` -- out of scope this pass, never treated as a song title."""
+
+    async def test_set_returns_unavailable_reply(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set discord #music"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _SET_UNAVAILABLE_REPLY
+        assert PROCESS_TARGET_APP_ID_KEY not in result.payload
+        assert "music_query" not in result.payload
+
+    async def test_bare_set_returns_unavailable_reply(self) -> None:
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr set"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["text"] == _SET_UNAVAILABLE_REPLY
+
+    async def test_set_returns_none_when_flag_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`set` follows the general flag gate (unlike `status`) -- silent when disabled."""
+        monkeypatch.setattr("bundles.social_music_process.feature_enabled", _flag_off)
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            assert await transform(_event("!sr set discord #music")) is None
+
+    async def test_a_song_literally_titled_settle_is_not_mistaken_for_set(self) -> None:
+        """Word-boundary check: `settle down` must not match the `set` subcommand."""
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(_event("!sr settle down"))
+        assert isinstance(result, PlatformEvent)
+        assert result.payload["music_query"] == "settle down"
 
 
 class TestTransformErrorHandling:
