@@ -1,6 +1,9 @@
 ## Waddlebot - Alpha Environment Overrides
 webui:
   publicUrl: "http://192.168.10.75:30879"  # node LAN IP + hub-webui NodePort — `!sq` links must open off-laptop
+  # #320 Connections: Google/Spotify only accept http (non-TLS) redirect URIs on
+  # `localhost` -- the LAN-IP publicUrl above is rejected by their OAuth consent screens.
+  connectionsCallbackBaseUrl: "http://localhost:30879"
 
 global:
   imageRegistry: ""

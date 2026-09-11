@@ -20,6 +20,59 @@ spec:
     requests:
       storage: {{ .Values.infrastructure.minio.persistence.size }}
 ---
+# MinIO bucket initialization Job (creates bucketName if it doesn't exist)
+# MinIO License: AGPL-3.0 — self-hosted object store, not linked into our code
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: storage-init
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      restartPolicy: Never
+      containers:
+      - name: minio-init
+        image: {{ .Values.infrastructure.minio.initImage }}
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          # `mc alias set` replaced the removed `mc config host add` in current mc releases.
+          /usr/bin/mc alias set minio http://{{ .Values.infrastructure.minio.service.name }}:{{ .Values.infrastructure.minio.service.apiPort }} "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}"
+          /usr/bin/mc mb --ignore-existing minio/{{ .Values.infrastructure.minio.bucketName }}
+          # svc-streaming recordings (RECORDINGS_BUCKET) live in their own bucket.
+          /usr/bin/mc mb --ignore-existing minio/recordings
+          /usr/bin/mc ls minio/
+          echo "Buckets {{ .Values.infrastructure.minio.bucketName }}, recordings initialized successfully"
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef:
+              name: waddlebot-secrets
+              key: MINIO_ROOT_USER
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: waddlebot-secrets
+              key: MINIO_ROOT_PASSWORD
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

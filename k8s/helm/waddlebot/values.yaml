@@ -5,6 +5,10 @@
 # Webui Configuration
 webui:
   publicUrl: ""
+  # #320 Connections: OAuth redirect_uri base. Empty by default -- hub-api falls back
+  # to publicUrl above when blank. See values-alpha.yaml for why this needs its own
+  # override in some environments.
+  connectionsCallbackBaseUrl: ""
 
 # Global settings
 global:
@@ -32,6 +36,12 @@ global:
   jwtSecret: "REPLACE_ME_jwt_secret"
   moduleSecretKey: "REPLACE_ME_module_secret"
   serviceApiKey: "REPLACE_ME_service_key"
+
+  # hub-api-v3 Connections (#320): symmetric key used to encrypt stored per-community
+  # OAuth tokens at rest. Empty by default (never a literal here) -- see secrets.yaml
+  # for the generation command; OVERRIDE REQUIRED via --set or an out-of-git values
+  # override / ExternalSecret before Connections can be used in any environment.
+  credentialEncryptionKey: ""
 
   # gRPC transport TLS (PR #264, A02 HIGH -- flask_core.grpc_tls / GRPC_TLS_* env vars).
   # Every gRPC server (core-data, core-identity, interactive-productivity,
@@ -186,7 +196,11 @@ infrastructure:
   # MinIO Object Storage
   minio:
     enabled: true
-    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # MinIO API server — moved from Docker Hub (deprecated) to quay.io/minio/minio
+    # License: AGPL-3.0 (self-hosted object store, not linked into our code)
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # MinIO client (mc) used for bucket initialization — same license
+    initImage: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     apiPort: 9000
     consolePort: 9001
     bucketName: "waddlebot-assets"
@@ -499,6 +513,10 @@ pipeline:
     # override to false since their `infrastructure.ollama.enabled` is
     # already false -- no AI backend actually deployed in either env.
     aiEnabled: true
+    # #320 Connections: TTL (seconds) for the OAuth state param cached in Redis/Valkey
+    # during the per-community connect flow (CSRF protection between redirect and
+    # callback). 600s = 10min, generous for a user to complete an OAuth consent screen.
+    connectionsStateTtlS: 600
     resources:
       requests:
         cpu: "250m"

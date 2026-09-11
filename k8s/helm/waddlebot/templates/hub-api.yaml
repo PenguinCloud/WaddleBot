@@ -65,6 +65,24 @@ spec:
         # never grants access on its own, see values.yaml's own comment.
         - name: WADDLES_AI_ENABLED
           value: {{ .Values.pipeline.hubApi.aiEnabled | quote }}
+        # #320 Connections: PUBLIC_WEBUI_URL (OAuth redirect_uri base) and the 12
+        # {DISCORD,TWITCH,SLACK,YOUTUBE,SPOTIFY,KICK}_CLIENT_ID/_CLIENT_SECRET pairs
+        # already reach this container via the envFrom.configMapRef/secretRef blocks
+        # above (shared -config/-secrets objects) -- same whole-object envFrom pattern
+        # svc-action.yaml/svc-ingest.yaml use for the same keys; no per-key duplicates
+        # added here.
+        - name: CONNECTIONS_STATE_TTL_S
+          value: {{ .Values.pipeline.hubApi.connectionsStateTtlS | quote }}
+        - name: CREDENTIAL_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "waddlebot.fullname" . }}-secrets
+              key: CREDENTIAL_ENCRYPTION_KEY
+              # optional: true -- mirrors _helpers.tpl's dbMigrateInitContainer pattern
+              # for secret keys that may not exist yet on an already-deployed Secret
+              # (live alpha's waddlebot-secrets predates this key); hub_api/config.py
+              # must fail closed on Connections use if this resolves empty/unset.
+              optional: true
         {{- if .Values.modules.bot.enabled }}
         - name: MODULE_LOAD_BOT
           value: "true"
