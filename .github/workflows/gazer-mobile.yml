@@ -531,17 +531,12 @@ jobs:
           rm -rf mobile/gazer/android/app/build/reports/androidTests/connected
           rm -rf mobile/gazer/build/app/outputs/flutter-apk
 
-  # NOTE for writer E's Task 21: once the `integration` job exists (added after `security`, per
-  # Task 21 Step 15), this job's `needs:` list below MUST be extended to
-  # `[toolchain, build, test, android-unit, security, integration]` in that same task --
-  # otherwise a tag push creates a GitHub release without ever waiting for the emulator
-  # integration test to pass. `integration` is not added here because it does not exist yet at
-  # this point in the plan (Task 3 predates Task 21) -- a `needs:` reference to a job that
-  # doesn't exist yet would be an invalid workflow. `toolchain` IS added here (Task 25) so this
-  # job can pull the toolchain image for its apksigner verification step below.
+  # `integration` gates this job (Task 21) so a tagged release never ships without the emulator
+  # test passing. `toolchain` is also a dependency (Task 25) so this job can pull the toolchain
+  # image for its apksigner verification step below.
   release:
     name: GitHub Release
-    needs: [toolchain, build, test, android-unit, security]
+    needs: [toolchain, build, test, android-unit, security, integration]
     if: startsWith(github.ref, 'refs/tags/gazer-v')
     runs-on: ubuntu-latest
     permissions:
