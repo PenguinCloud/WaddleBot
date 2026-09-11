@@ -9,13 +9,26 @@ bundle's `transform()`.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import dataclasses
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from flask_core import PlatformEvent, bundle_context, reset_bundle_dal_for_tests, set_bundle_dal
 
 import bundles.bot_process as bot_process
 from bundles.bot_process import transform
+from services.command_alias_store import CommandAlias
+
+
+async def _alias_flag_on(*_args: Any, **_kwargs: Any) -> bool:
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _alias_flag_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every test to the alias feature flag ON -- flag-off tests override this."""
+    monkeypatch.setattr("bundles.bot_process.feature_enabled", _alias_flag_on)
 
 
 async def _noop_transform(event: PlatformEvent) -> PlatformEvent | None:
@@ -93,7 +106,9 @@ class TestCommands:
         assert result.payload["text"] == "\U0001fa99 Heads"
 
     async def test_unknown_command(self) -> None:
-        result = await transform(_event("!nonsense"))
+        """No community bound -- alias lookup is skipped, falls straight to unknown-command."""
+        with bundle_context(tenant="acme", community=None, app_id="waddles.bot.twitch.default"):
+            result = await transform(_event("!nonsense"))
         assert result is not None
         assert result.payload["text"] == "Unknown command. Try !help"
 
@@ -436,6 +451,124 @@ class TestRouter:
     async def test_non_command_chatter_still_returns_none_with_router_present(self) -> None:
         """Router presence doesn't change non-command chatter's no-reply behavior."""
         assert await transform(_event("just talking about the game")) is None
+
+
+class TestCommandAliases:
+    """Custom `command_aliases` expansion hook (`bot_process._expand_alias`)."""
+
+    async def test_alias_rewrites_to_a_feature_command_with_remaining_args(self) -> None:
+        """`!xx more` (alias `xx` -> `songrequest`) reaches the music feature with args `more`."""
+        captured: dict[str, object] = {}
+
+        async def _capture(event: PlatformEvent) -> PlatformEvent | None:
+            captured["text"] = event.payload["text"]
+            return dataclasses.replace(event, payload={**event.payload, "text": "captured"})
+
+        with (
+            patch.dict(bot_process._FEATURE_TRANSFORMS, {"songrequest": _capture}),
+            patch(
+                "bundles.bot_process.resolve_alias",
+                AsyncMock(
+                    return_value=CommandAlias(
+                        alias="xx", target_command="songrequest", community_id=4
+                    )
+                ),
+            ) as mock_resolve,
+        ):
+            with bundle_context(tenant="acme", community="4", app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!xx more"))
+
+        assert captured["text"] == "!songrequest more"
+        assert result is not None
+        assert result.payload["text"] == "captured"
+        mock_resolve.assert_awaited_once_with(community_id=4, alias="xx")
+
+    async def test_alias_with_fixed_args_joins_with_remaining_user_args(self) -> None:
+        """Alias `xx` -> `announce giveaway` + `!xx now` rewrites to `announce giveaway now`."""
+        captured: dict[str, object] = {}
+
+        async def _capture(event: PlatformEvent) -> PlatformEvent | None:
+            captured["text"] = event.payload["text"]
+            return dataclasses.replace(event, payload={**event.payload, "text": "captured"})
+
+        with (
+            patch.dict(bot_process._FEATURE_TRANSFORMS, {"announce": _capture}),
+            patch(
+                "bundles.bot_process.resolve_alias",
+                AsyncMock(
+                    return_value=CommandAlias(
+                        alias="xx", target_command="announce giveaway", community_id=4
+                    )
+                ),
+            ),
+        ):
+            with bundle_context(tenant="acme", community="4", app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!xx now"))
+
+        assert captured["text"] == "!announce giveaway now"
+        assert result is not None
+        assert result.payload["text"] == "captured"
+
+    async def test_known_built_in_command_never_triggers_a_lookup(self) -> None:
+        """A recognized built-in command word skips the alias store entirely."""
+        with patch("bundles.bot_process.resolve_alias", AsyncMock()) as mock_resolve:
+            result = await transform(_event("!ping"))
+        assert result is not None
+        assert result.payload["text"] == "pong \U0001f427"
+        mock_resolve.assert_not_awaited()
+
+    async def test_known_feature_command_never_triggers_a_lookup(self) -> None:
+        """A recognized feature command word skips the alias store entirely."""
+        with patch("bundles.bot_process.resolve_alias", AsyncMock()) as mock_resolve:
+            result = await transform(_event("!poll"))
+        assert result is not None
+        mock_resolve.assert_not_awaited()
+
+    async def test_unknown_command_with_no_alias_behaves_like_before(self) -> None:
+        """No matching alias row -- falls through to the normal unknown-command reply."""
+        with patch("bundles.bot_process.resolve_alias", AsyncMock(return_value=None)):
+            with bundle_context(tenant="acme", community="4", app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!nonsense"))
+        assert result is not None
+        assert result.payload["text"] == "Unknown command. Try !help"
+
+    async def test_flag_off_skips_lookup_entirely(self) -> None:
+        """Alias feature flag OFF -- behaves like an unrecognized command, no store call."""
+
+        async def _flag_off(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        with (
+            patch("bundles.bot_process.feature_enabled", _flag_off),
+            patch("bundles.bot_process.resolve_alias", AsyncMock()) as mock_resolve,
+        ):
+            with bundle_context(tenant="acme", community="4", app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!nonsense"))
+        assert result is not None
+        assert result.payload["text"] == "Unknown command. Try !help"
+        mock_resolve.assert_not_awaited()
+
+    async def test_no_community_bound_skips_lookup_entirely(self) -> None:
+        """A tenant-wide envelope (`community=None`) skips the alias lookup, no store call."""
+        with patch("bundles.bot_process.resolve_alias", AsyncMock()) as mock_resolve:
+            with bundle_context(tenant="acme", community=None, app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!nonsense"))
+        assert result is not None
+        assert result.payload["text"] == "Unknown command. Try !help"
+        mock_resolve.assert_not_awaited()
+
+    async def test_rewritten_target_unknown_falls_through_without_looping(self) -> None:
+        """Alias expands to an unrecognized word -- no recursive re-lookup, just falls through."""
+        with patch(
+            "bundles.bot_process.resolve_alias",
+            AsyncMock(return_value=CommandAlias(alias="xx", target_command="zzzz", community_id=4)),
+        ) as mock_resolve:
+            with bundle_context(tenant="acme", community="4", app_id="waddles.bot.twitch.default"):
+                result = await transform(_event("!xx"))
+
+        assert result is not None
+        assert result.payload["text"] == "Unknown command. Try !help"
+        mock_resolve.assert_awaited_once_with(community_id=4, alias="xx")
 
 
 class _EmptyQuoteDal:

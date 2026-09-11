@@ -7,7 +7,7 @@ logic runs for Discord and Twitch, driven only by `event.payload["text"]`,
 `event.actor`, and `event.platform` -- no platform-specific branching beyond
 interpolating `event.platform` into the `!waddle` reply string.
 
-Three response paths, tried in order:
+Four response paths, tried in order:
   - `!command [args]` -- the bot's own built-in commands: Fun (roll/dice/
     flip/coin/8ball/hug/love/lurk), Utility (ping/hello/help/echo/waddle/
     uptime/time/rules/bot), and Community (socials/discord/so/followage),
@@ -21,6 +21,12 @@ Three response paths, tried in order:
     `!rep` actually respond in live Discord/Twitch -- today only the bot's
     own app_id is routed a message, so these feature bundles (separate
     app_ids) otherwise never run.
+  - `!<alias>` -- CUSTOM ALIAS EXPANSION: a word that is neither a built-in
+    nor a loaded feature command is looked up against this community's own
+    `command_aliases` table (`services.command_alias_store`, feature-gated
+    by `_ALIAS_FEATURE_FLAG`) and, on a hit, rewritten to its stored
+    expansion before falling through to the two paths above -- see
+    `_expand_alias()`. Recognized commands never pay this lookup's cost.
   - keyword/greeting responder -- a small set of conversational triggers
     (greeting, bot-name mention, thanks) get a short reply; everything else
     returns `None` (no reply) so the bot never echoes random chatter back
@@ -47,7 +53,10 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
-from flask_core import PlatformEvent
+from flask_core import PlatformEvent, get_bundle_context
+from flask_core.feature_flags import feature_enabled
+
+from services.command_alias_store import resolve_alias
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +128,7 @@ TransformFn = Callable[[PlatformEvent], Awaitable[PlatformEvent | None]]
 _FEATURE_MODULES: dict[str, str] = {
     "quote": "bundles.social_quote_process",
     "alias": "bundles.social_alias_process",
+    "unalias": "bundles.social_alias_process",
     "poll": "bundles.community_polls_process",
     "announce": "bundles.community_announcements_process",
     "forum": "bundles.community_forums_process",
@@ -129,6 +139,9 @@ _FEATURE_MODULES: dict[str, str] = {
     "inventory": "bundles.inventory_process",
     "sr": "bundles.social_music_process",
     "songrequest": "bundles.social_music_process",
+    "sq": "bundles.social_music_process",
+    "songqueue": "bundles.social_music_process",
+    "cc": "bundles.community_context_process",
 }
 
 
@@ -156,6 +169,13 @@ def _load_feature_transforms() -> dict[str, TransformFn]:
 
 
 _FEATURE_TRANSFORMS: dict[str, TransformFn] = _load_feature_transforms()
+
+#: PostHog flag key gating the `command_aliases` lookup below -- `waddles.
+#: <module>.<feature>` convention (see `waddles.community.context`/
+#: `waddles.social.music` elsewhere in this file's sibling bundles).
+#: Default ON: an unrecognized `!<word>` looks itself up against this
+#: community's custom aliases before falling back to "Unknown command."
+_ALIAS_FEATURE_FLAG = "waddles.bot.command_aliases"
 
 
 _HELP_FUN = "!roll, !flip, !dice, !coin, !8ball <q>, !hug <user>, !love <user>, !lurk"
@@ -316,6 +336,63 @@ def _handle_keyword(text: str, *, actor: str | None) -> str | None:
     return None
 
 
+def _community_id(community: str | None) -> int | None:
+    """Best-effort `int(community)` for the alias flag/lookup; `None`/unparseable -> `None`."""
+    if community is None:
+        return None
+    try:
+        return int(community)
+    except ValueError:
+        return None
+
+
+async def _expand_alias(command: str, rest: str) -> tuple[str, str, str] | None:
+    """Resolve `command` against this community's `command_aliases` table, rewriting the message.
+
+    Only called for a word that is neither a built-in command nor a loaded
+    feature command (see `transform()`) -- a recognized command never pays
+    this lookup's cost. Feature-gated (`_ALIAS_FEATURE_FLAG`, default ON)
+    via the same `feature_enabled` helper every other bundle uses; a
+    tenant-wide envelope (`get_bundle_context().community is None`) skips
+    the lookup entirely, matching `services.command_alias_store.
+    resolve_alias`'s own "no community, nothing to look up" contract.
+
+    Returns the rewritten `(command, rest, text)` triple on an alias hit
+    (`text` is the full `!<expansion>` string, single-space join + strip,
+    re-parsed exactly once here) -- `transform()` never calls this again on
+    the rewritten command, so an alias whose own expansion is itself
+    unrecognized simply falls through to the normal unknown-command reply
+    rather than looping. Returns `None` when nothing should be rewritten
+    (flag off, no community, no matching alias, or an empty expansion).
+    """
+    ctx = get_bundle_context()
+    community_id = _community_id(ctx.community)
+    if community_id is None:
+        logger.debug("bot_process.alias_lookup_skipped_no_community command=%s", command)
+        return None
+
+    enabled = await feature_enabled(
+        _ALIAS_FEATURE_FLAG, tenant=ctx.tenant, community=community_id, default=True
+    )
+    if not enabled:
+        logger.debug("bot_process.alias_flag_disabled_no_lookup command=%s", command)
+        return None
+
+    alias = await resolve_alias(community_id=community_id, alias=command)
+    if alias is None:
+        return None
+
+    expansion = f"{alias.target_command} {rest}".strip() if rest else alias.target_command.strip()
+    if not expansion:
+        return None
+
+    logger.debug("bot_process.alias_expanded alias=%s target=%s", command, alias.target_command)
+    new_parts = expansion.split(maxsplit=1)
+    new_command = new_parts[0].lower()
+    new_rest = new_parts[1] if len(new_parts) > 1 else ""
+    return new_command, new_rest, f"!{expansion}"
+
+
 async def _dispatch_feature(command: str, event: PlatformEvent) -> PlatformEvent | None:
     """Call a feature bundle's `transform()`, guarding the bot against any failure.
 
@@ -335,12 +412,14 @@ async def _dispatch_feature(command: str, event: PlatformEvent) -> PlatformEvent
 
 
 async def transform(event: PlatformEvent) -> PlatformEvent | None:
-    """Route to a built-in command, a feature bundle, or the keyword responder.
+    """Route to a built-in command, a feature bundle, a custom alias, or the keyword responder.
 
     Reads `event.payload["text"]` for the message, `event.actor` for who to
     address, and `event.platform` for the `!waddle` reply. `!<word>` first
     checks the bot's own built-in commands, then the feature dispatch table
-    (`_FEATURE_TRANSFORMS`) -- see module docstring for the three-path
+    (`_FEATURE_TRANSFORMS`); an unrecognized word is tried once against
+    this community's own command aliases (`_expand_alias`) before falling
+    back to "Unknown command." -- see module docstring for the four-path
     router and its guards. Returns a NEW `PlatformEvent` (`dataclasses.
     replace`) with only `payload["text"]` replaced by the reply -- every
     other payload field (`channel_id`, `channel_name`, ...) is preserved so
@@ -360,6 +439,14 @@ async def transform(event: PlatformEvent) -> PlatformEvent | None:
             return None
         command = parts[0].lower()
         rest = parts[1] if len(parts) > 1 else ""
+
+        if command not in _BOT_COMMANDS and command not in _FEATURE_TRANSFORMS:
+            expanded = await _expand_alias(command, rest)
+            if expanded is not None:
+                command, rest, rewritten_text = expanded
+                event = dataclasses.replace(
+                    event, payload={**event.payload, "text": rewritten_text}
+                )
 
         if command in _BOT_COMMANDS:
             reply = _handle_command(command, rest, actor=event.actor, platform=event.platform)

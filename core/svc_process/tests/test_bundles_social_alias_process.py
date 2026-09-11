@@ -1,4 +1,4 @@
-"""Tests for `bundles.social_alias_process.transform` -- alias resolution and management."""
+"""Tests for `bundles.social_alias_process.transform` -- alias set/list/remove/invoke."""
 
 from __future__ import annotations
 
@@ -8,10 +8,31 @@ from typing import Any
 import pytest
 from flask_core import PlatformEvent, bundle_context, reset_bundle_dal_for_tests, set_bundle_dal
 
-from bundles.social_alias_process import _ALIAS_USAGE, transform
+import bundles.social_alias_process as social_alias_process
+import services.command_alias_store as command_alias_store_module
+from bundles.social_alias_process import (
+    _ALIAS_USAGE,
+    _COMMUNITY_REQUIRED_MSG,
+    _NO_ALIASES_MSG,
+    _PERMISSION_DENIED_MSG,
+    transform,
+)
+
+TENANT = "acme"
+COMMUNITY = "1"
+COMMUNITY_2 = "2"
+APP_ID = "waddles.social.alias.default"
+
+#: Default test actor -- seeded as `moderator` in `_FakeDal` so ordinary
+#: set/list/remove tests don't have to opt into permission separately;
+#: dedicated `TestPermissions` tests use a non-privileged actor instead.
+MOD_ACTOR = "penguin"
+NON_MOD_ACTOR = "rando"
 
 
-def _event(text: str, **payload_overrides: object) -> PlatformEvent:
+def _event(
+    text: str, *, actor: str | None = MOD_ACTOR, **payload_overrides: object
+) -> PlatformEvent:
     payload: dict[str, object] = {
         "text": text,
         "channel_id": "chan-123",
@@ -20,7 +41,7 @@ def _event(text: str, **payload_overrides: object) -> PlatformEvent:
     return PlatformEvent(
         platform="discord",
         event_type="message",
-        actor="penguin",
+        actor=actor,
         payload=payload,
         occurred_at="2026-01-01T00:00:00+00:00",
     )
@@ -42,30 +63,25 @@ class _FakeRow:
             return self._data[name]
         raise AttributeError(f"Row has no attribute {name}")
 
-    def __iter__(self) -> Any:
-        return iter(self._data)
-
-    def keys(self) -> Any:
-        return self._data.keys()
-
-    def items(self) -> Any:
-        return self._data.items()
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._data.get(key, default)
-
     def __repr__(self) -> str:
         return f"_FakeRow({self._data})"
 
 
 class _FakeDal:
-    """In-memory stand-in for AsyncDAL -- implements only the .select() and .update() surfaces."""
+    """In-memory stand-in for `AsyncDAL` -- pydal-style `command_aliases` + raw `execute()`.
 
-    def __init__(self, scenario: str = "normal") -> None:
+    `command_aliases` mirrors the original mock (`.select()`/`.update()`/
+    `.insert_async()`, generic over `community_id` so cross-community
+    isolation can be exercised). `execute()` is new: it answers the
+    `community_members.role` lookup `_caller_is_moderator_or_admin` issues,
+    same shape as `community_reputation_process`'s own `_FakeDal.execute()`.
+    """
+
+    def __init__(self) -> None:
         self.command_aliases = _FakeTable()
-        self.scenario = scenario
         self.should_error = False
         self.error_message = "Test error"
+        self.should_error_on_role_lookup = False
         self._aliases: dict[int, dict[str, Any]] = {
             1: {
                 "id": 1,
@@ -77,28 +93,25 @@ class _FakeDal:
                 "created_by": "penguin",
             },
         }
+        self._next_id = 2
+        self.roles_by_display_name: dict[str, str] = {MOD_ACTOR: "moderator"}
+        self.roles_by_platform_user_id: dict[str, str] = {}
         self._last_query: Any = None
         self._select_count = 0
-        self._expanded = False
+        self._execute_count = 0
 
     def select(self, query: Any) -> _FakeRows:
         if self.should_error:
             raise Exception(self.error_message)
 
-        # Store the query for inspection if needed
         self._last_query = query
         self._select_count += 1
-
-        # Parse the query to determine what to return. Generic over
-        # community_id so cross-community isolation can actually be
-        # exercised (regression: cross-community alias IDOR) instead of
-        # every query being implicitly pinned to community_id=1.
         query_str = str(query) if not isinstance(query, str) else query
 
         community_match = re.search(r"community_id=(\d+)", query_str)
         query_community_id = int(community_match.group(1)) if community_match else None
 
-        alias_match = re.search(r"alias=(\w+)", query_str)
+        alias_match = re.search(r"alias=([\w-]+)", query_str)
         query_alias_name = alias_match.group(1) if alias_match else None
 
         require_undeleted = "IS NULL" in query_str
@@ -118,21 +131,33 @@ class _FakeDal:
         if self.should_error:
             raise Exception(self.error_message)
 
-        # Simplified mock -- update alias by ID (query format: "id=X")
         query_str = str(query) if not isinstance(query, str) else query
         id_match = re.search(r"\bid=(\d+)", query_str)
         if id_match:
             alias_id = int(id_match.group(1))
             if alias_id in self._aliases:
                 self._aliases[alias_id].update(kwargs)
-                self._expanded = True
 
     def insert_async(self, table: Any, **kwargs: object) -> None:
         if self.should_error:
             raise Exception(self.error_message)
 
-        # Simplified mock
-        self._aliases[2] = {"id": 2, "deleted_at": None, **kwargs}
+        new_id = self._next_id
+        self._next_id += 1
+        self._aliases[new_id] = {"id": new_id, "deleted_at": None, "usage_count": 0, **kwargs}
+
+    async def execute(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        self._execute_count += 1
+        if self.should_error_on_role_lookup:
+            raise RuntimeError("simulated permission lookup outage")
+
+        if "platform_user_id" in sql:
+            _community_id, _platform, platform_user_id = params
+            role = self.roles_by_platform_user_id.get(platform_user_id)
+        else:
+            _community_id, display_name = params
+            role = self.roles_by_display_name.get(display_name)
+        return [{"role": role}] if role is not None else []
 
 
 class _FakeTable:
@@ -198,6 +223,21 @@ class _FakeRows:
         return self.rows[0] if self.rows else None
 
 
+async def _flag_on(*_args: Any, **_kwargs: Any) -> bool:
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _flag_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every test to flag ON -- `TestFeatureFlag` overrides this explicitly.
+
+    Mocked (not exercising the real entitlement client) so the suite never
+    depends on PostHog/license-server reachability, matching
+    `community_context_process`'s own test convention.
+    """
+    monkeypatch.setattr(social_alias_process, "feature_enabled", _flag_on)
+
+
 @pytest.fixture(autouse=True)
 def _dal() -> Any:
     """Set up fake DAL for all tests."""
@@ -207,506 +247,462 @@ def _dal() -> Any:
     reset_bundle_dal_for_tests()
 
 
-class TestTransformAliasInvocation:
-    """Test alias invocation (e.g., !greet)."""
+@pytest.fixture(autouse=True)
+def _invalidate_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
+    """Stub `services.command_alias_store.invalidate_alias` -- writes must never hit real Redis."""
+    calls: list[tuple[int, str]] = []
 
-    async def test_non_alias_chatter_returns_none(self) -> None:
-        """Non-alias messages should return None."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("just chatting"))
+    async def _fake_invalidate(*, community_id: int, alias: str, redis_client: Any = None) -> None:
+        calls.append((community_id, alias))
+
+    monkeypatch.setattr(command_alias_store_module, "invalidate_alias", _fake_invalidate)
+    return calls
+
+
+async def _run(
+    text: str,
+    *,
+    community: str | None = COMMUNITY,
+    actor: str | None = MOD_ACTOR,
+    **overrides: object,
+) -> PlatformEvent | None:
+    with bundle_context(tenant=TENANT, community=community, app_id=APP_ID):
+        return await transform(_event(text, actor=actor, **overrides))
+
+
+class TestFeatureFlag:
+    async def test_flag_off_returns_none_no_reply(
+        self, monkeypatch: pytest.MonkeyPatch, _dal: _FakeDal
+    ) -> None:
+        async def _flag_off(*_a: Any, **_kw: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(social_alias_process, "feature_enabled", _flag_off)
+        result = await _run("!alias list")
         assert result is None
+        assert _dal._select_count == 0
+
+
+class TestRoutingAndMalformedEvents:
+    async def test_non_command_chatter_returns_none(self) -> None:
+        assert await _run("just chatting") is None
 
     async def test_command_without_bang_returns_none(self) -> None:
-        """Commands without ! prefix should return None."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("greet penguin"))
-        assert result is None
-
-    async def test_bare_alias_returns_usage_hint(self) -> None:
-        """Bare `!alias` (no subcommand) should return a usage-hint reply, not None."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias"))
-        assert isinstance(result, PlatformEvent)
-        assert result.payload["text"] == _ALIAS_USAGE
-
-    async def test_bare_alias_with_trailing_whitespace_returns_usage_hint(self) -> None:
-        """`!alias ` (trailing whitespace, no subcommand) should return the same usage hint."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias   "))
-        assert isinstance(result, PlatformEvent)
-        assert result.payload["text"] == _ALIAS_USAGE
-
-    async def test_alias_invocation_expands_with_db(self) -> None:
-        """Alias invocation expands successfully when alias exists in DB."""
-        # With fake DAL mock, alias lookup succeeds and returns expanded text
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!greet penguin"))
-        # The greet alias should be expanded with the args
-        assert result is not None
-        assert "hello" in result.payload["text"]
-
-    async def test_preserves_channel_id_on_response(self) -> None:
-        """Channel ID should be preserved in response event."""
-        # For alias management commands
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list", channel_id="chan-42"))
-        assert result is not None
-        assert result.payload["channel_id"] == "chan-42"
-
-    async def test_preserves_other_payload_fields(self) -> None:
-        """Other payload fields should be preserved."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list", extra="keep-me"))
-        assert result is not None
-        assert result.payload["extra"] == "keep-me"
-
-    async def test_original_event_not_mutated(self) -> None:
-        """`PlatformEvent` is frozen -- transform must return a new instance."""
-        event = _event("!alias list")
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(event)
-        assert result is not event
-        assert event.payload["text"] == "!alias list"
-
-
-class TestTransformAliasCommands:
-    """Test alias management commands (!alias add/list/delete)."""
-
-    async def test_alias_list_without_db(self) -> None:
-        """!alias list returns list or not-found message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
-        assert result is not None
-        assert isinstance(result.payload["text"], str)
-
-    async def test_alias_add_without_args_returns_usage(self) -> None:
-        """!alias add without args should return usage message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add"))
-        assert result is not None
-        assert "Usage" in result.payload["text"]
-
-    async def test_alias_add_with_one_arg_returns_usage(self) -> None:
-        """!alias add <name> without <command> should return usage message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add greet"))
-        assert result is not None
-        assert "Usage" in result.payload["text"]
-
-    async def test_alias_delete_without_args_returns_usage(self) -> None:
-        """!alias delete without args should return usage message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete"))
-        assert result is not None
-        assert "Usage" in result.payload["text"]
-
-    async def test_invalid_alias_name_rejected(self) -> None:
-        """Alias names with invalid characters should be rejected."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add greet@me hello"))
-        assert result is not None
-        assert "Invalid alias name" in result.payload["text"]
-
-    async def test_unknown_subcommand_returns_error(self) -> None:
-        """Unknown !alias subcommand should return error message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias invalid"))
-        assert result is not None
-        assert "Unknown alias command" in result.payload["text"]
-
-    async def test_case_insensitive_alias_commands(self) -> None:
-        """!alias commands should be case-insensitive."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!ALIAS LIST"))
-        assert result is not None
-        # Response should be a list or no aliases message
-        assert isinstance(result.payload["text"], str)
-
-
-class TestTransformAliasDBOperations:
-    """Test alias DB operations: add, delete, list with actual queries."""
-
-    async def test_alias_add_with_db_stores_alias(self, _dal: _FakeDal) -> None:
-        """!alias add <name> <cmd> should insert into DB."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add newcmd hello {user}"))
-        assert result is not None
-        assert "newcmd" in result.payload["text"]
-        # Should indicate success or at least handle the add command
-        assert len(result.payload["text"]) > 0
-
-    async def test_alias_delete_with_db_removes_alias(self, _dal: _FakeDal) -> None:
-        """!alias delete <name> should soft-delete (set deleted_at)."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
-        assert result is not None
-        # Should return a response (either deleted or error message)
-        assert len(result.payload["text"]) > 0
-
-    async def test_alias_list_with_db_returns_aliases(self, _dal: _FakeDal) -> None:
-        """!alias list should query DB and return alias list."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
-        assert result is not None
-        assert isinstance(result.payload["text"], str)
-        # Should either show aliases or "No aliases" message
-        assert len(result.payload["text"]) > 0
-
-    async def test_alias_invocation_expands_with_variable_substitution(
-        self, _dal: _FakeDal
-    ) -> None:
-        """!greet user should expand variables in alias target command."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet alice"))
-        # The alias in _FakeDal has target_command "hello {user}"
-        # Since actor is "penguin" in _event, {user} should expand to that
-        # Result might be None if the mock doesn't return the alias, which is ok
-        # Just verify we attempted expansion
-
-    async def test_alias_invocation_increments_usage_count(self, _dal: _FakeDal) -> None:
-        """Calling an alias should increment its usage_count."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet"))
-        # After the invocation, usage_count should be incremented (verified via fake DAL)
-        # Just verify the call was processed without error
-
-    async def test_alias_add_with_special_characters_rejected(self) -> None:
-        """Alias names with special characters (except _) should be rejected."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add greet@cmd hello"))
-        assert result is not None
-        assert "Invalid alias name" in result.payload["text"]
-
-    async def test_alias_name_validation_allows_underscore(self) -> None:
-        """Alias names with underscores should be valid."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add my_greet hello"))
-        assert result is not None
-        # Should create or succeed validation (not show "Invalid")
-        assert "Invalid" not in result.payload["text"] or "created" in result.payload["text"]
-
-    async def test_alias_add_max_length_enforcement(self) -> None:
-        """Alias names over 30 chars should be rejected."""
-        long_name = "a" * 31
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event(f"!alias add {long_name} hello"))
-        assert result is not None
-        assert "Invalid alias name" in result.payload["text"]
-
-    async def test_alias_delete_not_found_returns_message(self) -> None:
-        """!alias delete <nonexistent> should return not found message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete nonexistent"))
-        assert result is not None
-        # Should return a response (either not found or error)
-        assert len(result.payload["text"]) > 0
-
-    async def test_alias_list_builds_response_from_aliases(self, _dal: _FakeDal) -> None:
-        """!alias list should build response text with alias details."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
-        assert result is not None
-        text = result.payload["text"]
-        # Should be a string (either list or no aliases message)
-        assert isinstance(text, str)
-        # Should build proper response (with aliases or empty message)
-        assert len(text) > 0
-
-    async def test_alias_expansion_with_args_substitution(self, _dal: _FakeDal) -> None:
-        """Expanded alias should substitute {args} and {arg1}/{arg2}."""
-        # When !greet is called with args, it should expand variables
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet arg1 arg2"))
-        # Just verify the call doesn't error out
-
-    async def test_alias_valid_name_accepts_all_valid_chars(self) -> None:
-        """Valid alias names should include a-z, A-Z, 0-9, and underscore."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add valid_name_123 hello"))
-        assert result is not None
-        # Should not show "Invalid" error
-        assert "created" in result.payload["text"] or "could not" not in result.payload["text"]
-
-    async def test_alias_delete_soft_delete_sets_deleted_at(self) -> None:
-        """Deleting an alias should set deleted_at (soft delete)."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
-        assert result is not None
-        # Response should acknowledge the delete attempt
-        assert len(result.payload["text"]) > 0
-
-
-class TestTransformExpansion:
-    """Test alias expansion and variable substitution edge cases."""
-
-    async def test_alias_expansion_returns_none_if_not_found(self, _dal: _FakeDal) -> None:
-        """Expanding a non-existent alias should return None."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            # Try to invoke an alias that doesn't exist
-            result = await transform(_event("!notarealalias test"))
-        # Should return None since alias doesn't exist (fake DAL doesn't have this alias)
-        assert result is None
-
-    async def test_alias_expansion_with_multiple_args(self, _dal: _FakeDal) -> None:
-        """Alias expansion should handle {arg1}, {arg2}, {args}."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet alice bob charlie"))
-        # Just verify it doesn't crash
-
-    async def test_alias_not_matched_returns_none(self) -> None:
-        """Text that doesn't match alias pattern should return None."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("just some text without command"))
-        assert result is None
-
-    async def test_alias_with_no_args_expands_correctly(self, _dal: _FakeDal) -> None:
-        """Alias without args should still expand variables."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet"))
-        # Might return None if mock doesn't work, but shouldn't crash
-
-    async def test_alias_list_empty_returns_no_aliases_message(self, _dal: _FakeDal) -> None:
-        """When no aliases exist, list should return 'No aliases defined' message."""
-        # Modify DAL to return empty list
-        _dal._aliases = {}
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
-        assert result is not None
-        assert "No aliases" in result.payload["text"]
-
-    async def test_alias_expansion_substitutes_user_variable(self, _dal: _FakeDal) -> None:
-        """Alias should substitute {user} with the actor."""
-        # The greet alias has target_command "hello {user}"
-        # Actor in _event is "penguin"
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet"))
-        # Result might be None if expand fails, but if it succeeds, it should have substitution
-
-    async def test_alias_expansion_substitutes_args_variable(self, _dal: _FakeDal) -> None:
-        """Alias should substitute {args} with space-joined arguments."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet arg1 arg2 arg3"))
-        # Just verify it doesn't crash
-
-    async def test_alias_expansion_substitutes_arg1_variable(self, _dal: _FakeDal) -> None:
-        """Alias should substitute {arg1} with first argument."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet first second third"))
-        # Just verify it doesn't crash
-
-    async def test_alias_expansion_substitutes_arg2_variable(self, _dal: _FakeDal) -> None:
-        """Alias should substitute {arg2} with second argument."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet first second"))
-        # Just verify it doesn't crash
-
-    async def test_alias_expansion_updates_usage_count(self, _dal: _FakeDal) -> None:
-        """Calling an alias should increment its usage_count."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            await transform(_event("!greet"))
-        # Usage might be incremented (though mock might not fully simulate this)
-
-    async def test_alias_delete_with_existing_alias_succeeds(self, _dal: _FakeDal) -> None:
-        """Deleting an existing alias should return success message."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
-        assert result is not None
-        # Result should indicate the delete operation was handled
-        assert len(result.payload["text"]) > 0
-
-    async def test_alias_add_handles_db_error(self, _dal: _FakeDal) -> None:
-        """!alias add should handle DB errors gracefully."""
-        _dal.should_error = True
-        _dal.error_message = "Database connection failed"
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add newalias echo hi"))
-        assert result is not None
-        assert "Failed" in result.payload["text"]
-
-    async def test_alias_list_handles_db_error(self, _dal: _FakeDal) -> None:
-        """!alias list should handle DB errors gracefully."""
-        _dal.should_error = True
-        _dal.error_message = "Database connection failed"
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
-        assert result is not None
-        assert "Failed" in result.payload["text"]
-
-    async def test_alias_delete_handles_db_error(self, _dal: _FakeDal) -> None:
-        """!alias delete should handle DB errors gracefully."""
-        _dal.should_error = True
-        _dal.error_message = "Database connection failed"
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
-        assert result is not None
-        assert "Failed" in result.payload["text"]
-
-    async def test_alias_expansion_handles_db_error(self, _dal: _FakeDal) -> None:
-        """Alias expansion should handle DB errors gracefully and return None."""
-        _dal.should_error = True
-        _dal.error_message = "Database connection failed"
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!greet alice"))
-        # On DB error, expansion returns None and transform returns None
-        assert result is None
-
-
-class TestTransformEdgeCases:
-    """Test edge cases and error handling."""
+        assert await _run("greet penguin") is None
 
     async def test_missing_text_raises(self) -> None:
-        """Missing text field should raise ValueError."""
         event = PlatformEvent(
-            platform="discord",
-            event_type="message",
-            actor=None,
-            payload={"channel_id": "123"},
-            occurred_at="2026-01-01T00:00:00+00:00",
+            platform="discord", event_type="message", actor=None, payload={}, occurred_at="x"
         )
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             with pytest.raises(ValueError, match="text"):
                 await transform(event)
 
     async def test_empty_text_raises(self) -> None:
-        """Empty text should raise ValueError."""
         event = PlatformEvent(
             platform="discord",
             event_type="message",
             actor=None,
-            payload={"text": "", "channel_id": "123"},
-            occurred_at="2026-01-01T00:00:00+00:00",
+            payload={"text": ""},
+            occurred_at="x",
         )
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             with pytest.raises(ValueError, match="text"):
                 await transform(event)
 
     async def test_text_is_not_string_raises(self) -> None:
-        """Non-string text should raise ValueError."""
         event = PlatformEvent(
             platform="discord",
             event_type="message",
             actor=None,
-            payload={"text": 123, "channel_id": "123"},
-            occurred_at="2026-01-01T00:00:00+00:00",
+            payload={"text": 123},
+            occurred_at="x",
         )
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             with pytest.raises(ValueError, match="text"):
                 await transform(event)
 
     async def test_whitespace_only_text_raises(self) -> None:
-        """Whitespace-only text should raise ValueError."""
         event = PlatformEvent(
             platform="discord",
             event_type="message",
             actor=None,
-            payload={"text": "   ", "channel_id": "123"},
-            occurred_at="2026-01-01T00:00:00+00:00",
+            payload={"text": "   "},
+            occurred_at="x",
         )
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
             with pytest.raises(ValueError, match="text"):
                 await transform(event)
 
-    async def test_strips_leading_trailing_whitespace(self) -> None:
-        """Text should be stripped of leading/trailing whitespace."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("  !alias list  "))
+
+class TestList:
+    async def test_bare_alias_lists(self) -> None:
+        result = await _run("!alias")
         assert result is not None
-        # The response should be processed (not the original whitespaced text)
+        assert result.payload["text"] == "aliases: !greet → !hello {user} {args}"
+
+    async def test_alias_list_word_lists(self) -> None:
+        result = await _run("!alias list")
+        assert result is not None
+        assert result.payload["text"] == "aliases: !greet → !hello {user} {args}"
+
+    async def test_list_case_insensitive(self) -> None:
+        result = await _run("!ALIAS LIST")
+        assert result is not None
+        assert result.payload["text"] == "aliases: !greet → !hello {user} {args}"
+
+    async def test_list_empty_returns_no_aliases_message(self, _dal: _FakeDal) -> None:
+        _dal._aliases = {}
+        result = await _run("!alias list")
+        assert result is not None
+        assert result.payload["text"] == _NO_ALIASES_MSG
+
+    async def test_list_sorted_and_truncated_past_15(self, _dal: _FakeDal) -> None:
+        _dal._aliases = {
+            i: {
+                "id": i,
+                "community_id": 1,
+                "alias": f"a{i:02d}",
+                "target_command": "ping",
+                "deleted_at": None,
+                "usage_count": 0,
+            }
+            for i in range(20)
+        }
+        result = await _run("!alias list")
+        assert result is not None
+        text = result.payload["text"]
+        assert text.startswith("aliases: !a00 → !ping, !a01 → !ping")
+        assert text.endswith("…and 5 more")
+
+    async def test_list_without_community_returns_guard(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias list", community=None)
+        assert result is not None
+        assert result.payload["text"] == _COMMUNITY_REQUIRED_MSG
+        assert _dal._select_count == 0
+
+    async def test_list_handles_db_error(self, _dal: _FakeDal) -> None:
+        _dal.should_error = True
+        result = await _run("!alias list")
+        assert result is not None
+        assert "Failed to list aliases" in result.payload["text"]
+
+
+class TestSetAlias:
+    async def test_positional_set_success(
+        self, _dal: _FakeDal, _invalidate_calls: list[Any]
+    ) -> None:
+        result = await _run("!alias newcmd echo hi there")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi there"
+        assert _invalidate_calls == [(1, "newcmd")]
+
+    async def test_add_synonym_success(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias add newcmd echo hi there")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi there"
+
+    async def test_set_lowercases_name(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias NewCmd echo hi")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi"
+
+    async def test_set_overwrites_existing_active_alias(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias greet echo hi")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !greet → !echo hi"
+        assert _dal._aliases[1]["target_command"] == "echo hi"
+
+    async def test_set_revives_soft_deleted_alias(self, _dal: _FakeDal) -> None:
+        _dal._aliases[1]["deleted_at"] = "2026-01-01T00:00:00+00:00"
+        result = await _run("!alias greet echo hi")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !greet → !echo hi"
+        assert _dal._aliases[1]["deleted_at"] is None
+
+    async def test_missing_args_add_only_returns_usage(self) -> None:
+        result = await _run("!alias add")
+        assert result is not None
+        assert result.payload["text"] == _ALIAS_USAGE
+
+    async def test_missing_expansion_positional_returns_usage(self) -> None:
+        result = await _run("!alias newcmd")
+        assert result is not None
+        assert result.payload["text"] == _ALIAS_USAGE
+
+    async def test_missing_expansion_add_returns_usage(self) -> None:
+        result = await _run("!alias add newcmd")
+        assert result is not None
+        assert result.payload["text"] == _ALIAS_USAGE
+
+    async def test_invalid_name_rejected(self) -> None:
+        result = await _run("!alias greet@me echo hi")
+        assert result is not None
+        assert "alias names are letters, numbers, - and _ (max 32)" in result.payload["text"]
+
+    async def test_name_allows_hyphen_and_underscore(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias my-new_cmd echo hi")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !my-new_cmd → !echo hi"
+
+    async def test_name_too_long_rejected(self) -> None:
+        long_name = "a" * 33
+        result = await _run(f"!alias {long_name} echo hi")
+        assert result is not None
+        assert "alias names are letters, numbers, - and _ (max 32)" in result.payload["text"]
+
+    async def test_name_at_max_length_accepted(self, _dal: _FakeDal) -> None:
+        max_name = "a" * 32
+        result = await _run(f"!alias {max_name} echo hi")
+        assert result is not None
+        assert result.payload["text"] == f"alias set: !{max_name} → !echo hi"
+
+    async def test_name_equal_to_bot_command_rejected(self) -> None:
+        result = await _run("!alias ping echo hi")
+        assert result is not None
+        assert result.payload["text"] == "!ping is a built-in command and can't be aliased"
+
+    async def test_name_equal_to_feature_command_rejected(self) -> None:
+        result = await _run("!alias poll echo hi")
+        assert result is not None
+        assert result.payload["text"] == "!poll is a built-in command and can't be aliased"
+
+    async def test_expansion_starting_with_alias_rejected(self) -> None:
+        result = await _run("!alias newcmd alias list")
+        assert result is not None
+        assert result.payload["text"] == "an alias can't run !alias"
+
+    async def test_expansion_starting_with_unalias_rejected(self) -> None:
+        result = await _run("!alias newcmd unalias greet")
+        assert result is not None
+        assert result.payload["text"] == "an alias can't run !alias"
+
+    async def test_expansion_unknown_command_rejected(self) -> None:
+        result = await _run("!alias newcmd totallymadeupword foo")
+        assert result is not None
+        assert result.payload["text"] == "unknown command: totallymadeupword"
+
+    async def test_expansion_flattens_existing_alias(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias b greet extra")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !b → !hello {user} {args} extra"
+
+    async def test_expansion_flattens_existing_alias_no_trailing_args(self, _dal: _FakeDal) -> None:
+        """`!alias b greet` (no trailing args) flattens to `greet`'s own target verbatim."""
+        result = await _run("!alias b greet")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !b → !hello {user} {args}"
+
+    async def test_expansion_too_long_rejected(self) -> None:
+        long_expansion = "echo " + ("a" * 250)
+        result = await _run(f"!alias newcmd {long_expansion}")
+        assert result is not None
+        assert "too long" in result.payload["text"]
+
+    async def test_set_without_community_returns_guard(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias newcmd echo hi", community=None)
+        assert result is not None
+        assert result.payload["text"] == _COMMUNITY_REQUIRED_MSG
+        assert 2 not in _dal._aliases
+
+    async def test_set_handles_db_error(self, _dal: _FakeDal) -> None:
+        _dal.should_error = True
+        result = await _run("!alias newcmd echo hi")
+        assert result is not None
+        assert "Failed to set alias" in result.payload["text"]
+
+
+class TestRemoveAlias:
+    async def test_unalias_success(self, _dal: _FakeDal, _invalidate_calls: list[Any]) -> None:
+        result = await _run("!unalias greet")
+        assert result is not None
+        assert result.payload["text"] == "alias removed: !greet"
+        assert _dal._aliases[1]["deleted_at"] is not None
+        assert _invalidate_calls == [(1, "greet")]
+
+    async def test_alias_delete_success(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias delete greet")
+        assert result is not None
+        assert result.payload["text"] == "alias removed: !greet"
+        assert _dal._aliases[1]["deleted_at"] is not None
+
+    async def test_alias_remove_success(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias remove greet")
+        assert result is not None
+        assert result.payload["text"] == "alias removed: !greet"
+        assert _dal._aliases[1]["deleted_at"] is not None
+
+    async def test_unalias_not_found(self, _dal: _FakeDal) -> None:
+        result = await _run("!unalias nosuchalias")
+        assert result is not None
+        assert result.payload["text"] == "no alias named !nosuchalias"
+
+    async def test_unalias_missing_name_returns_usage(self) -> None:
+        result = await _run("!unalias")
+        assert result is not None
+        assert result.payload["text"] == _ALIAS_USAGE
+
+    async def test_alias_delete_missing_name_returns_usage(self) -> None:
+        result = await _run("!alias delete")
+        assert result is not None
+        assert result.payload["text"] == _ALIAS_USAGE
+
+    async def test_unalias_without_community_returns_guard(self, _dal: _FakeDal) -> None:
+        result = await _run("!unalias greet", community=None)
+        assert result is not None
+        assert result.payload["text"] == _COMMUNITY_REQUIRED_MSG
+        assert _dal._aliases[1]["deleted_at"] is None
+
+    async def test_unalias_handles_db_error(self, _dal: _FakeDal) -> None:
+        _dal.should_error = True
+        result = await _run("!unalias greet")
+        assert result is not None
+        assert "Failed to remove alias" in result.payload["text"]
+
+
+class TestPermissions:
+    async def test_set_denied_for_non_moderator(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias newcmd echo hi", actor=NON_MOD_ACTOR)
+        assert result is not None
+        assert result.payload["text"] == _PERMISSION_DENIED_MSG
+        assert 2 not in _dal._aliases
+
+    async def test_unalias_denied_for_non_moderator(self, _dal: _FakeDal) -> None:
+        result = await _run("!unalias greet", actor=NON_MOD_ACTOR)
+        assert result is not None
+        assert result.payload["text"] == _PERMISSION_DENIED_MSG
+        assert _dal._aliases[1]["deleted_at"] is None
+
+    async def test_set_denied_when_role_lookup_errors_fail_closed(self, _dal: _FakeDal) -> None:
+        _dal.should_error_on_role_lookup = True
+        result = await _run("!alias newcmd echo hi")
+        assert result is not None
+        assert result.payload["text"] == _PERMISSION_DENIED_MSG
+
+    async def test_set_allowed_by_platform_user_id_match(self, _dal: _FakeDal) -> None:
+        _dal.roles_by_platform_user_id["plat-42"] = "admin"
+        result = await _run("!alias newcmd echo hi", actor=NON_MOD_ACTOR, author_id="plat-42")
+        assert result is not None
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi"
+
+    async def test_list_does_not_require_permission(self, _dal: _FakeDal) -> None:
+        result = await _run("!alias list", actor=NON_MOD_ACTOR)
+        assert result is not None
+        assert result.payload["text"] != _PERMISSION_DENIED_MSG
+
+
+class TestInvocation:
+    async def test_bare_alias_invocation_returns_none_no_expansion(self, _dal: _FakeDal) -> None:
+        """Bare `!greet alice` returns None -- expansion is handled by bot_process, not here."""
+        result = await _run("!greet alice")
+        assert result is None
+        # Verify no database lookup occurred
+        assert _dal._select_count == 0
+        # Verify usage count didn't increment (no DB access)
+        assert _dal._aliases[1]["usage_count"] == 5
+
+    async def test_unknown_bang_word_returns_none_no_lookup(self, _dal: _FakeDal) -> None:
+        """Unknown bang-words like `!sr foo` return None with no DB lookup."""
+        result = await _run("!sr foo")
+        assert result is None
+        assert _dal._select_count == 0
+
+    async def test_unknown_alias_returns_none(self) -> None:
+        """Unknown alias `!notarealalias` returns None."""
+        assert await _run("!notarealalias test") is None
+
+    async def test_invocation_without_community_returns_none_no_query(self, _dal: _FakeDal) -> None:
+        """Bare invocation without community context returns None without query."""
+        result = await _run("!greet alice", community=None)
+        assert result is None
+        assert _dal._select_count == 0
+
+    async def test_bare_invocation_no_db_access_on_error(self, _dal: _FakeDal) -> None:
+        """Bare invocation doesn't access DB even if it errors, so DB error is never hit."""
+        _dal.should_error = True
+        result = await _run("!greet alice")
+        # No DB access means no error can occur
+        assert result is None
+        assert _dal._select_count == 0
+
+    async def test_preserves_channel_id_on_response(self) -> None:
+        result = await _run("!alias list", channel_id="chan-42")
+        assert result is not None
+        assert result.payload["channel_id"] == "chan-42"
+
+    async def test_preserves_other_payload_fields(self) -> None:
+        result = await _run("!alias list", extra="keep-me")
+        assert result is not None
+        assert result.payload["extra"] == "keep-me"
+
+    async def test_original_event_not_mutated(self) -> None:
+        event = _event("!alias list")
+        with bundle_context(tenant=TENANT, community=COMMUNITY, app_id=APP_ID):
+            result = await transform(event)
+        assert result is not event
+        assert event.payload["text"] == "!alias list"
+
+    async def test_strips_leading_trailing_whitespace(self) -> None:
+        result = await _run("  !alias list  ")
+        assert result is not None
         assert result.payload["text"] != "  !alias list  "
 
-    async def test_actor_defaults_to_unknown(self) -> None:
-        """Actor should default to 'unknown' if not provided."""
-        event = _event("!alias list")
-        event = PlatformEvent(
-            platform=event.platform,
-            event_type=event.event_type,
-            actor=None,  # Explicitly None
-            payload=event.payload,
-            occurred_at=event.occurred_at,
-        )
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(event)
+    async def test_actor_none_defaults_gracefully(self) -> None:
+        result = await _run("!alias list", actor=None)
         assert result is not None
-        # Should not crash, command should process
         assert isinstance(result.payload["text"], str)
 
 
-class TestTransformCrossCommunityIsolation:
-    """Regression: cross-community alias IDOR.
-
-    An alias created in one community must never be listed, expanded, or
-    mutated from another.
-    """
+class TestCrossCommunityIsolation:
+    """Regression: cross-community alias IDOR -- unchanged from prior behavior."""
 
     async def test_alias_not_listed_from_other_community(self, _dal: _FakeDal) -> None:
         # regression: cross-community alias IDOR
-        """`greet` belongs to community 1 -- listing from community 2 must not surface it."""
-        with bundle_context(tenant="acme", community="2", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
+        result = await _run("!alias list", community=COMMUNITY_2)
         assert result is not None
         assert "greet" not in result.payload["text"]
-        assert "No aliases" in result.payload["text"]
+        assert result.payload["text"] == _NO_ALIASES_MSG
 
     async def test_alias_still_listed_from_its_own_community(self, _dal: _FakeDal) -> None:
         # regression: cross-community alias IDOR
-        """Sanity check: `greet` is still listed from its own community (1)."""
-        with bundle_context(tenant="acme", community="1", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
+        result = await _run("!alias list", community=COMMUNITY)
         assert result is not None
         assert "greet" in result.payload["text"]
 
     async def test_alias_not_expanded_from_other_community(self, _dal: _FakeDal) -> None:
         # regression: cross-community alias IDOR
-        """`!greet` invoked from community 2 must not expand community 1's alias."""
-        with bundle_context(tenant="acme", community="2", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!greet penguin"))
+        result = await _run("!greet penguin", community=COMMUNITY_2)
         assert result is None
 
     async def test_alias_not_deletable_from_other_community(self, _dal: _FakeDal) -> None:
         # regression: cross-community alias IDOR
-        """`!alias delete greet` from community 2 must not delete community 1's alias."""
-        with bundle_context(tenant="acme", community="2", app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
+        result = await _run("!unalias greet", community=COMMUNITY_2)
         assert result is not None
-        assert "not found" in result.payload["text"]
-        assert _dal._aliases[1]["deleted_at"] is None  # untouched
+        assert result.payload["text"] == "no alias named !greet"
+        assert _dal._aliases[1]["deleted_at"] is None
 
 
-class TestTransformRequiresCommunityContext:
-    """Regression: cross-community alias IDOR.
+class TestInvalidateAliasCacheGuard:
+    async def test_missing_module_logs_debug_and_write_still_succeeds(
+        self, _dal: _FakeDal, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`import services.command_alias_store` failing must never block a write."""
 
-    A missing community context (tenant-wide activation) must be
-    rejected/no-op, never fall back to querying community_id == 0.
-    """
+        def _raise_import_error(name: str) -> Any:
+            raise ImportError(f"No module named {name!r}")
 
-    async def test_list_without_community_returns_guard(self, _dal: _FakeDal) -> None:
-        # regression: cross-community alias IDOR
-        with bundle_context(tenant="acme", community=None, app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias list"))
+        monkeypatch.setattr(social_alias_process.importlib, "import_module", _raise_import_error)
+        result = await _run("!alias newcmd echo hi")
         assert result is not None
-        assert "community context" in result.payload["text"]
-        assert _dal._select_count == 0  # no DB query against community 0
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi"
 
-    async def test_add_without_community_returns_guard(self, _dal: _FakeDal) -> None:
-        # regression: cross-community alias IDOR
-        with bundle_context(tenant="acme", community=None, app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias add newcmd hello"))
+    async def test_invalidate_failure_logs_debug_and_write_still_succeeds(
+        self, _dal: _FakeDal, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _boom(*, community_id: int, alias: str, redis_client: Any = None) -> None:
+            raise RuntimeError("redis unreachable")
+
+        monkeypatch.setattr(command_alias_store_module, "invalidate_alias", _boom)
+        result = await _run("!alias newcmd echo hi")
         assert result is not None
-        assert "community context" in result.payload["text"]
-        assert 2 not in _dal._aliases  # insert_async never called
-
-    async def test_delete_without_community_returns_guard(self, _dal: _FakeDal) -> None:
-        # regression: cross-community alias IDOR
-        with bundle_context(tenant="acme", community=None, app_id="waddles.social.alias.default"):
-            result = await transform(_event("!alias delete greet"))
-        assert result is not None
-        assert "community context" in result.payload["text"]
-        assert _dal._select_count == 0  # no DB query against community 0
-
-    async def test_expand_without_community_returns_none(self, _dal: _FakeDal) -> None:
-        # regression: cross-community alias IDOR
-        """Inline `!<alias>` expansion stays silent (None), never errors or leaks."""
-        with bundle_context(tenant="acme", community=None, app_id="waddles.social.alias.default"):
-            result = await transform(_event("!greet penguin"))
-        assert result is None
-        assert _dal._select_count == 0  # no DB query against community 0
+        assert result.payload["text"] == "alias set: !newcmd → !echo hi"
