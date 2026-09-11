@@ -10,6 +10,12 @@ import 'package:flutter/widgets.dart';
 /// [AppLifecycleState.resumed] starts it, every backgrounded state stops
 /// it. [ping] failures are swallowed (never crash the app) and counted
 /// in [failures] for diagnostics.
+///
+/// [_tick] guards against overlap: if a [ping] call is still in flight when
+/// the next timer tick fires, that tick is dropped rather than starting a
+/// second concurrent [ping] — the interval is a floor on ping frequency, not
+/// a strict clock, so a slow ping simply delays the next attempt instead of
+/// stacking calls.
 class KeepaliveScheduler {
   KeepaliveScheduler({
     required Future<void> Function() ping,
@@ -24,6 +30,7 @@ class KeepaliveScheduler {
   final Timer Function(Duration, void Function(Timer)) _periodic;
 
   Timer? _timer;
+  bool _tickInFlight = false;
 
   /// Number of [ping] calls that threw since this scheduler was created.
   int failures = 0;
@@ -59,10 +66,14 @@ class KeepaliveScheduler {
   }
 
   Future<void> _tick() async {
+    if (_tickInFlight) return;
+    _tickInFlight = true;
     try {
       await _ping();
     } catch (_) {
       failures++;
+    } finally {
+      _tickInFlight = false;
     }
   }
 }

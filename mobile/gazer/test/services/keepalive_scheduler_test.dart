@@ -137,4 +137,38 @@ void main() {
       expect(scheduler.isRunning, isTrue);
     },
   );
+
+  test('an in-flight ping is never overlapped by the next tick', () async {
+    var slowPingCalls = 0;
+    final completer = Completer<void>();
+
+    final scheduler = KeepaliveScheduler(
+      ping: () async {
+        slowPingCalls++;
+        await completer.future;
+      },
+      interval: const Duration(minutes: 5),
+      periodic: periodic.call,
+    );
+    scheduler.start();
+
+    // First tick starts the slow ping and leaves it in flight.
+    periodic.tick();
+    await Future<void>.delayed(Duration.zero);
+    expect(slowPingCalls, 1);
+
+    // A second tick while the first ping is still pending must be dropped.
+    periodic.tick();
+    await Future<void>.delayed(Duration.zero);
+    expect(slowPingCalls, 1);
+
+    // Resolving the pending ping clears the in-flight guard.
+    completer.complete();
+    await Future<void>.delayed(Duration.zero);
+
+    // A third tick, now that nothing is in flight, starts a new ping.
+    periodic.tick();
+    await Future<void>.delayed(Duration.zero);
+    expect(slowPingCalls, 2);
+  });
 }
