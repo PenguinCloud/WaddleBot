@@ -489,6 +489,13 @@ jobs:
         # (actions/runner-images installs it under $ANDROID_HOME but only adds ANDROID_HOME/
         # ANDROID_SDK_ROOT to the environment, not this subdirectory to PATH). Resolve the
         # binary's full path explicitly instead of relying on PATH.
+        # Fix round 2: `yes | sdkmanager --licenses` under `set -o pipefail` always fails --
+        # sdkmanager stops reading and closes stdin once licenses are accepted, so `yes`
+        # (which never terminates on its own) is killed by SIGPIPE (exit 141); pipefail then
+        # reports the whole pipeline as failed even though sdkmanager itself exited 0. Check
+        # sdkmanager's own exit status via PIPESTATUS instead of the pipeline's aggregate one
+        # (critical-rules.md Verification Integrity: never read $? after a pipe -- but here
+        # the correct fix is to check the LAST command's status via PIPESTATUS, not mask it).
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME/ANDROID_SDK_ROOT not set by runner image}}"
@@ -498,7 +505,14 @@ jobs:
             find "${SDK_ROOT}/cmdline-tools" -maxdepth 2 -name sdkmanager 2>/dev/null || true
             exit 1
           fi
+          set +e
           yes | "${SDKMANAGER}" --licenses > /dev/null
+          LICENSE_STATUS="${PIPESTATUS[1]}"
+          set -e
+          if [ "${LICENSE_STATUS}" -ne 0 ]; then
+            echo "::error::sdkmanager --licenses failed with exit ${LICENSE_STATUS}" >&2
+            exit "${LICENSE_STATUS}"
+          fi
           "${SDKMANAGER}" \
             "platforms;android-34" \
             "platforms;android-35" \
