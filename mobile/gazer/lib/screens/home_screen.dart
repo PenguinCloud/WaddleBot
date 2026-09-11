@@ -155,7 +155,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                           devices: devices,
                           flags: flags,
                           orientation:
-                              MediaQuery.of(context).orientation ==
+                              MediaQuery.orientationOf(context) ==
                                   Orientation.portrait
                               ? OutputOrientation.portrait
                               : OutputOrientation.landscape,

@@ -160,6 +160,62 @@ void main() {
     expect(hostApi.stopCallCount, 1);
   });
 
+  testWidgets(
+    'a retryable error enters ReconnectingState; Stop cancels back to Idle',
+    (WidgetTester tester) async {
+      await pumpGazerApp(
+        tester,
+        overrides: overrides(license: license(flagsSet: true)),
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Go Live'));
+      await tester.pumpAndSettle();
+      // rtmpConnectFailed is retryable (reconnect_policy.dart's shouldRetry
+      // table), so the controller emits a transient ReconnectingState and
+      // schedules a retry after ReconnectPolicy's backoff delay. A single
+      // `pump()` — not `pumpAndSettle()` — rebuilds the tree from that
+      // synchronous state push without elapsing the fake clock far enough
+      // to fire the pending retry timer, so the assertions below observe
+      // ReconnectingState itself rather than whatever it retries into.
+      await tester.runAsync(
+        () => hostApi.emitState(
+          NativePipelineState.error,
+          error: GazerErrorCode.rtmpConnectFailed,
+        ),
+      );
+      // Several zero-duration pumps (never advancing the fake clock) drain
+      // every microtask hop between the bridge event and the rebuilt
+      // widget tree: NativeEventBridge -> PipelineController._emit ->
+      // pipelineStateProvider's `async*` forwarding -> Riverpod's
+      // AsyncValue notification -> ConsumerState.markNeedsBuild.
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      expect(find.widgetWithText(FilledButton, 'Stop'), findsOneWidget);
+      expect(find.widgetWithText(FilledButton, 'Go Live'), findsNothing);
+      expect(find.text('Reconnecting'), findsOneWidget);
+      final Chip chip = tester.widget<Chip>(find.byType(Chip));
+      expect(chip.backgroundColor, Colors.orange);
+
+      // Stop sets the controller's `_cancelled` flag synchronously, so the
+      // pending retry (whose timer this settle does elapse) sees it and
+      // no-ops instead of re-emitting Connecting — see
+      // PipelineController._retryAfter.
+      await tester.tap(find.widgetWithText(FilledButton, 'Stop'));
+      await tester.pumpAndSettle();
+      expect(find.widgetWithText(FilledButton, 'Go Live'), findsOneWidget);
+      expect(find.widgetWithText(FilledButton, 'Stop'), findsNothing);
+      expect(find.text('Idle'), findsOneWidget);
+
+      // `pumpAndSettle` only drains scheduled frames, not timers — Stop
+      // produces no further frame once Idle renders, so the ~1s retry
+      // timer from the earlier reconnect attempt is still pending. Elapse
+      // the fake clock past it so it fires (a no-op, since `_cancelled` is
+      // now true) before teardown; otherwise flutter_test's end-of-test
+      // invariant check flags it as a leaked pending Timer.
+      await tester.pump(const Duration(seconds: 2));
+    },
+  );
+
   testWidgets('selecting a different source is used by the next Go Live', (
     WidgetTester tester,
   ) async {
