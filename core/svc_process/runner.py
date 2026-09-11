@@ -60,6 +60,30 @@ applies a reputation hit (`core/reputation_module`'s already-fixed gh #299
 one of its own failure modes (flag check, DB read, classifier, reputation
 write) is caught internally and never propagates here, so it can never be
 the reason a message fails to reach `transform_fn`.
+
+Community resolution (gh #311): a tenant-wide (`community=None`) envelope
+no longer maps unconditionally to `Config.DEMO_ACTIVITY_COMMUNITY_ID` --
+`services.community_resolver.resolve_community` is consulted first (per-
+user override -> channel primary -> demo shim -> none), controlled by
+`Config.COMMUNITY_RESOLUTION_ENABLED` (default on; `false` restores the
+prior unconditional shim with no lookup at all). An envelope that already
+carries a real community is never looked up. Landing on the demo-shim
+source logs one WARN per process lifetime (`_warn_demo_shim_once`), not
+per event.
+
+Ordinary-activity reputation accrual (gh #310): after a successful
+(non-raising) transform of an INBOUND `event_type == "message"` event,
+`services.activity_accrual.record_activity` (imported here as
+`accrue_activity` -- `services.activity_feed.record_activity`, the board-
+demo telemetry writer above, already owns the bare name) is awaited
+best-effort to credit the acting user's community reputation --
+`command_usage` for a bot-prefixed (`!...`) message, `chat_message`
+otherwise. Runs whether or not `transform_fn` produced a reply: ordinary
+chatter with no bot reply is exactly the activity this hook credits.
+Skipped (never guessed) when the resolved community or the platform user
+id can't be determined, and for any non-"message" `event_type` (Twitch
+EventSub follow/subscribe/raid and similar system events are out of scope
+for this positive-accrual path). Never raises into the caller.
 """
 
 from __future__ import annotations
@@ -69,7 +93,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from flask_core import (
     PROCESS_TARGET_APP_ID_KEY,
@@ -87,10 +111,72 @@ from flask_core.stage_runner import (
 from flask_core.stream_pipeline import bundle_stream_key
 
 from config import Config
+from services.activity_accrual import ActivityAccrualResult
+from services.activity_accrual import record_activity as accrue_activity
 from services.activity_feed import record_activity
+from services.community_resolver import resolve_community
 from services.moderation_gate import run_moderation_gate
 
 logger = logging.getLogger(__name__)
+
+_DEMO_SHIM_WARNED = False
+
+
+def _warn_demo_shim_once(community_id: int | None) -> None:
+    """WARN, once per process (not per event), that resolution fell through to the demo shim.
+
+    `resolve_community` itself only WARNs on a genuine lookup FAILURE
+    (rate-limited per `(platform, entity)`); landing on `source=
+    "demo_shim"` is not a failure, it's this runner's own alpha-only
+    fallback -- worth one visible WARN per process lifetime so an operator
+    notices the shim is still load-bearing, without spamming one line per
+    tenant-wide message.
+    """
+    global _DEMO_SHIM_WARNED
+    if not _DEMO_SHIM_WARNED:
+        _DEMO_SHIM_WARNED = True
+        logger.warning("runner.demo_shim_in_use community=%s", community_id)
+
+
+def reset_demo_shim_warned_for_tests() -> None:
+    """Clear the once-per-process demo-shim WARN latch. Test isolation only."""
+    global _DEMO_SHIM_WARNED
+    _DEMO_SHIM_WARNED = False
+
+
+def _resolve_platform_user_id(event: PlatformEvent) -> str | None:
+    """The platform-native user id for community resolution/activity accrual, or `None`.
+
+    Same convention `services/moderation_gate.py::_resolve_platform_user_id`
+    already uses (not imported -- that helper is private to its own
+    module): prefers `payload['author_id']`, falls back to `event.actor`
+    (a display name), `None` only when neither is available.
+    """
+    author_id = event.payload.get("author_id")
+    if isinstance(author_id, str) and author_id:
+        return author_id
+    if event.actor:
+        # `flask_core` ships no py.typed marker (`follow_imports = "skip"`
+        # override in pyproject.toml) -- `event.actor`'s real `str | None`
+        # annotation is invisible to mypy here, `cast` restores it. Same
+        # boundary `services/moderation_gate.py::_resolve_platform_user_id`
+        # already crosses identically.
+        return cast(str, event.actor)
+    return None
+
+
+def _resolve_platform_entity_id(event: PlatformEvent) -> str | None:
+    """The platform-native channel/server id for community resolution, or `None`.
+
+    Same `channel_id or channel_name` normalization `_emit_activity()`
+    (below) and `bundles/community_context_process.py` already use, to
+    reconcile Discord's `channel_id` against Twitch's `channel_name` into
+    one platform-entity identifier.
+    """
+    raw = event.payload.get("channel_id") or event.payload.get("channel_name")
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
 
 
 class ProcessRunner:
@@ -180,19 +266,39 @@ class ProcessRunner:
 
         event_in: PlatformEvent = envelope_in.event
 
-        # DEMO SHIM (board-demo crunch, see gh #298/#295 for the proper fix):
-        # the pipeline runs tenant-wide (`community=None`) today, but the
-        # command-router feature bundles (`bot_process` -> social_quote/
-        # social_alias/community_polls/community_announcements/
-        # community_forums) reject state-changing ops without a community
-        # scope. Map None -> the configured demo community so `!quote add`
-        # etc. work end to end; a real envelope community is never
-        # overridden.
-        community_for_context = (
-            envelope_in.community
-            if envelope_in.community is not None
-            else str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
-        )
+        # Community resolution (gh #311): the pipeline runs tenant-wide
+        # (`community=None`) today, but the command-router feature bundles
+        # (`bot_process` -> social_quote/social_alias/community_polls/
+        # community_announcements/community_forums) reject state-changing
+        # ops without a community scope. An envelope that already carries a
+        # real community is never overridden -- resolution only runs for a
+        # tenant-wide envelope, via `resolve_community`'s per-user ->
+        # per-channel -> demo-shim order. `Config.
+        # COMMUNITY_RESOLUTION_ENABLED=false` restores the prior
+        # unconditional demo-shim mapping with no lookup at all (an
+        # operational escape hatch, not expected in normal operation).
+        community_for_context: str | None
+        if envelope_in.community is not None:
+            community_for_context = envelope_in.community
+        elif Config.COMMUNITY_RESOLUTION_ENABLED:
+            resolved = await resolve_community(
+                platform=event_in.platform,
+                platform_user_id=_resolve_platform_user_id(event_in),
+                platform_entity_id=_resolve_platform_entity_id(event_in),
+                demo_default=Config.DEMO_ACTIVITY_COMMUNITY_ID,
+            )
+            logger.debug(
+                "runner.community_resolved source=%s community=%s",
+                resolved.source,
+                resolved.community_id,
+            )
+            if resolved.source == "demo_shim":
+                _warn_demo_shim_once(resolved.community_id)
+            community_for_context = (
+                str(resolved.community_id) if resolved.community_id is not None else None
+            )
+        else:
+            community_for_context = str(Config.DEMO_ACTIVITY_COMMUNITY_ID)
 
         try:
             with bundle_context(
@@ -222,6 +328,7 @@ class ProcessRunner:
             )
 
         await self._emit_activity(envelope_in, event_in, event_out)
+        await self._accrue_activity(envelope_in, event_in, community_for_context, bundle)
 
         if event_out is None:
             logger.info("process.no_reply app_id=%s", bundle.app_id)
@@ -288,3 +395,89 @@ class ProcessRunner:
             logger.warning(
                 "process.activity_emit_failed app_id=%s error=%s", envelope_in.app_id, exc
             )
+
+    async def _accrue_activity(
+        self,
+        envelope_in: StageEnvelope,
+        event_in: PlatformEvent,
+        community_for_context: str | None,
+        bundle: BundleDistribution,
+    ) -> None:
+        """Best-effort ordinary-activity reputation accrual hook (gh #310).
+
+        Fires once per successfully-transformed INBOUND platform event --
+        `event_in.event_type == "message"` only (a Twitch EventSub follow/
+        subscribe/raid or any other non-chat system event is out of scope
+        for this positive-accrual path, same as `services.activity_accrual`'s
+        own `_SUPPORTED_EVENT_TYPES`). Runs regardless of whether
+        `transform_fn` produced a reply (`event_out`) -- ordinary chatter
+        that gets no bot reply is exactly the activity this hook exists to
+        credit; only a `command_usage` (bot-prefixed) message is expected to
+        usually also enqueue a reply. Skipped, never guessed, when the
+        community or the platform user id can't be resolved.
+
+        Awaited directly, not backgrounded: no fire-and-forget/background-
+        task pattern exists elsewhere in this runner for a per-event side
+        call (`_emit_activity` above is the closest precedent, and it is
+        awaited too) -- `record_activity()` already short-circuits cheaply
+        on a claimed cooldown before it would ever reach the reputation
+        service's HTTP call (`reputation_gate_client.py`'s own 5s
+        `httpx.AsyncClient` timeout). Never raises into the caller --
+        `record_activity()`'s own contract already never raises; this wraps
+        it anyway as defense in depth (mirrors `_emit_activity`'s FAIL-SAFE
+        wrapping above) so a broken test double or future refactor can't
+        turn best-effort telemetry into a pipeline-breaking bug.
+        """
+        if event_in.event_type != "message":
+            logger.debug(
+                "process.activity_accrual_skipped app_id=%s reason=non_message_event_type "
+                "event_type=%s",
+                bundle.app_id,
+                event_in.event_type,
+            )
+            return
+        if community_for_context is None:
+            logger.debug(
+                "process.activity_accrual_skipped app_id=%s reason=no_community", bundle.app_id
+            )
+            return
+        platform_user_id = _resolve_platform_user_id(event_in)
+        if platform_user_id is None:
+            logger.debug(
+                "process.activity_accrual_skipped app_id=%s reason=no_platform_user_id",
+                bundle.app_id,
+            )
+            return
+
+        text = event_in.payload.get("text")
+        accrual_event_type = (
+            "command_usage"
+            if isinstance(text, str) and text.strip().startswith("!")
+            else "chat_message"
+        )
+
+        try:
+            result: ActivityAccrualResult = await accrue_activity(
+                tenant=envelope_in.tenant,
+                community=community_for_context,
+                platform=event_in.platform,
+                platform_user_id=platform_user_id,
+                event_type=accrual_event_type,
+                # No true per-message id exists on the frozen `StageEnvelope`/
+                # `PlatformEvent` contract -- `ts` is the closest available
+                # correlation value; `record_activity()` only carries this
+                # into `metadata['event_id']` for audit/debugging, never as
+                # an idempotency key (the per-user cooldown is that guard).
+                event_id=envelope_in.ts,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort accrual, must never break the pipeline
+            logger.warning("process.activity_accrual_failed app_id=%s error=%s", bundle.app_id, exc)
+            return
+
+        logger.debug(
+            "process.activity_accrual_result app_id=%s applied=%s event_type=%s reason=%s",
+            bundle.app_id,
+            result.applied,
+            result.event_type,
+            result.reason,
+        )

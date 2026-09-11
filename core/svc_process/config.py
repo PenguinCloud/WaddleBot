@@ -106,8 +106,19 @@ class Config:
     #: community -- the pipeline runs tenant-wide/`community=None` today, so
     #: this is the community every `live_activity_events` row lands under
     #: when an envelope carries no community. 4 is the demo "waddlebot"
-    #: community.
+    #: community. Also the `demo_default` passed to `services.
+    #: community_resolver.resolve_community` (see `COMMUNITY_RESOLUTION_
+    #: ENABLED` below).
     DEMO_ACTIVITY_COMMUNITY_ID = int(os.getenv("DEMO_ACTIVITY_COMMUNITY_ID", "4"))
+
+    #: Community resolution (gh #311, `services/community_resolver.py`) --
+    #: default ON. `false` restores the pipeline's prior unconditional
+    #: demo-shim mapping for a tenant-wide (`community=None`) envelope, with
+    #: no per-user/channel lookup at all -- an operational escape hatch, not
+    #: expected to be flipped off in normal operation.
+    COMMUNITY_RESOLUTION_ENABLED = os.getenv(
+        "COMMUNITY_RESOLUTION_ENABLED", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     SECRET_KEY = require_secret_key()
     JWT_SCOPE = "distribution:read"
