@@ -196,7 +196,7 @@ seed-mock-data-mobile: ## Launch Gazer with the mock target/quality preset seede
 		-v gazer-gradle:/home/appuser/.gradle \
 		-w /work \
 		gazer-toolchain:3.47.2 \
-		flutter run --dart-define=GAZER_SEED=true
+		bash -lc "set -euo pipefail; flutter build apk --debug --dart-define=GAZER_SEED=true; flutter run --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk --dart-define=GAZER_SEED=true"
 
 mobile-screenshots: ## Capture the docs/screenshots/gazer/ marketing set from seeded phone + tablet emulators (needs /dev/kvm)
 	@test -e /dev/kvm || { echo "ERROR: /dev/kvm not present - screenshot capture requires KVM"; exit 1; }
