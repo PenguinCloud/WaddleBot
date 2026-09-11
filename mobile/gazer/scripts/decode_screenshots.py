@@ -2,11 +2,15 @@
 """Decode build/integration_response_data.json's embedded screenshots into
 individual PNG files under build/integration_screenshots/.
 
-`flutter test integration_test/<file>.dart -d <device>` writes this JSON
-when the test binding is IntegrationTestWidgetsFlutterBinding; each
+`flutter drive --driver=test_driver/integration_test.dart --target=<file>`
+writes this JSON: integrationDriver()'s default responseDataCallback dumps
+the IntegrationTestWidgetsFlutterBinding's reportData there, and each
 `binding.takeScreenshot(name)` call adds one entry under the top-level
 "screenshots" key, with "screenshotName" and a raw (non-base64) "bytes"
-array of PNG byte values. This script is additive: it never clears
+array of PNG byte values. `flutter test <integration_test/...> -d <device>`
+does NOT write this file -- it bridges only the package:test protocol and
+drops reportData -- so the drive path is required. This script is additive:
+it never clears
 build/integration_screenshots/, so re-running it after a second test run
 (e.g. the tablet pass in Task 26) layers new files in without deleting
 the first run's output.

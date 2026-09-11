@@ -537,25 +537,36 @@ jobs:
           profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -camera-back emulated -camera-front emulated -accel on
           disable-animations: true
-          # Fix round 3: reactivecircus/android-emulator-runner executes `script:` via
-          # /usr/bin/sh (dash), not bash -- `set -o pipefail` is a bash-only extension dash
-          # doesn't recognize ("Illegal option -o pipefail"), unlike the plain `run:` steps
-          # elsewhere in this job/file which do run under bash. Use POSIX `set -eu` only;
-          # pipefail isn't actually needed here since both piped commands below are verified
-          # afterward by grepping their captured log file, not by the pipe's own exit status.
+          # Fix round 4a: the action runs EVERY line of `script:` as its own `sh -c <line>`
+          # subprocess -- src/script-parser.ts's parseScript() splits the input on newlines and
+          # src/main.ts does `for (const script of scripts) await exec.exec('sh', ['-c', script])`.
+          # So neither `cd` nor `set -eu` carried to the next line, and the `\` continuations were
+          # split too: dash turns a dangling trailing `\` into a literal extra argv entry, so
+          # `flutter test <file> -d <dev> \` arrived as TWO test targets, the second one `\` and
+          # therefore outside integration_test/. flutter_tools rejects that mix in
+          # _shouldRunAsIntegrationTests (flutter_tools/lib/src/commands/test.dart:896) with
+          # "Integration tests and unit tests cannot be run in a single invocation" -- raised from
+          # verifyThenRunCommand, i.e. before runCommand's pubspec.yaml check, which is why the
+          # wrong CWD never surfaced as "No pubspec.yaml file found". Fixed by using the action's
+          # own `working-directory` input (main.ts process.chdir()s into it before the script loop)
+          # and keeping every command on exactly one line. Each line is still individually gated:
+          # exec.exec throws on any non-zero exit and the action then calls core.setFailed.
+          # Fix round 4b: `flutter test` can never produce the screenshot artifact -- it bridges
+          # only the package:test protocol and drops the binding's reportData, so
+          # build/integration_response_data.json is never written and takeScreenshot's bytes are
+          # lost. Only `flutter drive` + integrationDriver() writes that file; see
+          # mobile/gazer/test_driver/integration_test.dart.
+          # dash has no `pipefail`, so each pipeline runs under an explicit `bash -eo pipefail`:
+          # flutter's/gradle's own exit status gates the step instead of tee's.
+          working-directory: mobile/gazer
           script: |
-            set -eu
-            adb install -r mobile/gazer/build/app/outputs/flutter-apk/app-debug.apk
+            adb install -r build/app/outputs/flutter-apk/app-debug.apk
             adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
             adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
-            cd mobile/gazer
-            flutter test integration_test/go_live_unreachable_test.dart -d emulator-5554 \
-              --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture \
-              2>&1 | tee /tmp/flutter_integration.log
+            bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart -d emulator-5554 --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
             grep -qE '\+[1-9][0-9]*' /tmp/flutter_integration.log
             python3 scripts/decode_screenshots.py
-            cd android
-            ./gradlew connectedDebugAndroidTest 2>&1 | tee /tmp/gradle_connected.log
+            bash -eo pipefail -c "cd android && ./gradlew connectedDebugAndroidTest 2>&1 | tee /tmp/gradle_connected.log"
             grep -q "BUILD SUCCESSFUL" /tmp/gradle_connected.log
 
       - name: Upload integration screenshots

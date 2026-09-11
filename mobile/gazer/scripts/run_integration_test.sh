@@ -40,7 +40,15 @@ adb install -r build/app/outputs/flutter-apk/app-debug.apk
 adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
 adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
 
-flutter test integration_test/go_live_unreachable_test.dart -d emulator-5554 \
+# `flutter drive`, not `flutter test`: only integrationDriver() (test_driver/
+# integration_test.dart) writes build/integration_response_data.json, which is
+# where binding.takeScreenshot()'s PNG bytes land and what decode_screenshots.py
+# reads. `flutter test <integration_test/...> -d <device>` bridges only the
+# package:test protocol and drops the binding's reportData entirely.
+flutter drive \
+  --driver=test_driver/integration_test.dart \
+  --target=integration_test/go_live_unreachable_test.dart \
+  -d emulator-5554 \
   --dart-define=GAZER_FLAGS_OVERRIDE="$FLAGS_DEFINE" \
   | tee /tmp/integration_test.log
 

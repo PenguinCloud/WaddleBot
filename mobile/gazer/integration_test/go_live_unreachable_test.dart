@@ -101,6 +101,16 @@ void main() {
         findsOneWidget,
       );
 
+      // Android renders Flutter into a SurfaceView the screenshot API cannot
+      // read back, so integration_test's IOCallbackManager throws
+      // `Call convertFlutterSurfaceToImage() before taking a screenshot`
+      // unless the surface is swapped for an ImageView first. The matching
+      // revertFlutterImage is registered by convertFlutterSurfaceToImage
+      // itself via addTearDown. `pump` (not `pumpAndSettle`) drives the frame
+      // into that image: ReconnectPolicy's countdown timer keeps this tree
+      // permanently unsettled, exactly as _pumpUntil's doc comment explains.
+      await binding.convertFlutterSurfaceToImage();
+      await tester.pump(const Duration(milliseconds: 500));
       await binding.takeScreenshot('go-live-unreachable');
 
       // --- Stop cancels the reconnect loop and returns to Idle ---
