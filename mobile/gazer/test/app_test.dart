@@ -9,10 +9,12 @@ import 'package:gazer/providers/connectivity_provider.dart';
 import 'package:gazer/providers/devices_provider.dart';
 import 'package:gazer/providers/license_provider.dart';
 import 'package:gazer/providers/settings_provider.dart';
+import 'package:gazer/providers/telemetry_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
 import 'package:gazer/screens/home_screen.dart';
 import 'package:gazer/screens/settings_screen.dart';
 import 'package:gazer/services/keepalive_scheduler.dart';
+import 'package:gazer/telemetry/telemetry_config.dart';
 
 import 'helpers/fake_host_api.dart';
 import 'helpers/fakes.dart';
@@ -48,6 +50,16 @@ void main() {
     isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
     updateCheckerProvider.overrideWith(
       (Ref ref) async => FakeUpdateChecker(null),
+    ),
+    telemetryConfigProvider.overrideWith(
+      (Ref ref) async => const TelemetryConfig(
+        endpoint: '',
+        protocol: 'http/json',
+        headers: <String, String>{},
+        serviceName: 'gazer',
+        serviceVersion: '0.0.0',
+        deploymentEnvironment: 'test',
+      ),
     ),
   ];
 
