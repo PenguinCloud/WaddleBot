@@ -2,6 +2,10 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+# Webui Configuration
+webui:
+  publicUrl: ""
+
 # Global settings
 global:
   # Container registry for Waddles images
@@ -69,6 +73,9 @@ global:
   # Logging
   logLevel: "INFO"
   nodeEnv: "production"
+
+  # Deployment tier (alpha/beta/production) — used by services for environment-specific behavior
+  deploymentTier: "production"
 
 # Namespace configuration
 namespace: waddlebot
@@ -534,6 +541,18 @@ pipeline:
         cpu: "1000m"
         memory: "1Gi"
 
+# v3.0.x — svc-presentation (8th container, 4th stage-runner). Music overlay + per-community
+# OBS browser-source surfaces. Own image placeholder (core/svc_presentation/ builds with
+# CI once Dockerfile is wired). Image repository structure allows alpha local registry +
+# beta/gamma/prod ghcr.io registry -- see templates/svc-presentation.yaml rendering logic.
+presentation:
+  image:
+    repository: "waddlebot-svc-presentation"
+    tag: ""
+  service:
+    type: ClusterIP
+    nodePort: ""
+
   # v3.0.x — REAL Streaming module control plane + real ffmpeg data plane — see
   # templates/svc-streaming.yaml header and docs/plans/2026-08-31-svc-streaming-design.md.
   # Gated only on `enabled` here (same pattern as svcPresentation), NOT on
@@ -555,6 +574,31 @@ pipeline:
       limits:
         cpu: "2000m"
         memory: "2Gi"
+
+# Reputation service (Issue #310, core/reputation_module) -- standalone internal
+# HTTP+gRPC API, not a pipeline stage-runner. Own image (core/reputation_module/
+# Dockerfile already exists), so reputation.image.repository is a self-contained
+# full path per environment rather than global.imageRegistry concatenation --
+# see templates/reputation.yaml header. Resources match the hubApi/svcCore tier
+# above (lightweight internal API, not a heavy ingest/process/action stage).
+reputation:
+  enabled: true
+  replicas: 1
+  image:
+    repository: "docker.io/waddlebot/reputation-module"
+    tag: ""
+  port: 8021
+  grpcPort: 50021
+  env:
+    deploymentTier: "production"
+    workers: 2
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
 
 # Processing Module
 modules:
@@ -1366,6 +1410,8 @@ oauth:
     apiKey: ""
     clientId: ""
     clientSecret: ""
+    # OAuth refresh token from the one-time consent flow; YouTube Data API v3 search works with either apiKey or clientId+clientSecret+refreshToken
+    refreshToken: ""
     webhookCallbackUrl: ""
   spotify:
     clientId: ""

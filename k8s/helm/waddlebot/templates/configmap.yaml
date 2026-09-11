@@ -87,6 +87,7 @@ data:
   # General Configuration
   LOG_LEVEL: {{ .Values.global.logLevel | quote }}
   NODE_ENV: {{ .Values.global.nodeEnv | quote }}
+  DEPLOYMENT_TIER: {{ .Values.global.deploymentTier | quote }}
   BASE_DOMAIN: {{ .Values.global.baseDomain | quote }}
   OVERLAY_BASE_URL: {{ .Values.global.overlayBaseUrl | quote }}
   OVERLAY_KEY_GRACE_PERIOD_MINUTES: "5"
@@ -98,3 +99,7 @@ data:
   # when posthog.enabled=true and posthog.host is blank, else the external
   # hosted default. See templates/infrastructure/posthog/_helpers.tpl.
   POSTHOG_HOST: {{ include "waddlebot.posthog.effectiveHost" . | quote }}
+
+  # Service Discovery URLs
+  HUB_API_URL: "http://{{ include "waddlebot.fullname" . }}-hub-api-v3:8204"
+  PUBLIC_WEBUI_URL: {{ .Values.webui.publicUrl | quote }}

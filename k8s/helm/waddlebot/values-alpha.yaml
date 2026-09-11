@@ -1,8 +1,12 @@
 ## Waddlebot - Alpha Environment Overrides
+webui:
+  publicUrl: "http://192.168.10.75:30879"  # node LAN IP + hub-webui NodePort — `!sq` links must open off-laptop
+
 global:
   imageRegistry: ""
   imageTag: "alpha"
-  imagePullPolicy: Never
+  imagePullPolicy: IfNotPresent  # Never makes containerd skip localhost:32000 (ErrImageNeverPull) -- images are pushed, not side-loaded
+  deploymentTier: "alpha"
   # gRPC transport TLS (PR #264) -- alpha is single-node local dev with no cert material
   # provisioned, so it uses flask_core's own documented dev-only escape hatch instead of
   # real certs (refused outright under production posture, so this can never leak into
@@ -92,6 +96,28 @@ pipeline:
     resources:
       requests: { cpu: "100m", memory: "128Mi" }
       limits: { cpu: "500m", memory: "512Mi" }
+
+presentation:
+  image:
+    repository: "localhost:32000/waddlebot/svc-presentation"
+    tag: "alpha"
+  service:
+    type: NodePort
+    nodePort: 31032
+
+# Reputation service (Issue #310) -- built locally, pushed to the local
+# registry (no CI image for it yet), same as every other alpha module.
+reputation:
+  replicas: 1
+  image:
+    repository: "localhost:32000/waddlebot/reputation-module"
+    tag: "alpha"
+  env:
+    deploymentTier: "alpha"
+    workers: 1
+  resources:
+    requests: { cpu: "50m", memory: "96Mi" }
+    limits: { cpu: "300m", memory: "256Mi" }
 
 ingress:
   enabled: false

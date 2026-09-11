@@ -49,10 +49,7 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
       - name: svc-presentation
-        # SKELETON PLACEHOLDER — no Dockerfile/CI image exists yet for svc-presentation;
-        # pinned to the repo's existing Python base digest rather than inventing one or
-        # using a mutable tag. Replace once svc-presentation has its own CI build.
-        image: "{{ .Values.pipeline.pythonBaseImage }}"
+        image: "{{ .Values.presentation.image.repository }}:{{ .Values.presentation.image.tag | default .Values.global.imageTag }}"
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}
@@ -105,12 +102,15 @@ metadata:
     {{- include "waddlebot.labels" . | nindent 4 }}
     app.kubernetes.io/component: svc-presentation
 spec:
-  type: ClusterIP
+  type: {{ .Values.presentation.service.type | default "ClusterIP" }}
   ports:
   - port: {{ .Values.pipeline.svcPresentation.port }}
     targetPort: http
     protocol: TCP
     name: http
+    {{- if and (eq (.Values.presentation.service.type | default "ClusterIP") "NodePort") .Values.presentation.service.nodePort }}
+    nodePort: {{ .Values.presentation.service.nodePort }}
+    {{- end }}
   selector:
     {{- include "waddlebot.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: svc-presentation

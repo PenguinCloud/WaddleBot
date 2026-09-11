@@ -2,6 +2,10 @@
 # This file overrides default values for beta cluster deployment
 # Usage: helm upgrade --install waddlebot . -f values.yaml -f values-beta.yaml
 
+# Webui Configuration
+webui:
+  publicUrl: "https://waddlebot.penguintech.cloud"
+
 # Global settings for beta cluster
 global:
   imageRegistry: "ghcr.io/penguintechinc/waddlebot"
@@ -94,6 +98,17 @@ pipeline:
     resources:
       requests: { cpu: "150m", memory: "192Mi" }
       limits: { cpu: "750m", memory: "768Mi" }
+
+# Reputation service (Issue #310) -- CI-built image from ghcr.io, matches
+# modules.hub's beta tier (lightweight internal API).
+reputation:
+  replicas: 1
+  image:
+    repository: "ghcr.io/penguintechinc/waddlebot/reputation-module"
+    tag: ""
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits: { cpu: "500m", memory: "512Mi" }
 
 # PostHog stays OFF by default in beta too — flip on deliberately per
 # release. When enabled, secrets MUST come from a pre-created Secret, never
@@ -734,6 +749,11 @@ httproute:
 # Network Policies — enabled in beta for namespace isolation
 networkPolicy:
   enabled: true
+
+presentation:
+  image:
+    repository: "waddlebot-svc-presentation"
+    tag: "latest"
 
 spire:
   enabled: true
