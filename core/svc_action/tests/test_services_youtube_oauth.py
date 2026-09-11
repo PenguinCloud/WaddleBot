@@ -9,6 +9,8 @@ shape (it never builds its own client, unlike the `hub_api` module).
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -19,6 +21,7 @@ from services.youtube_oauth import (
     YOUTUBE_FORCE_SSL_SCOPE,
     YouTubeOAuthError,
     get_access_token,
+    get_access_token_for_community,
     token_has_scope,
 )
 
@@ -224,3 +227,145 @@ class TestTokenHasScope:
         async with _client(handler) as client:
             with pytest.raises(YouTubeOAuthError, match="tokeninfo lookup failed"):
                 await token_has_scope(client, "at-8", YOUTUBE_FORCE_SSL_SCOPE)
+
+
+@dataclass(slots=True, frozen=True)
+class _FakeCommunityTokens:
+    """Local stand-in for `waddle_transports.community_credentials.CommunityTokens`.
+
+    Not imported from `waddle_transports` -- that module is landing
+    concurrently (gh-320) and may not exist on disk yet; this mirrors the
+    contract's documented field shape exactly enough for
+    `get_access_token_for_community`'s own `tokens.source`/
+    `tokens.access_token` attribute reads.
+    """
+
+    access_token: str | None
+    refresh_token: str | None
+    expires_at: datetime | None
+    scopes: list[str]
+    source: str
+
+
+class TestGetAccessTokenForCommunity:
+    """`get_access_token_for_community()` -- community-token-first, env-refresh fallback."""
+
+    async def test_community_source_returns_its_token_without_refresh_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        refresh_called = False
+
+        async def fake_resolve(community_id: int | None, provider: str) -> _FakeCommunityTokens:
+            assert community_id == 42
+            assert provider == "youtube"
+            return _FakeCommunityTokens(
+                access_token="community-access-token",
+                refresh_token=None,
+                expires_at=None,
+                scopes=[YOUTUBE_FORCE_SSL_SCOPE],
+                source="community",
+            )
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal refresh_called
+            refresh_called = True
+            return httpx.Response(200, json=_token_payload())
+
+        async with _client(handler) as client:
+            token = await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+
+        assert token == "community-access-token"
+        assert refresh_called is False
+
+    async def test_env_source_falls_through_to_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> _FakeCommunityTokens:
+            return _FakeCommunityTokens(
+                access_token="env-side-token",
+                refresh_token="rtoken",
+                expires_at=None,
+                scopes=[],
+                source="env",
+            )
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        async with _client(lambda r: httpx.Response(200, json=_token_payload())) as client:
+            token = await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+
+        assert token == "test-access-token"
+
+    async def test_no_community_connection_falls_through_to_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> None:
+            return None
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        async with _client(lambda r: httpx.Response(200, json=_token_payload())) as client:
+            token = await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+
+        assert token == "test-access-token"
+
+    async def test_resolver_unavailable_falls_through_to_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", None)
+
+        async with _client(lambda r: httpx.Response(200, json=_token_payload())) as client:
+            token = await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+
+        assert token == "test-access-token"
+
+    async def test_resolver_failure_falls_through_to_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> None:
+            raise RuntimeError("hub-api unreachable")
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        async with _client(lambda r: httpx.Response(200, json=_token_payload())) as client:
+            token = await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+
+        assert token == "test-access-token"
+
+    async def test_no_community_id_still_resolves_via_env_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> None:
+            assert community_id is None
+            return None
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        async with _client(lambda r: httpx.Response(200, json=_token_payload())) as client:
+            token = await get_access_token_for_community(client, None, "cid", "csecret", "rtoken")
+
+        assert token == "test-access-token"
+
+    async def test_force_refresh_is_forwarded_to_the_env_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> None:
+            return None
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=_token_payload())
+
+        async with _client(handler) as client:
+            await get_access_token_for_community(client, 42, "cid", "csecret", "rtoken")
+            await get_access_token_for_community(
+                client, 42, "cid", "csecret", "rtoken", force_refresh=True
+            )
+
+        assert calls == 2

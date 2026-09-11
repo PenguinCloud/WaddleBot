@@ -123,7 +123,13 @@ def _set_fake_resolve(
 ) -> None:
     """Same fake `resolve()` as `fake_resolve`, with configurable provider/labels (gh-313)."""
 
-    async def _fake(url_or_query: str, provider: str | None = None) -> Track:
+    async def _fake(
+        url_or_query: str,
+        provider: str | None = None,
+        *,
+        db: Any = None,
+        community_id: int | None = None,
+    ) -> Track:
         return Track(
             provider=provider or track_provider,
             external_id=url_or_query,

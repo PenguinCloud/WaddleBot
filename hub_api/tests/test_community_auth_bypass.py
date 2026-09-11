@@ -49,10 +49,19 @@ from blueprints import register_blueprints
 # handler this sweep's `"community" in rule.endpoint` filter matches --
 # `list_communities`/`get_spotlighted_communities` don't, since
 # "community" (singular) isn't a substring of "communities".)
+#
+# `GET /connections/callback/<provider>` (community_connections.py, #320) is
+# the OAuth consent landing page the *provider* redirects the admin's browser
+# to -- it can never carry our JWT. It is deliberately pre-auth: the only
+# input it trusts is a single-use, TTL-bound `state` minted by the
+# authenticated `/authorize` route (CSRF binding), it stores nothing without
+# a valid state, and its HTML response never contains token material. An
+# unauthenticated hit therefore returns 400 (bad/missing state), not 401.
 _EXEMPT_PATHS = {
     ("POST", "/api/v1/auth/login"),
     ("GET", "/api/v1/public/communities/1/profile"),
     ("GET", "/api/v1/public/communities/1"),
+    ("GET", "/api/v1/connections/callback/<provider>"),
 }
 
 

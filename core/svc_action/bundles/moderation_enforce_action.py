@@ -49,6 +49,12 @@ platform_moderation.py`; this module owns config parsing, target-user/
 channel/guild resolution, the self-message / non-positive-timeout /
 explicit-`action=none` skip logic, and combining the warn + timeout
 outcomes into one `TransportResult`.
+
+`_enforce_twitch`'s Twitch timeout path (gh-320) tries a per-community
+Twitch user token (`services.platform_moderation
+.resolve_community_moderator_token`) BEFORE the static
+`moderator_token_ref` config below -- a community with no connected
+Twitch account falls through to that existing config path unchanged.
 """
 
 from __future__ import annotations
@@ -70,6 +76,7 @@ from services.platform_moderation import (
     EnforcementOutcome,
     discord_timeout,
     discord_warn,
+    resolve_community_moderator_token,
     twitch_timeout,
     twitch_warn,
 )
@@ -265,6 +272,7 @@ async def _enforce_twitch(
     warn_text: str,
     timeout_s: int,
     target_user_id: str,
+    community_id: int | None,
     http_client: httpx.AsyncClient,
 ) -> list[EnforcementOutcome]:
     """Warn (always, via the existing IRC relay) then, if `timeout_s > 0`, a Helix timed ban."""
@@ -282,17 +290,31 @@ async def _enforce_twitch(
     ]
 
     if timeout_s > 0:
-        moderator_token_ref = config.get("moderator_token_ref")
-        if not isinstance(moderator_token_ref, str) or not moderator_token_ref:
-            # Deliberately checked BEFORE any Helix call -- an app/
-            # client-credentials token (the only kind `bot_token_ref`
-            # bundles like `twitch_send_action.py` ever resolve) can
-            # never authorize `/moderation/bans`; refusing here means
-            # this bundle never even attempts a call it knows will be
-            # rejected, i.e. it never "fakes success" by half-trying.
-            raise NonRetryableTransportError(
-                "twitch moderation requires a user token with moderator:manage:banned_users"
-            )
+        # gh-320: a per-community-connected Twitch account's user token
+        # takes priority over the static `moderator_token_ref` config
+        # below -- tried first, never required to be configured when a
+        # community connection exists. `None` (no connection, resolver
+        # unavailable, or a resolver failure) falls through unchanged.
+        moderator_token = await resolve_community_moderator_token(community_id)
+        if moderator_token is None:
+            moderator_token_ref = config.get("moderator_token_ref")
+            if not isinstance(moderator_token_ref, str) or not moderator_token_ref:
+                # Deliberately checked BEFORE any Helix call -- an app/
+                # client-credentials token (the only kind `bot_token_ref`
+                # bundles like `twitch_send_action.py` ever resolve) can
+                # never authorize `/moderation/bans`; refusing here means
+                # this bundle never even attempts a call it knows will be
+                # rejected, i.e. it never "fakes success" by half-trying.
+                raise NonRetryableTransportError(
+                    "twitch moderation requires a user token with moderator:manage:banned_users"
+                )
+            try:
+                moderator_token = resolve_secret(moderator_token_ref)
+            except SecretResolutionError as exc:
+                raise NonRetryableTransportError(
+                    f"twitch moderator token resolution failed: {exc}"
+                ) from exc
+
         client_id = _resolve_str(config.get("client_id"))
         if client_id is None:
             raise NonRetryableTransportError(
@@ -311,12 +333,6 @@ async def _enforce_twitch(
             raise NonRetryableTransportError(
                 "twitch moderation enforcement config missing required 'moderator_id'"
             )
-        try:
-            moderator_token = resolve_secret(moderator_token_ref)
-        except SecretResolutionError as exc:
-            raise NonRetryableTransportError(
-                f"twitch moderator token resolution failed: {exc}"
-            ) from exc
 
         api_base = config.get("api_base", DEFAULT_TWITCH_API_BASE)
         api_base_str = (
@@ -389,6 +405,12 @@ async def enforce(
     warn_text = enforcement["warn_text"]
     timeout_s = enforcement["timeout_s"]
 
+    community_id: int | None
+    try:
+        community_id = int(envelope.community) if envelope.community is not None else None
+    except (TypeError, ValueError):
+        community_id = None
+
     logger.debug(
         "moderation.enforce_decision platform=%s category=%s timeout_s=%s actor=%s",
         platform,
@@ -415,6 +437,7 @@ async def enforce(
             warn_text=warn_text,
             timeout_s=timeout_s,
             target_user_id=target_user_id,
+            community_id=community_id,
             http_client=http_client,
         )
 

@@ -219,6 +219,26 @@ class HubAPIConfig:
     # through.
     api_max_page_size: int = 100
 
+    # gh-320 Community Connections (per-community OAuth). `public_webui_url`
+    # is the browser-facing webui origin used for user-visible links (e.g.
+    # chat-embedded URLs) -- often a LAN IP in alpha, never guaranteed to be
+    # an OAuth-provider-acceptable redirect host.
+    #
+    # `connections_callback_base_url` is a SEPARATE, independently
+    # overridable base for building the OAuth `redirect_uri` (`blueprints/
+    # v1/community_connections.py`'s authorize route) and the `callback_base`
+    # value in the connections-list response. Defaults to
+    # `public_webui_url` (`from_env()`) since most deployments want the
+    # same origin for both, but alpha needs to diverge: Google/Spotify (and
+    # most OAuth providers) only accept an `http://` redirect URI on
+    # `localhost`/`127.0.0.1`, never an arbitrary LAN IP, so alpha sets
+    # `CONNECTIONS_CALLBACK_BASE_URL=http://localhost:<port>` independently
+    # of `PUBLIC_WEBUI_URL` (still the LAN IP, for chat links) rather than
+    # forcing one shared value to satisfy two incompatible constraints.
+    public_webui_url: str = "http://localhost:30879"
+    connections_callback_base_url: str = "http://localhost:30879"
+    connections_state_ttl_s: int = 600
+
     @classmethod
     def from_env(cls) -> HubAPIConfig:
         """Build config from the process environment. Raises on an invalid DB_TYPE."""
@@ -286,4 +306,10 @@ class HubAPIConfig:
             ),
             trusted_proxy_hops=max(0, int(os.getenv("TRUSTED_PROXY_HOPS", "0"))),
             api_max_page_size=int(os.getenv("API_MAX_PAGE_SIZE", "100")),
+            public_webui_url=os.getenv("PUBLIC_WEBUI_URL", "http://localhost:30879").rstrip("/"),
+            connections_callback_base_url=(
+                os.getenv("CONNECTIONS_CALLBACK_BASE_URL", "")
+                or os.getenv("PUBLIC_WEBUI_URL", "http://localhost:30879")
+            ).rstrip("/"),
+            connections_state_ttl_s=int(os.getenv("CONNECTIONS_STATE_TTL_S", "600")),
         )

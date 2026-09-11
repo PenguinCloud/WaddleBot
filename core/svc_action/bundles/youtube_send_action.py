@@ -74,7 +74,7 @@ from waddle_transports.url_guard import SSRFError, guarded_request
 from services.youtube_oauth import (
     YOUTUBE_FORCE_SSL_SCOPE,
     YouTubeOAuthError,
-    get_access_token,
+    get_access_token_for_community,
     token_has_scope,
 )
 
@@ -172,6 +172,12 @@ async def send_message(
     API). `text` longer than YouTube's 200-char live-chat cap is
     truncated with a trailing `…`.
 
+    OAuth token resolution is community-aware (gh-320,
+    `services.youtube_oauth.get_access_token_for_community`): if
+    `envelope.community` has a per-community-connected YouTube account,
+    its token is used; otherwise this falls back to the `refresh_token_ref`
+    env-credential flow above, unchanged.
+
     Raises `NonRetryableTransportError` for a config/auth failure (no
     resolvable live_chat_id, unresolvable secret, OAuth refresh failure,
     a refresh token missing the `youtube.force-ssl` scope, a persistent
@@ -187,6 +193,12 @@ async def send_message(
             "action envelope event.payload missing required 'text' string"
         )
     text = _truncate_for_youtube(text)
+
+    community_id: int | None
+    try:
+        community_id = int(envelope.community) if envelope.community is not None else None
+    except (TypeError, ValueError):
+        community_id = None
 
     client_id_ref = config.get("client_id_ref") or "YOUTUBE_CLIENT_ID"
     client_secret_ref = config.get("client_secret_ref") or "YOUTUBE_CLIENT_SECRET"
@@ -208,7 +220,9 @@ async def send_message(
         raise NonRetryableTransportError(f"youtube bundle secret resolution failed: {exc}") from exc
 
     try:
-        access_token = await get_access_token(http_client, client_id, client_secret, refresh_token)
+        access_token = await get_access_token_for_community(
+            http_client, community_id, client_id, client_secret, refresh_token
+        )
     except YouTubeOAuthError as exc:
         raise NonRetryableTransportError(str(exc)) from exc
 
@@ -247,8 +261,13 @@ async def send_message(
     response = await _guarded_call(http_client, "POST", send_url, access_token, json_body=body)
     if response.status_code == 401:
         try:
-            access_token = await get_access_token(
-                http_client, client_id, client_secret, refresh_token, force_refresh=True
+            access_token = await get_access_token_for_community(
+                http_client,
+                community_id,
+                client_id,
+                client_secret,
+                refresh_token,
+                force_refresh=True,
             )
         except YouTubeOAuthError as exc:
             raise NonRetryableTransportError(str(exc)) from exc

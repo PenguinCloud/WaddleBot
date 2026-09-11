@@ -157,7 +157,13 @@ def _set_fake_resolve(
     which needs a different `Track.labels`/`provider` per test case.
     """
 
-    async def _fake(url_or_query: str, provider: str | None = None) -> Track:
+    async def _fake(
+        url_or_query: str,
+        provider: str | None = None,
+        *,
+        db: Any = None,
+        community_id: int | None = None,
+    ) -> Track:
         return Track(
             provider=provider or track_provider,
             external_id=url_or_query,

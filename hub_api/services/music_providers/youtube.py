@@ -1,7 +1,18 @@
 """YouTube Data API v3 resolver -- real search/videos.list calls, real response parsing.
 
-Credentials, in precedence order:
+Credentials, in precedence order (issue #320 adds credential mode 0 ahead of the
+pre-existing env-only modes 1/2, unchanged):
 
+0. A community's own connected YouTube account, when `resolve()`/`search()` are called
+   with both `db` and `community_id` -- `services.community_connections.
+   get_decrypted_tokens()` fetches the community's stored OAuth material; a token that's
+   `None`/expiring within 60s is refreshed via `services.oauth_providers.
+   refresh_access_token()` and persisted via `store_refreshed_access_token()`. This is a
+   *preference*, not a hard requirement: no connection, no refresh token on an expired
+   token, or a failed refresh (`OAuthExchangeError`) all fall through to mode 1 below
+   rather than raising -- logged at WARNING (community id + provider only, never token
+   material). Cached in-process per community id, <=60s, including a "no usable
+   connection" result, to avoid a DB decrypt on every call (`_resolve_community_auth()`).
 1. `YOUTUBE_API_KEY` env var (or `~/.youtube.token` line 1 -- see `_load_api_key()`'s
    own docstring for the OAuth-client-id-is-unusable-here caveat) -- sent as the `key=`
    query param on every Data API v3 call.
@@ -12,9 +23,12 @@ Credentials, in precedence order:
    `key=` param). A 401 from the Data API triggers one forced token refresh and one
    retry, for the case where the cached token was revoked server-side mid-lifetime.
 
-Neither usable -> `ProviderUnavailable` naming exactly which env vars to set.
-`youtube_credentials_configured()` is the presence-only check (no network I/O, no token
-refresh) that `services.music_providers` uses for its bare-text YouTube-first default.
+None usable -> `ProviderUnavailable` naming exactly which env vars to set.
+`youtube_credentials_configured()` is the presence-only, community-unaware env check (no
+network I/O, no token refresh, signature unchanged by issue #320) that
+`services.music_providers` uses for its bare-text YouTube-first default.
+`youtube_credentials_source()` is the community-aware counterpart backing `!sr status`
+(`services.music_status_service.check_youtube_health()`).
 
 Never logs, prints, or otherwise surfaces the key/token/client-secret value itself --
 only which credential mode was selected and OAuth token cache hit/miss/refresh.
@@ -38,14 +52,17 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from services.community_connections import get_decrypted_tokens, store_refreshed_access_token
 from services.music_providers.errors import ProviderUnavailable, TrackNotFound
 from services.music_providers.track import Track
+from services.oauth_providers import OAuthExchangeError, refresh_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +72,14 @@ _TIMEOUT_SECONDS = 10.0
 _SEARCH_MAX_RESULTS = 10
 _TOKEN_FILE = Path.home() / ".youtube.token"
 #: Refresh this many seconds before the OAuth access token's reported expiry, to avoid
-#: a request racing an about-to-expire token.
+#: a request racing an about-to-expire token. Reused as the community-connection
+#: near-expiry threshold (issue #320, `_fetch_community_auth()`).
 _OAUTH_EXPIRY_SAFETY_MARGIN_SECONDS = 60
+
+#: In-process community-YouTube-auth cache TTL (issue #320) -- avoids a DB decrypt (and
+#: a possible refresh-token network round trip) on every `resolve()`/`search()` call for
+#: the same community. See `_resolve_community_auth()`.
+_COMMUNITY_AUTH_CACHE_TTL_SECONDS = 60.0
 
 #: Highest-quality-first; `snippet.thumbnails` only guarantees `default`.
 _THUMBNAIL_PRIORITY = ("maxres", "standard", "high", "medium", "default")
@@ -140,6 +163,37 @@ _oauth_token_lock = asyncio.Lock()
 
 
 @dataclass(slots=True)
+class _CommunityAuth:
+    """Data API v3 authenticated via a community-connected bearer access token (issue #320).
+
+    Already-valid (or freshly-refreshed) -- unlike `_OAuthAuth`, this carries no
+    client id/secret/refresh token; refresh happens once, up front, in
+    `_fetch_community_auth()`, not lazily per-request.
+    """
+
+    access_token: str
+
+
+@dataclass(slots=True)
+class _CachedCommunityAuth:
+    """In-process per-community auth cache entry (issue #320); `expires_at` is `time.monotonic()`.
+
+    `value` is `None` when the community has no usable YouTube connection right
+    now (absent, or expired with no refresh token, or a failed refresh) -- cached
+    too, so a community without one doesn't re-hit the DB on every call within
+    the TTL.
+    """
+
+    value: _CommunityAuth | None
+    expires_at: float
+
+
+#: Community id -> cached auth/no-auth result. See `_resolve_community_auth()`.
+_community_auth_cache: dict[int, _CachedCommunityAuth] = {}
+_community_auth_cache_lock = asyncio.Lock()
+
+
+@dataclass(slots=True)
 class _CachedLabels:
     """In-process `Track.labels` cache entry; `expires_at` is a `time.monotonic()` deadline."""
 
@@ -187,11 +241,35 @@ def _load_oauth_credentials() -> tuple[str, str, str] | None:
 def youtube_credentials_configured() -> bool:
     """True if a usable Data API key or a full OAuth refresh-token trio is configured.
 
-    Presence-only check (no network I/O, no token refresh) -- used by
-    `services.music_providers`'s bare-text YouTube-first default policy to decide
-    whether YouTube is even worth trying before Spotify.
+    Presence-only, community-unaware check (no network I/O, no token refresh,
+    signature unchanged by issue #320) -- used by `services.music_providers`'s
+    bare-text YouTube-first default policy to decide whether YouTube is even
+    worth trying before Spotify.
     """
     return _load_api_key() is not None or _load_oauth_credentials() is not None
+
+
+async def youtube_credentials_source(
+    db: Any, community_id: int | None
+) -> Literal["community", "env", "api_key", "none"]:
+    """Which credential mode `resolve()`/`search()` would use for `community_id` right now.
+
+    Mirrors `_resolve_auth()`'s own precedence (community connection, then
+    `_resolve_auth_mode()`'s API-key-then-OAuth-trio env order) without making a
+    Data API v3 call -- used by `services.music_status_service.
+    check_youtube_health()` so `!sr status` can report which account is actually
+    in use. `community_id=None` skips the community check entirely. Reuses the
+    same <=60s community-auth cache `resolve()`/`search()` populate, so calling
+    this immediately before/after a real resolve for the same community costs no
+    extra DB round trip.
+    """
+    if community_id is not None and await _resolve_community_auth(db, community_id) is not None:
+        return "community"
+    if _load_api_key() is not None:
+        return "api_key"
+    if _load_oauth_credentials() is not None:
+        return "env"
+    return "none"
 
 
 def _resolve_auth_mode() -> _ApiKeyAuth | _OAuthAuth:
@@ -216,6 +294,93 @@ def _resolve_auth_mode() -> _ApiKeyAuth | _OAuthAuth:
         "youtube credentials not configured: set YOUTUBE_API_KEY or "
         "YOUTUBE_CLIENT_ID+YOUTUBE_CLIENT_SECRET+YOUTUBE_REFRESH_TOKEN"
     )
+
+
+async def _fetch_community_auth(db: Any, community_id: int) -> _CommunityAuth | None:
+    """Resolve `community_id`'s connected YouTube bearer token, refreshing if near expiry.
+
+    Returns `None` (never raises) if there's no active connection, an expired
+    token with no refresh token, or the refresh attempt itself fails
+    (`OAuthExchangeError`) -- all fall through to credential mode 1 (module
+    docstring) per this module's community-preference contract. A refresh
+    failure is logged at WARNING with community id + provider only, never token
+    material.
+    """
+    tokens = await get_decrypted_tokens(db, community_id, "youtube")
+    if tokens is None:
+        return None
+
+    now = datetime.now(UTC)
+    still_fresh = tokens.expires_at is None or tokens.expires_at > now + timedelta(
+        seconds=_OAUTH_EXPIRY_SAFETY_MARGIN_SECONDS
+    )
+    if still_fresh:
+        return _CommunityAuth(access_token=tokens.access_token)
+
+    if not tokens.refresh_token:
+        logger.warning(
+            "youtube.community_auth expired_no_refresh_token community_id=%s provider=youtube",
+            community_id,
+        )
+        return None
+
+    try:
+        refreshed = await refresh_access_token("youtube", refresh_token=tokens.refresh_token)
+    except OAuthExchangeError:
+        logger.warning(
+            "youtube.community_auth refresh_failed community_id=%s provider=youtube",
+            community_id,
+        )
+        return None
+
+    new_expires_at = (
+        now + timedelta(seconds=refreshed.expires_in) if refreshed.expires_in is not None else None
+    )
+    await store_refreshed_access_token(
+        db, community_id, "youtube", access_token=refreshed.access_token, expires_at=new_expires_at
+    )
+    return _CommunityAuth(access_token=refreshed.access_token)
+
+
+async def _resolve_community_auth(db: Any, community_id: int) -> _CommunityAuth | None:
+    """Cached (<=60s) wrapper around `_fetch_community_auth()`.
+
+    Guarded by `_community_auth_cache_lock` (held across the fetch, mirroring
+    `_get_oauth_access_token()`'s own `_oauth_token_lock` pattern) so concurrent
+    calls for the same community don't each hit the DB / mint their own refresh.
+    """
+    async with _community_auth_cache_lock:
+        cached = _community_auth_cache.get(community_id)
+        if cached is not None and cached.expires_at > time.monotonic():
+            logger.debug("youtube.community_auth cache=hit community_id=%s", community_id)
+            return cached.value
+
+        logger.debug("youtube.community_auth cache=miss community_id=%s", community_id)
+        auth = await _fetch_community_auth(db, community_id)
+        _community_auth_cache[community_id] = _CachedCommunityAuth(
+            value=auth, expires_at=time.monotonic() + _COMMUNITY_AUTH_CACHE_TTL_SECONDS
+        )
+        return auth
+
+
+async def _resolve_auth(
+    db: Any | None, community_id: int | None
+) -> _ApiKeyAuth | _OAuthAuth | _CommunityAuth:
+    """Pick the credential mode per module docstring precedence: community, then env.
+
+    `db`/`community_id` are optional; omitting either (both default `None`)
+    preserves the env-only behavior every pre-issue-#320 caller of this module
+    relies on -- e.g. `music_status_service`'s own presence probe. Raises
+    `ProviderUnavailable` (same as `_resolve_auth_mode()`) if nothing usable is
+    found at all.
+    """
+    if db is not None and community_id is not None:
+        community_auth = await _resolve_community_auth(db, community_id)
+        if community_auth is not None:
+            logger.debug("youtube.auth mode=community community_id=%s", community_id)
+            return community_auth
+
+    return _resolve_auth_mode()
 
 
 def _describe_oauth_error(response: httpx.Response) -> str:
@@ -427,7 +592,7 @@ def _labels_cache_set(video_id: str, labels: tuple[str, ...]) -> None:
 
 
 async def _fetch_labels(
-    client: httpx.AsyncClient, auth: _ApiKeyAuth | _OAuthAuth, video_id: str
+    client: httpx.AsyncClient, auth: _ApiKeyAuth | _OAuthAuth | _CommunityAuth, video_id: str
 ) -> tuple[str, ...]:
     """Fetch `Track.labels` for one video id via a second `videos.list` call, cached 24h.
 
@@ -508,20 +673,27 @@ async def _send_data_api_request(
 
 
 async def _data_api_get(
-    client: httpx.AsyncClient, auth: _ApiKeyAuth | _OAuthAuth, path: str, params: dict[str, Any]
+    client: httpx.AsyncClient,
+    auth: _ApiKeyAuth | _OAuthAuth | _CommunityAuth,
+    path: str,
+    params: dict[str, Any],
 ) -> dict[str, Any]:
     """GET one Data API v3 endpoint under `auth`; retries once on a 401 in OAuth mode.
 
     API-key mode sends `key=` as a query param, never retries (a bad key doesn't get
-    better on retry). OAuth mode sends `Authorization: Bearer <token>`; a 401 forces
-    one token refresh (bypassing the cache) and one retry, covering a token revoked
-    server-side mid-lifetime.
+    better on retry). OAuth and community modes send `Authorization: Bearer <token>`;
+    OAuth mode's 401 forces one token refresh (bypassing the cache) and one retry,
+    covering a token revoked server-side mid-lifetime -- community mode already
+    refreshed up front (`_fetch_community_auth()`) so a 401 there means the
+    community's own token is bad right now, not something this call can fix.
     """
     request_params = dict(params)
     headers: dict[str, str] = {}
 
     if isinstance(auth, _ApiKeyAuth):
         request_params["key"] = auth.api_key
+    elif isinstance(auth, _CommunityAuth):
+        headers["Authorization"] = f"Bearer {auth.access_token}"
     else:
         headers["Authorization"] = f"Bearer {await _get_oauth_access_token(client, auth)}"
 
@@ -536,14 +708,20 @@ async def _data_api_get(
     return _parse_data_api_response(response)
 
 
-async def resolve(url: str) -> Track:
+async def resolve(url: str, *, db: Any = None, community_id: int | None = None) -> Track:
     """Resolve a YouTube video URL to a `Track` via `videos.list`.
 
+    `db`/`community_id` (issue #320): when both given, the community's own
+    connected YouTube account is preferred over this module's env credentials
+    -- see the module docstring's credential-precedence list and
+    `_resolve_auth()`. Omitting either preserves the env-only behavior every
+    pre-issue-#320 caller relies on.
+
     `Track.labels` is populated by a second, decoupled `videos.list` call
-    (`_fetch_labels()`) -- see this module's own docstring for why a failure
-    there never raises out of `resolve()`.
+    (`_fetch_labels()`, same resolved `auth`) -- see this module's own
+    docstring for why a failure there never raises out of `resolve()`.
     """
-    auth = _resolve_auth_mode()
+    auth = await _resolve_auth(db, community_id)
 
     video_id = _extract_video_id(url)
     if video_id is None:
@@ -563,13 +741,16 @@ async def resolve(url: str) -> Track:
     return track
 
 
-async def search(query: str) -> list[Track]:
+async def search(query: str, *, db: Any = None, community_id: int | None = None) -> list[Track]:
     """Search YouTube via `search.list`, then hydrate durations via `videos.list`.
+
+    `db`/`community_id` (issue #320): same community-first credential
+    precedence as `resolve()` -- see that function's own docstring.
 
     `Track.labels` for each result is populated the same way `resolve()` does --
     one additional `videos.list` call per result id (cached, see `_fetch_labels()`).
     """
-    auth = _resolve_auth_mode()
+    auth = await _resolve_auth(db, community_id)
 
     async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
         search_data = await _data_api_get(

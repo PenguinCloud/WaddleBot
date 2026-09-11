@@ -981,7 +981,7 @@ class TestResolveContract:
     ) -> None:
         called_with = {}
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             called_with["url"] = url
             return Track(
                 provider="youtube",
@@ -1021,7 +1021,7 @@ class TestResolveContract:
     async def test_resolve_bare_query_uses_explicit_provider(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             return Track(
                 provider="youtube",
                 external_id="x",
@@ -1050,7 +1050,7 @@ class TestResolveContract:
             await resolve("some bare search text with no provider")
 
     async def test_search_dispatches_to_youtube(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def fake_search(query: str) -> list[Track]:
+        async def fake_search(query: str, **_kwargs: Any) -> list[Track]:
             return [
                 Track(
                     provider="youtube",
@@ -1070,7 +1070,7 @@ class TestResolveContract:
         assert results[0].provider == "youtube"
 
     async def test_search_dispatches_to_spotify(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def fake_search(query: str) -> list[Track]:
+        async def fake_search(query: str, **_kwargs: Any) -> list[Track]:
             return [
                 Track(
                     provider="spotify",
@@ -1106,7 +1106,7 @@ class TestBareTextProviderDefault:
         monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
         spotify_called = False
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             return Track(
                 provider="youtube",
                 external_id="yt",
@@ -1135,7 +1135,7 @@ class TestBareTextProviderDefault:
     ) -> None:
         monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             raise TrackNotFound(url)
 
         async def fake_spotify_resolve(url: str) -> Track:
@@ -1160,7 +1160,7 @@ class TestBareTextProviderDefault:
     ) -> None:
         monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             raise ProviderUnavailable("youtube")
 
         async def fake_spotify_resolve(url: str) -> Track:
@@ -1184,7 +1184,7 @@ class TestBareTextProviderDefault:
         """`_no_real_creds` already cleared `YOUTUBE_API_KEY` -- today's (pre-change) behavior."""
         youtube_called = False
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             nonlocal youtube_called
             youtube_called = True
             raise AssertionError("youtube must not be called with no key configured")
@@ -1215,7 +1215,7 @@ class TestBareTextProviderDefault:
         monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
         youtube_called = False
 
-        async def fake_youtube_resolve(url: str) -> Track:
+        async def fake_youtube_resolve(url: str, **_kwargs: Any) -> Track:
             nonlocal youtube_called
             youtube_called = True
             raise AssertionError("youtube must not be called -- explicit provider was spotify")

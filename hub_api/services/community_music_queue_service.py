@@ -467,19 +467,26 @@ async def _enforce_youtube_label_gate(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_track(url_or_query: str, provider: str | None) -> Track:
+async def _resolve_track(
+    async_dal: Any, url_or_query: str, provider: str | None, *, community_id: int
+) -> Track:
     """Resolve via `services.music_providers.resolve()` -- the shared, safe provider contract.
 
     `resolve()` auto-detects the provider from the URL host when possible
     (`youtube.com`/`youtu.be` -> youtube, `open.spotify.com` -> spotify);
-    `provider` is only needed as a fallback for bare search text. Real
+    `provider` is only needed as a fallback for bare search text. `async_dal`/
+    `community_id` (issue #320) are threaded through to `resolve()`'s own
+    `db`/`community_id` kwargs so a YouTube resolution prefers this
+    community's connected account over env credentials -- see `services.
+    music_providers.youtube`'s module docstring for the precedence and
+    fallback contract; this function itself makes no provider decision. Real
     network calls throughout (`services/music_providers/youtube.py`/
     `spotify.py`) -- `ProviderUnavailable`/`TrackNotFound` are the only
     non-`Track` outcomes, both converted to a clear 422 here, never a
     silent fake track.
     """
     try:
-        return await resolve(url_or_query, provider)
+        return await resolve(url_or_query, provider, db=async_dal, community_id=community_id)
     except ProviderUnavailable as exc:
         raise unprocessable(f"{exc.provider} provider is not available right now") from exc
     except TrackNotFound as exc:
@@ -629,7 +636,7 @@ async def enqueue_request(
         is_admin_override=is_admin_override,
     )
 
-    track = await _resolve_track(url_or_query, provider)
+    track = await _resolve_track(async_dal, url_or_query, provider, community_id=community_id)
     if enforce_youtube_labels:
         await _enforce_youtube_label_gate(async_dal, dal, community_id=community_id, track=track)
     track_id = await _get_or_create_track_id(async_dal, dal, tenant_id=tenant_id, track=track)
@@ -687,7 +694,7 @@ async def enqueue_playlist(
 
     created: list[QueueItemDTO] = []
     for raw_item in cleaned:
-        track = await _resolve_track(raw_item, provider)
+        track = await _resolve_track(async_dal, raw_item, provider, community_id=community_id)
         track_id = await _get_or_create_track_id(async_dal, dal, tenant_id=tenant_id, track=track)
         new_id = await async_dal.insert_async(
             dal.music_station_queue,

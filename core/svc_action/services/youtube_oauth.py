@@ -29,6 +29,21 @@ access token, not once per chat message sent.
 Never logs, prints, or otherwise surfaces the client secret, refresh
 token, or access token value itself -- only cache hit/miss/refresh and
 which error class a refresh failure falls into.
+
+`get_access_token_for_community()` (gh-320) is the community-aware entry
+point `bundles/youtube_send_action.py` calls instead of `get_access_token`
+directly: it tries `waddle_transports.community_credentials
+.resolve_community_tokens(community_id, "youtube")` first -- a
+`source == "community"` result means hub-api has a per-community-connected
+YouTube OAuth token (already refreshed server-side), returned as-is; any
+other outcome (`source == "env"`, `None`, or the resolver itself failing)
+falls through to the existing env-credential refresh-token flow
+unchanged, so a community with no connected YouTube account behaves
+exactly as before this feature existed. The resolver is imported at
+module load time but guarded by `try`/`except ImportError` -- the shared
+`waddle_transports.community_credentials` module is landing concurrently
+(gh-320) and may not exist on disk yet; tests monkeypatch
+`resolve_community_tokens` on this module directly.
 """
 
 from __future__ import annotations
@@ -42,6 +57,11 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+try:
+    from waddle_transports.community_credentials import resolve_community_tokens
+except ImportError:  # pragma: no cover -- exercised only before gh-320's resolver lands
+    resolve_community_tokens = None
 
 _OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 -- URL, not a secret
 _TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
@@ -166,6 +186,51 @@ async def get_access_token(
         )
         _token_cache[cache_key] = new_token
         return new_token.value
+
+
+async def get_access_token_for_community(
+    http_client: httpx.AsyncClient,
+    community_id: int | None,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    *,
+    force_refresh: bool = False,
+) -> str:
+    """Community-aware access token: per-community connected token, else the env refresh flow.
+
+    Tries `resolve_community_tokens(community_id, "youtube")` first (gh-320).
+    A `source == "community"` result returns its `access_token` directly --
+    hub-api already refreshed it server-side, so this module's own cache/
+    refresh machinery never applies to it. Any other outcome (`source ==
+    "env"`, a `None` result, the resolver module not being importable yet,
+    or the resolver itself raising) falls through to `get_access_token`
+    unchanged -- identical to this bundle's behavior before gh-320.
+
+    Never logs the resolved token value -- only which source it came from.
+    """
+    tokens = None
+    if resolve_community_tokens is not None:
+        try:
+            tokens = await resolve_community_tokens(community_id, "youtube")
+        except Exception as exc:  # noqa: BLE001 -- a resolver failure must never block a send
+            logger.debug(
+                "youtube_oauth.community_resolve_failed community_id=%s error=%s",
+                community_id,
+                type(exc).__name__,
+            )
+            tokens = None
+
+    if tokens is not None and tokens.source == "community" and tokens.access_token:
+        logger.debug(
+            "youtube_oauth.token_source=community community_id=%s provider=youtube", community_id
+        )
+        return str(tokens.access_token)
+
+    logger.debug("youtube_oauth.token_source=env community_id=%s provider=youtube", community_id)
+    return await get_access_token(
+        http_client, client_id, client_secret, refresh_token, force_refresh=force_refresh
+    )
 
 
 async def token_has_scope(

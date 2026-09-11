@@ -1,4 +1,4 @@
-"""Decrypt-only port of `credential_manager_module/services/token_crypto.py`.
+"""Decrypt port + write path of `credential_manager_module/services/token_crypto.py`.
 
 SECURITY (HIGH, see that module's own docstring for the full rationale):
 `platform_config_service.py::test_platform_connection()` is the one other
@@ -10,14 +10,19 @@ before sending the value to the platform's own validation API, or every
 "test credential" call on a since-refreshed row would send ciphertext and
 report a false `invalid token`.
 
-Decrypt-only (this service never *writes* `platform_integrations`
-credentials -- `refresh_service.py` owns that side) and re-implements the
-same AES-256-GCM primitive/wire format rather than importing across
-services (`credential_manager_module` is a separate deployable/DB-grant --
-backend-database.md Per-Service Database Accounts -- same reasoning
-`core/svc_streaming/services/community_access.py`'s own docstring
-documents for authz code). `CREDENTIAL_ENCRYPTION_KEY` MUST be set
-identically in both services' deployments.
+Originally decrypt-only (`refresh_service.py` owned all writes to
+`bot`/`user_oauth` rows). gh-320 (per-community OAuth "Connections")
+adds `encrypt_token()`: `services/community_connections.py` is now a
+second, hub_api-local writer -- but only ever for
+`integration_type='community_oauth'` rows, a lane `refresh_service.py`
+never touches, so there's no write-write overlap between the two owners.
+
+Re-implements the same AES-256-GCM primitive/wire format rather than
+importing across services (`credential_manager_module` is a separate
+deployable/DB-grant -- backend-database.md Per-Service Database Accounts
+-- same reasoning `core/svc_streaming/services/community_access.py`'s own
+docstring documents for authz code). `CREDENTIAL_ENCRYPTION_KEY` MUST be
+set identically in both services' deployments.
 """
 
 from __future__ import annotations
@@ -56,6 +61,21 @@ def _encryption_key() -> bytes:
             "CREDENTIAL_ENCRYPTION_KEY must be a 64-character hex string (32 bytes)"
         )
     return key
+
+
+def encrypt_token(plaintext: str) -> str:
+    """AES-256-GCM encrypt `plaintext`; returns base64(iv(12) || ciphertext || tag).
+
+    Mirrors `token_crypto.encrypt_value()`'s wire format exactly (same
+    primitive, same layout) so a value written here decrypts cleanly via
+    either service's `decrypt_value()`, and vice versa -- see module
+    docstring. Callers must never log `plaintext` or the returned
+    ciphertext's decrypted form.
+    """
+    key = _encryption_key()
+    iv = os.urandom(_IV_LENGTH)
+    ciphertext_and_tag = AESGCM(key).encrypt(iv, plaintext.encode("utf-8"), None)
+    return base64.b64encode(iv + ciphertext_and_tag).decode("ascii")
 
 
 def decrypt_value(encrypted_b64: str) -> str:

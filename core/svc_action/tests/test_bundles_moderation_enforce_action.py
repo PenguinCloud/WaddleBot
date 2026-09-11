@@ -561,3 +561,157 @@ class TestTwitchEnforcement:
         async with _client(lambda r: httpx.Response(status)) as client:
             with pytest.raises(expected_error, match=match):
                 await enforce(_twitch_envelope(), _twitch_config(), http_client=client)
+
+
+class TestTwitchCommunityModeratorToken:
+    """gh-320: a per-community Twitch connection takes priority over `moderator_token_ref`."""
+
+    async def test_community_token_used_and_config_ref_never_resolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`moderator_token_ref` unset entirely -- community token alone must satisfy the call."""
+
+        async def fake_resolve_community_moderator_token(community_id: int | None) -> str | None:
+            assert community_id == 42
+            return "community-moderator-token"  # noqa: S106 -- test fixture value
+
+        monkeypatch.setattr(
+            mod_bundle,
+            "resolve_community_moderator_token",
+            fake_resolve_community_moderator_token,
+        )
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["auth"] = request.headers["Authorization"]
+            return httpx.Response(200, json={"data": [{"user_id": "555666777"}]})
+
+        config = _twitch_config()
+        del config["moderator_token_ref"]
+
+        async with _client(handler) as client:
+            result = await enforce(_twitch_envelope(), config, http_client=client)
+
+        assert captured["auth"] == "Bearer community-moderator-token"
+        assert "action=warn+timeout" in result.detail
+
+    async def test_community_token_takes_priority_over_configured_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(TWITCH_MODERATOR_TOKEN_REF, "s3cr3t-moderator-token")
+
+        async def fake_resolve_community_moderator_token(community_id: int | None) -> str | None:
+            return "community-moderator-token"  # noqa: S106 -- test fixture value
+
+        monkeypatch.setattr(
+            mod_bundle,
+            "resolve_community_moderator_token",
+            fake_resolve_community_moderator_token,
+        )
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["auth"] = request.headers["Authorization"]
+            return httpx.Response(200, json={"data": [{"user_id": "555666777"}]})
+
+        async with _client(handler) as client:
+            await enforce(_twitch_envelope(), _twitch_config(), http_client=client)
+
+        assert captured["auth"] == "Bearer community-moderator-token"
+
+    async def test_no_community_connection_falls_back_to_configured_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolver returns `None` -- falls back to `moderator_token_ref`, unchanged."""
+        monkeypatch.setenv(TWITCH_MODERATOR_TOKEN_REF, "s3cr3t-moderator-token")
+
+        async def fake_resolve_community_moderator_token(community_id: int | None) -> str | None:
+            return None
+
+        monkeypatch.setattr(
+            mod_bundle,
+            "resolve_community_moderator_token",
+            fake_resolve_community_moderator_token,
+        )
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["auth"] = request.headers["Authorization"]
+            return httpx.Response(200, json={"data": [{"user_id": "555666777"}]})
+
+        async with _client(handler) as client:
+            await enforce(_twitch_envelope(), _twitch_config(), http_client=client)
+
+        assert captured["auth"] == "Bearer s3cr3t-moderator-token"
+
+    async def test_no_community_connection_and_no_configured_ref_is_non_retryable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither source available -- same specific error as the pre-gh-320 refusal path."""
+
+        async def fake_resolve_community_moderator_token(community_id: int | None) -> str | None:
+            return None
+
+        monkeypatch.setattr(
+            mod_bundle,
+            "resolve_community_moderator_token",
+            fake_resolve_community_moderator_token,
+        )
+        config = _twitch_config()
+        del config["moderator_token_ref"]
+
+        async with _client(lambda r: httpx.Response(200)) as client:
+            with pytest.raises(
+                NonRetryableTransportError,
+                match="requires a user token with moderator:manage:banned_users",
+            ):
+                await enforce(_twitch_envelope(), config, http_client=client)
+
+    async def test_malformed_community_id_still_falls_back_to_configured_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`envelope.community` not an integer -- `community_id` becomes `None`, never raises."""
+        monkeypatch.setenv(TWITCH_MODERATOR_TOKEN_REF, "s3cr3t-moderator-token")
+
+        async def fake_resolve_community_moderator_token(community_id: int | None) -> str | None:
+            assert community_id is None
+            return None
+
+        monkeypatch.setattr(
+            mod_bundle,
+            "resolve_community_moderator_token",
+            fake_resolve_community_moderator_token,
+        )
+        envelope = StageEnvelope(
+            tenant="1",
+            community="not-an-int",
+            app_id="waddles.bot.twitch.default",
+            stage="action",
+            event=PlatformEvent(
+                platform="twitch",
+                event_type="message",
+                actor="flagged-user",
+                payload={
+                    "channel_name": "somechannel",
+                    "broadcaster_id": "123456789",
+                    "user_id": "555666777",
+                    "moderation_enforcement": {
+                        "category": "harassment",
+                        "timeout_s": 300,
+                        "warn_text": "please keep it civil",
+                    },
+                },
+                occurred_at="2026-09-11T12:00:00Z",
+            ),
+            ts="2026-09-11T12:00:00Z",
+        )
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["auth"] = request.headers["Authorization"]
+            return httpx.Response(200, json={"data": [{"user_id": "555666777"}]})
+
+        async with _client(handler) as client:
+            await enforce(envelope, _twitch_config(), http_client=client)
+
+        assert captured["auth"] == "Bearer s3cr3t-moderator-token"

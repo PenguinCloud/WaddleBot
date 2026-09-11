@@ -17,6 +17,14 @@ doc's "error states must be specific, e.g. 'oauth token didn't work'")
 action.py::enforce()` owns config parsing, target resolution, and
 combining outcomes into one `TransportResult`; this module owns nothing
 but "make the actual call, classify the actual response."
+
+`resolve_community_moderator_token()` (gh-320) is this module's
+community-aware addition: `bundles/moderation_enforce_action.py`'s Twitch
+timeout path (the one call here needing a *user*-scoped token, `twitch_
+timeout`'s `moderator_token`) tries it FIRST, falling back to the
+existing `moderator_token_ref`/`resolve_secret` config path only when no
+per-community Twitch connection exists -- see that function's own
+docstring.
 """
 
 from __future__ import annotations
@@ -33,6 +41,11 @@ from waddle_transports.transports.irc_relay import RelayOutboundIrcTransport, Re
 from waddle_transports.url_guard import SSRFError, guarded_request
 
 logger = logging.getLogger(__name__)
+
+try:
+    from waddle_transports.community_credentials import resolve_community_tokens
+except ImportError:  # pragma: no cover -- exercised only before gh-320's resolver lands
+    resolve_community_tokens = None
 
 #: Discord's own ceiling for `communication_disabled_until` (28 days out
 #: from now) -- a request beyond this is rejected by Discord itself with
@@ -243,6 +256,49 @@ def _classify_twitch_response(response: httpx.Response) -> None:
             f"twitch API server error: HTTP {response.status_code}",
             http_status=response.status_code,
         )
+
+
+async def resolve_community_moderator_token(community_id: int | None) -> str | None:
+    """Best-effort per-community Twitch USER token via the shared community-credentials resolver.
+
+    Returns the community's connected Twitch access token (gh-320) if one
+    exists (`resolve_community_tokens(community_id, "twitch")` returns
+    `source == "community"`); `None` for every other outcome -- no
+    community connection, `source == "env"`, the resolver module not
+    importable yet, or the resolver itself raising. Never raises: the
+    caller (`bundles/moderation_enforce_action.py::_enforce_twitch`) falls
+    back to its existing `moderator_token_ref`/`resolve_secret` config
+    path whenever this returns `None`, so a community with no connected
+    Twitch account behaves exactly as before this feature existed.
+
+    Deliberately does not attempt token *validation* (scope check) here --
+    same as `twitch_timeout`'s own docstring, an invalid/under-scoped
+    token surfaces as a 401/403 from the real Helix call, classified by
+    `_classify_twitch_response` same as any other configured token.
+    """
+    if resolve_community_tokens is None:
+        return None
+    try:
+        tokens = await resolve_community_tokens(community_id, "twitch")
+    except Exception as exc:  # noqa: BLE001 -- a resolver failure must never block enforcement
+        logger.debug(
+            "platform_moderation.community_resolve_failed community_id=%s error=%s",
+            community_id,
+            type(exc).__name__,
+        )
+        return None
+
+    if tokens is not None and tokens.source == "community" and tokens.access_token:
+        logger.debug(
+            "platform_moderation.token_source=community community_id=%s provider=twitch",
+            community_id,
+        )
+        return str(tokens.access_token)
+
+    logger.debug(
+        "platform_moderation.token_source=env community_id=%s provider=twitch", community_id
+    )
+    return None
 
 
 async def twitch_timeout(

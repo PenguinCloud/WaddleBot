@@ -72,6 +72,7 @@ import LoyaltyLeaderboard from './pages/admin/LoyaltyLeaderboard';
 import LoyaltyGiveaways from './pages/admin/LoyaltyGiveaways';
 import LoyaltyGames from './pages/admin/LoyaltyGames';
 import LoyaltyGear from './pages/admin/LoyaltyGear';
+import CommunityConnections from './pages/admin/CommunityConnections';
 import AdminWorkflows from './pages/admin/AdminWorkflows';
 import AdminShoutouts from './pages/admin/AdminShoutouts';
 import AdminTranslation from './pages/admin/AdminTranslation';
@@ -328,6 +329,7 @@ function App() {
         <Route path="/admin/:communityId/loyalty/giveaways" element={<LoyaltyGiveaways />} />
         <Route path="/admin/:communityId/loyalty/games" element={<LoyaltyGames />} />
         <Route path="/admin/:communityId/loyalty/gear" element={<LoyaltyGear />} />
+        <Route path="/admin/:communityId/connections" element={<CommunityConnections />} />
         <Route path="/admin/:communityId/raffle-customization" element={<AdminRaffleCustomization />} />
         <Route path="/admin/:communityId/shoutouts" element={<AdminShoutouts />} />
         <Route path="/admin/:communityId/translation" element={<AdminTranslation />} />

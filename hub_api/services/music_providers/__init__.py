@@ -17,17 +17,24 @@ community" instead of a 500).
 
 `community_music_settings.default_provider` (`services/schema.py`) is a
 per-community override for this same bare-text decision, but nothing reads
-it yet -- neither this module nor `services/community_music_queue_service.
-py::_resolve_track()` (which doesn't receive `community_id` today). Until
-that's wired through, the caller-supplied `provider` kwarg below is the
-only per-call override; the module-level default here (env-var-driven, not
-per-community) applies otherwise. See `resolve()`'s own DEBUG logging for
-which branch fired on a given call.
+it yet. The caller-supplied `provider` kwarg below is the only per-call
+override; the module-level default here (env-var-driven, not per-community)
+applies otherwise. See `resolve()`'s own DEBUG logging for which branch
+fired on a given call.
+
+`resolve()`/`search()`'s optional `db`/`community_id` kwargs (issue #320) are
+passed straight through to `youtube.resolve()`/`youtube.search()` only --
+`services/community_music_queue_service.py::_resolve_track()` supplies them
+so a YouTube resolution prefers the community's own connected account over
+env credentials; see that module's own docstring for the precedence/fallback
+contract. Spotify has no per-community connection support yet, so these
+kwargs are a no-op on the Spotify branch.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 from urllib.parse import urlparse
 
 from services.music_providers import spotify, youtube
@@ -59,14 +66,22 @@ def _detect_provider(url_or_query: str) -> str | None:
     return None
 
 
-async def _resolve_via(provider: str, url_or_query: str) -> Track:
+async def _resolve_via(
+    provider: str, url_or_query: str, *, db: Any, community_id: int | None
+) -> Track:
     """Dispatch to the named provider's own `resolve()` -- `provider` already validated."""
     if provider == "youtube":
-        return await youtube.resolve(url_or_query)
+        return await youtube.resolve(url_or_query, db=db, community_id=community_id)
     return await spotify.resolve(url_or_query)
 
 
-async def resolve(url_or_query: str, provider: str | None = None) -> Track:
+async def resolve(
+    url_or_query: str,
+    provider: str | None = None,
+    *,
+    db: Any = None,
+    community_id: int | None = None,
+) -> Track:
     """Resolve one URL or bare query to a single `Track`.
 
     Provider is auto-detected from the URL host when possible. For bare
@@ -77,19 +92,22 @@ async def resolve(url_or_query: str, provider: str | None = None) -> Track:
     `ProviderUnavailable` if the resolved provider has no usable
     credentials, `TrackNotFound` if the provider found nothing (or an
     unknown `provider` was given explicitly).
+
+    `db`/`community_id` (issue #320) -- see module docstring; forwarded only
+    to the YouTube branch, a no-op for Spotify.
     """
     detected_provider = _detect_provider(url_or_query)
     if detected_provider is not None:
         logger.debug(
             "music_providers.resolve provider=%s reason=url_host_detected", detected_provider
         )
-        return await _resolve_via(detected_provider, url_or_query)
+        return await _resolve_via(detected_provider, url_or_query, db=db, community_id=community_id)
 
     if provider is not None:
         if provider not in _KNOWN_PROVIDERS:
             raise TrackNotFound(url_or_query)
         logger.debug("music_providers.resolve provider=%s reason=explicit_provider_arg", provider)
-        return await _resolve_via(provider, url_or_query)
+        return await _resolve_via(provider, url_or_query, db=db, community_id=community_id)
 
     # Bare text, no explicit provider -- see module docstring for why
     # `community_music_settings.default_provider` isn't consulted here.
@@ -98,7 +116,7 @@ async def resolve(url_or_query: str, provider: str | None = None) -> Track:
             "music_providers.resolve provider=youtube reason=bare_text_default_youtube_key_set"
         )
         try:
-            return await youtube.resolve(url_or_query)
+            return await youtube.resolve(url_or_query, db=db, community_id=community_id)
         except (ProviderUnavailable, TrackNotFound) as exc:
             logger.debug(
                 "music_providers.resolve provider=spotify "
@@ -111,15 +129,20 @@ async def resolve(url_or_query: str, provider: str | None = None) -> Track:
     return await spotify.resolve(url_or_query)
 
 
-async def search(query: str, provider: str) -> list[Track]:
+async def search(
+    query: str, provider: str, *, db: Any = None, community_id: int | None = None
+) -> list[Track]:
     """Search a specific provider for `query`, returning every match found.
 
     Raises `ProviderUnavailable` if `provider` has no usable credentials,
     `TrackNotFound` if the search returns zero results.
+
+    `db`/`community_id` (issue #320) -- see module docstring; forwarded only
+    to the YouTube branch, a no-op for Spotify.
     """
     if provider not in _KNOWN_PROVIDERS:
         raise TrackNotFound(query)
 
     if provider == "youtube":
-        return await youtube.search(query)
+        return await youtube.search(query, db=db, community_id=community_id)
     return await spotify.search(query)

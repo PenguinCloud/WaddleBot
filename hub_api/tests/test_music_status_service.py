@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from services import music_status_service as status_mod
+from services.community_connections import DecryptedTokens
 from services.music_providers import youtube as youtube_mod
 
 _RealAsyncClient = httpx.AsyncClient
@@ -60,14 +61,16 @@ def _isolate_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_module_caches() -> Any:
-    """Every probe/token cache here is module-level state -- isolate every test."""
+    """Every probe/token/community-auth cache here is module-level state -- isolate every test."""
     status_mod._health_cache = None
-    status_mod._youtube_health_cache = None
+    status_mod._youtube_health_cache = {}
     youtube_mod._oauth_token_cache = None
+    youtube_mod._community_auth_cache = {}
     yield
     status_mod._health_cache = None
-    status_mod._youtube_health_cache = None
+    status_mod._youtube_health_cache = {}
     youtube_mod._oauth_token_cache = None
+    youtube_mod._community_auth_cache = {}
 
 
 def _oauth_trio(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,6 +94,7 @@ class TestYoutubeHealthNotConfigured:
 
         assert health.state == "not_configured"
         assert health.cause == "youtube credentials not configured"
+        assert health.source == "none"
 
 
 class TestYoutubeHealthApiKeyMode:
@@ -110,6 +114,7 @@ class TestYoutubeHealthApiKeyMode:
 
         assert health.state == "enabled"
         assert health.cause is None
+        assert health.source == "api_key"
         assert seen_params["id"] == "dQw4w9WgXcQ"
         assert seen_params["key"] == "test-key"
 
@@ -184,6 +189,7 @@ class TestYoutubeHealthOAuthMode:
         health = await status_mod.check_youtube_health()
 
         assert health.state == "enabled"
+        assert health.source == "env"
         assert seen_auth_header == "Bearer tok"
 
     async def test_refresh_exchange_failure_returns_error(
@@ -235,13 +241,125 @@ class TestYoutubeHealthCaching:
         _use_transport(monkeypatch, handler)
 
         await status_mod.check_youtube_health()
-        assert status_mod._youtube_health_cache is not None
+        assert status_mod._youtube_health_cache.get(None) is not None
         stale = time.monotonic() - status_mod._CACHE_TTL_SECONDS - 1
-        status_mod._youtube_health_cache.checked_at = stale
+        status_mod._youtube_health_cache[None].checked_at = stale
 
         await status_mod.check_youtube_health()
 
         assert call_count == 2
+
+
+class TestYoutubeHealthCommunitySource:
+    """`check_youtube_health(db, community_id)`'s `source` field (issue #320)."""
+
+    async def test_community_connected_reports_community_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "env-fallback-key")
+
+        async def fake_get_decrypted_tokens(_db: Any, community_id: int, provider: str) -> Any:
+            assert community_id == 42
+            assert provider == "youtube"
+            return DecryptedTokens(
+                access_token="community-token",
+                refresh_token=None,
+                expires_at=None,
+                scopes=[],
+            )
+
+        monkeypatch.setattr(youtube_mod, "get_decrypted_tokens", fake_get_decrypted_tokens)
+
+        seen_auth_header = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal seen_auth_header
+            seen_auth_header = request.headers.get("Authorization")
+            return httpx.Response(200, json={"items": [{"id": "dQw4w9WgXcQ"}]})
+
+        _use_transport(monkeypatch, handler)
+
+        health = await status_mod.check_youtube_health(db=object(), community_id=42)
+
+        assert health.state == "enabled"
+        assert health.source == "community"
+        assert seen_auth_header == "Bearer community-token"
+
+    async def test_no_community_connection_falls_back_to_env_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YOUTUBE_API_KEY", "env-key")
+
+        async def fake_get_decrypted_tokens(_db: Any, _community_id: int, _provider: str) -> Any:
+            return None
+
+        monkeypatch.setattr(youtube_mod, "get_decrypted_tokens", fake_get_decrypted_tokens)
+
+        seen_params: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_params.update(request.url.params)
+            return httpx.Response(200, json={"items": [{"id": "dQw4w9WgXcQ"}]})
+
+        _use_transport(monkeypatch, handler)
+
+        health = await status_mod.check_youtube_health(db=object(), community_id=42)
+
+        assert health.state == "enabled"
+        assert health.source == "api_key"
+        assert seen_params["key"] == "env-key"
+
+    async def test_no_community_id_skips_community_check_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No `community_id` -- today's env-only callers get today's env-only behavior."""
+        monkeypatch.setenv("YOUTUBE_API_KEY", "env-key")
+
+        async def boom_get_decrypted_tokens(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("community check must not run without a community_id")
+
+        monkeypatch.setattr(youtube_mod, "get_decrypted_tokens", boom_get_decrypted_tokens)
+        _use_transport(
+            monkeypatch, lambda _r: httpx.Response(200, json={"items": [{"id": "dQw4w9WgXcQ"}]})
+        )
+
+        health = await status_mod.check_youtube_health()
+
+        assert health.source == "api_key"
+
+    async def test_cache_is_keyed_per_community_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A probe for one community must never leak into another's cached result.
+
+        Nor into the env-only `None` slot's -- each gets its own network call.
+        """
+        monkeypatch.setenv("YOUTUBE_API_KEY", "env-key")
+
+        async def fake_get_decrypted_tokens(_db: Any, community_id: int, _provider: str) -> Any:
+            if community_id == 1:
+                return DecryptedTokens(
+                    access_token="community-1-token", refresh_token=None, expires_at=None, scopes=[]
+                )
+            return None
+
+        monkeypatch.setattr(youtube_mod, "get_decrypted_tokens", fake_get_decrypted_tokens)
+
+        call_count = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(200, json={"items": [{"id": "dQw4w9WgXcQ"}]})
+
+        _use_transport(monkeypatch, handler)
+
+        health_env_only = await status_mod.check_youtube_health()
+        health_community_1 = await status_mod.check_youtube_health(db=object(), community_id=1)
+        health_community_2 = await status_mod.check_youtube_health(db=object(), community_id=2)
+
+        assert call_count == 3
+        assert health_env_only.source == "api_key"
+        assert health_community_1.source == "community"
+        assert health_community_2.source == "api_key"
 
 
 class TestSpotifyHealthStillWorks:

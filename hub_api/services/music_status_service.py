@@ -11,18 +11,26 @@ losing the specific-cause detail `!sr status` needs to tell a community admin
 This module re-derives the same client-credentials flow independently, with
 its own >=60s in-process cache, entirely separate from that module's cache.
 
-`check_youtube_health()` probes YouTube alongside Spotify: presence-only via
-`services.music_providers.youtube.youtube_credentials_configured()`, then --
-when configured -- one cheap `videos.list?part=id` call against a known-good
-video id, reusing that module's own credential resolution/OAuth-token
-machinery (`_resolve_auth_mode()`/`_get_oauth_access_token()`) rather than
-duplicating the non-trivial OAuth refresh-token exchange. Unlike the Spotify
-probe above, the status-code -> cause mapping IS this module's own -- the
-same rationale as the Spotify probe: `youtube.py`'s own `_parse_data_api_
+`check_youtube_health()` probes YouTube alongside Spotify: `youtube_credentials_
+source()` first (issue #320 -- community connection, then env, presence-only,
+no network I/O), then -- unless `"none"` -- one cheap `videos.list?part=id`
+call against a known-good video id, reusing that module's own credential
+resolution/OAuth-token machinery (`_resolve_auth()`/`_get_oauth_access_token()`)
+rather than duplicating the non-trivial OAuth refresh-token exchange. Unlike the
+Spotify probe above, the status-code -> cause mapping IS this module's own --
+the same rationale as the Spotify probe: `youtube.py`'s own `_parse_data_api_
 response()` collapses 400/401/429/5xx into one generic `ProviderUnavailable(
 "youtube")`, losing the "(401)" detail `!sr status` needs. Also >=60s
-in-process cache, separate from both the Spotify cache above and
-`youtube.py`'s own OAuth-token cache.
+in-process cache, separate from both the Spotify cache above and `youtube.py`'s
+own OAuth-token/community-auth caches -- keyed by `community_id` (`None` for the
+env-only default every pre-issue-#320 caller uses) so one community's probe
+result can never leak into another's `!sr status` response.
+
+`check_youtube_health()`'s optional `db`/`community_id` kwargs (issue #320) are
+plumbing for a future caller to pass a specific community's context through;
+today's only caller (`blueprints/v1/community_music_queue.py`'s
+`_internal_music_status` handler) still calls it with neither, which preserves
+its pre-issue-#320 env-only behavior exactly.
 
 Never logs, prints, or returns the client secret, API key, or bearer token
 itself -- only a short, secret-free cause string on failure.
@@ -85,11 +93,15 @@ class YoutubeHealth:
     `state` is one of `"enabled"`/`"not_configured"`/`"error"` (unlike
     Spotify's plain `healthy: bool`, YouTube has a real third state -- no
     credentials configured at all, distinct from configured-but-failing)
-    -- `cause` is `None` iff `state == "enabled"`.
+    -- `cause` is `None` iff `state == "enabled"`. `source` (issue #320) is
+    which credential mode is actually in use -- `"community"`/`"env"`/
+    `"api_key"`/`"none"`, see `services.music_providers.youtube.
+    youtube_credentials_source()`; `"none"` iff `state == "not_configured"`.
     """
 
     state: str
     cause: str | None
+    source: str
 
 
 @dataclass(slots=True)
@@ -100,7 +112,9 @@ class _CachedYoutubeHealth:
     checked_at: float
 
 
-_youtube_health_cache: _CachedYoutubeHealth | None = None
+#: Community id -> cached probe result; `None` is the env-only-probe slot (issue
+#: #320) -- keyed so one community's result can never leak into another's.
+_youtube_health_cache: dict[int | None, _CachedYoutubeHealth] = {}
 _youtube_health_lock = asyncio.Lock()
 
 
@@ -190,32 +204,47 @@ async def check_spotify_health() -> ProviderHealth:
         return result
 
 
-async def _probe_youtube(http_client: httpx.AsyncClient) -> YoutubeHealth:
+async def _probe_youtube(
+    http_client: httpx.AsyncClient, db: Any = None, community_id: int | None = None
+) -> YoutubeHealth:
     """One real `videos.list?part=id` probe against YouTube; never raises.
 
-    Reuses `services.music_providers.youtube`'s own credential-presence
-    check and auth-mode/OAuth-token resolution (see module docstring for
-    why that machinery is reused rather than duplicated); only the
-    response's status-code -> cause mapping below is this probe's own.
+    `db`/`community_id` (issue #320): passed straight through to `youtube_
+    credentials_source()`/`_resolve_auth()` so a community-connected account is
+    preferred/reported the same way `resolve()`/`search()` prefer it -- both
+    default `None`, which preserves the pre-issue-#320 env-only probe. Reuses
+    `services.music_providers.youtube`'s own credential resolution/OAuth-token
+    machinery (see module docstring for why that machinery is reused rather than
+    duplicated); only the response's status-code -> cause mapping below is this
+    probe's own.
     """
-    if not youtube_provider.youtube_credentials_configured():
-        return YoutubeHealth(state="not_configured", cause="youtube credentials not configured")
+    source = await youtube_provider.youtube_credentials_source(db, community_id)
+    if source == "none":
+        return YoutubeHealth(
+            state="not_configured", cause="youtube credentials not configured", source=source
+        )
 
     try:
-        auth = youtube_provider._resolve_auth_mode()  # noqa: SLF001
+        auth = await youtube_provider._resolve_auth(db, community_id)  # noqa: SLF001
     except ProviderUnavailable:
-        return YoutubeHealth(state="not_configured", cause="youtube credentials not configured")
+        return YoutubeHealth(
+            state="not_configured", cause="youtube credentials not configured", source="none"
+        )
 
     params: dict[str, str] = {"part": "id", "id": _YOUTUBE_PROBE_VIDEO_ID}
     headers: dict[str, str] = {}
     if isinstance(auth, youtube_provider._ApiKeyAuth):  # noqa: SLF001
         params["key"] = auth.api_key
+    elif isinstance(auth, youtube_provider._CommunityAuth):  # noqa: SLF001
+        headers["Authorization"] = f"Bearer {auth.access_token}"
     else:
         try:
             token = await youtube_provider._get_oauth_access_token(http_client, auth)  # noqa: SLF001
         except ProviderUnavailable as exc:
             return YoutubeHealth(
-                state="error", cause=f"youtube oauth token didn't work: {exc.provider}"
+                state="error",
+                cause=f"youtube oauth token didn't work: {exc.provider}",
+                source=source,
             )
         headers["Authorization"] = f"Bearer {token}"
 
@@ -227,30 +256,42 @@ async def _probe_youtube(http_client: httpx.AsyncClient) -> YoutubeHealth:
             timeout=_TIMEOUT_SECONDS,
         )
     except httpx.HTTPError as exc:
-        return YoutubeHealth(state="error", cause=f"youtube unreachable: {type(exc).__name__}")
+        return YoutubeHealth(
+            state="error", cause=f"youtube unreachable: {type(exc).__name__}", source=source
+        )
 
     if response.status_code == 401:
-        return YoutubeHealth(state="error", cause="youtube oauth token didn't work (401)")
+        return YoutubeHealth(
+            state="error", cause="youtube oauth token didn't work (401)", source=source
+        )
     if response.status_code == 403:
         reason = youtube_provider._describe_403_reason(response)  # noqa: SLF001
-        return YoutubeHealth(state="error", cause=f"youtube quota/access error ({reason})")
+        return YoutubeHealth(
+            state="error", cause=f"youtube quota/access error ({reason})", source=source
+        )
     if response.status_code >= 400:
-        return YoutubeHealth(state="error", cause=f"youtube api error ({response.status_code})")
+        return YoutubeHealth(
+            state="error", cause=f"youtube api error ({response.status_code})", source=source
+        )
 
-    return YoutubeHealth(state="enabled", cause=None)
+    return YoutubeHealth(state="enabled", cause=None, source=source)
 
 
-async def check_youtube_health() -> YoutubeHealth:
-    """Return cached (>=60s) or freshly-probed YouTube health."""
-    global _youtube_health_cache
+async def check_youtube_health(db: Any = None, community_id: int | None = None) -> YoutubeHealth:
+    """Return cached (>=60s) or freshly-probed YouTube health.
+
+    `db`/`community_id` (issue #320) -- see `_probe_youtube()`'s own docstring;
+    cached per `community_id` (`None` slot for the env-only default) so results
+    for different communities never mix.
+    """
     async with _youtube_health_lock:
-        if (
-            _youtube_health_cache is not None
-            and (time.monotonic() - _youtube_health_cache.checked_at) < _CACHE_TTL_SECONDS
-        ):
-            return _youtube_health_cache.result
+        cached = _youtube_health_cache.get(community_id)
+        if cached is not None and (time.monotonic() - cached.checked_at) < _CACHE_TTL_SECONDS:
+            return cached.result
 
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-            result = await _probe_youtube(client)
-        _youtube_health_cache = _CachedYoutubeHealth(result=result, checked_at=time.monotonic())
+            result = await _probe_youtube(client, db, community_id)
+        _youtube_health_cache[community_id] = _CachedYoutubeHealth(
+            result=result, checked_at=time.monotonic()
+        )
         return result

@@ -12,6 +12,7 @@ SSRF guard -- see that module's own docstring).
 from __future__ import annotations
 
 import json as _json
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -475,3 +476,98 @@ class TestErrorMapping:
                     http_client=client,
                 )
         assert called is False
+
+
+class TestCommunityAwareOAuth:
+    """gh-320: `get_access_token_for_community` wiring -- community id resolution + token source."""
+
+    async def test_community_token_used_no_refresh_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        refresh_called = False
+
+        async def fake_resolve(community_id: int | None, provider: str) -> Any:
+            assert community_id == 42
+            assert provider == "youtube"
+            return SimpleNamespace(access_token="community-access-token", source="community")
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        def token_response(request: httpx.Request) -> httpx.Response:
+            nonlocal refresh_called
+            refresh_called = True
+            return httpx.Response(200, json=_TOKEN_PAYLOAD)
+
+        def data_api(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == "Bearer community-access-token"
+            return httpx.Response(200, json={"id": "msg1"})
+
+        handler = _routed_handler(data_api_response=data_api, token_response=token_response)
+        async with _client(handler) as client:
+            result = await send_message(_envelope(), _config(), http_client=client)
+
+        assert refresh_called is False
+        assert result.http_status == 200
+
+    async def test_no_community_connection_falls_back_to_env_refresh_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_resolve(community_id: int | None, provider: str) -> None:
+            return None
+
+        monkeypatch.setattr(oauth_mod, "resolve_community_tokens", fake_resolve)
+
+        def data_api(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == "Bearer test-access-token"
+            return httpx.Response(200, json={"id": "msg1"})
+
+        async with _client(_routed_handler(data_api_response=data_api)) as client:
+            result = await send_message(_envelope(), _config(), http_client=client)
+
+        assert result.http_status == 200
+
+    async def test_malformed_community_id_falls_back_to_env_refresh_flow(self) -> None:
+        """`envelope.community` not an integer -- `community_id` becomes `None`, never raises."""
+        envelope = StageEnvelope(
+            tenant="1",
+            community="not-an-int",
+            app_id="waddles.bot.youtube.default",
+            stage="action",
+            event=PlatformEvent(
+                platform="youtube",
+                event_type="message",
+                actor=None,
+                payload={"text": "hi", "live_chat_id": "chat123"},
+                occurred_at="2026-09-11T12:00:00Z",
+            ),
+            ts="2026-09-11T12:00:00Z",
+        )
+
+        handler = _routed_handler(data_api_response=lambda r: httpx.Response(200))
+        async with _client(handler) as client:
+            result = await send_message(envelope, _config(), http_client=client)
+
+        assert result.http_status == 200
+
+    async def test_no_community_still_resolves_via_env_refresh_flow(self) -> None:
+        """`envelope.community is None` (tenant-wide activation) -- `community_id` stays `None`."""
+        envelope = StageEnvelope(
+            tenant="1",
+            community=None,
+            app_id="waddles.bot.youtube.default",
+            stage="action",
+            event=PlatformEvent(
+                platform="youtube",
+                event_type="message",
+                actor=None,
+                payload={"text": "hi", "live_chat_id": "chat123"},
+                occurred_at="2026-09-11T12:00:00Z",
+            ),
+            ts="2026-09-11T12:00:00Z",
+        )
+
+        handler = _routed_handler(data_api_response=lambda r: httpx.Response(200))
+        async with _client(handler) as client:
+            result = await send_message(envelope, _config(), http_client=client)
+
+        assert result.http_status == 200

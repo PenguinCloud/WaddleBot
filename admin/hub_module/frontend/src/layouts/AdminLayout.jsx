@@ -41,6 +41,7 @@ import {
   ClipboardDocumentListIcon,
   UserPlusIcon,
   AcademicCapIcon,
+  LinkIcon,
 } from '@heroicons/react/24/outline';
 
 function AdminLayout() {
@@ -115,6 +116,14 @@ function AdminLayout() {
             { to: `/admin/${communityId}/loyalty/games`, icon: CubeIcon, label: 'Games' },
             { to: `/admin/${communityId}/loyalty/gear`, icon: InboxStackIcon, label: 'Gear' },
             { to: `/admin/${communityId}/raffle-customization`, icon: SpeakerWaveIcon, label: 'Raffle Sounds', premium: true },
+          ],
+        },
+        {
+          key: 'connections',
+          label: 'Connections',
+          icon: LinkIcon,
+          items: [
+            { to: `/admin/${communityId}/connections`, icon: LinkIcon, label: 'Connections' },
           ],
         },
         {

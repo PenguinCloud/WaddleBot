@@ -535,6 +535,13 @@ export const adminApi = {
   // Server link requests (community-initiated)
   createServerLinkRequest: (communityId, data) =>
     api.post(`/api/v1/admin/${communityId}/server-link-requests`, data),
+  // Community OAuth connections (gh-320)
+  listCommunityConnections: (communityId) =>
+    api.get(`/api/v1/communities/${communityId}/connections`),
+  authorizeCommunityConnection: (communityId, provider) =>
+    api.post(`/api/v1/communities/${communityId}/connections/${provider}/authorize`),
+  disconnectCommunityConnection: (communityId, provider) =>
+    api.delete(`/api/v1/communities/${communityId}/connections/${provider}`),
 };
 
 export const supportApi = {
