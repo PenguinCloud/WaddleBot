@@ -153,10 +153,12 @@ async def transform(event: PlatformEvent) -> PlatformEvent | None:
     welcome_text, source = await _build_welcome(platform_username=platform_username)
     logger.info(
         "welcome_sent",
-        platform=event.platform,
-        user_id=platform_user_id,
-        community_id=community_id,
-        source=source,
+        extra={
+            "platform": event.platform,
+            "user_id": platform_user_id,
+            "community_id": community_id,
+            "source": source,
+        },
     )
 
     # Return modified event with welcome text

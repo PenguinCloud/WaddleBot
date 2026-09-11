@@ -69,8 +69,14 @@ def create_health_blueprint(module_name: str, module_version: str):
                 checks["checks"]["memory"] = "warning"
                 checks["status"] = "degraded"
 
-            # CPU check (fail if > 95% used)
-            cpu_percent = psutil.cpu_percent(interval=0.1)
+            # CPU check (fail if > 95% used). `interval=None` is non-blocking and
+            # compares against the last call, instead of a blocking 100ms sample --
+            # a fixed 100ms window is highly exposed to transient host scheduling
+            # noise from *other* processes on a shared/busy node (observed tripping
+            # this check under concurrent CI/dev load with no relation to this
+            # service's own health), which would spuriously flip a K8s liveness/
+            # readiness probe to failing and could trigger needless pod restarts.
+            cpu_percent = psutil.cpu_percent(interval=None)
             if cpu_percent > 95:
                 checks["checks"]["cpu"] = "warning"
                 checks["status"] = "degraded"

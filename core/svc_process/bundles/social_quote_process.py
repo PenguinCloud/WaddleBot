@@ -69,17 +69,15 @@ async def transform(event: PlatformEvent) -> PlatformEvent | None:
 
     if subcommand == "random":
         # Fetch random quote
-        reply_text = await _fetch_random_quote()
-        if not reply_text:
-            reply_text = "No quotes found."
+        fetched = await _fetch_random_quote()
+        reply_text = fetched or "No quotes found."
         return dataclasses.replace(event, payload={**event.payload, "text": reply_text})
 
     # Try to parse as quote ID
     if re.match(r"^\d+$", subcommand):
         quote_id = int(subcommand)
-        reply_text = await _fetch_quote(quote_id)
-        if not reply_text:
-            reply_text = f"Quote #{quote_id} not found."
+        fetched = await _fetch_quote(quote_id)
+        reply_text = fetched or f"Quote #{quote_id} not found."
         return dataclasses.replace(event, payload={**event.payload, "text": reply_text})
 
     # Unknown subcommand

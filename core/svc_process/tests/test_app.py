@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from flask_core import get_bundle_dal, reset_bundle_dal_for_tests
@@ -31,9 +32,41 @@ class TestHealthEndpoints:
             assert body["module"] == "svc-process"
 
     async def test_healthz(self, client: Any) -> None:
-        async with client as c:
-            response = await c.get("/healthz")
-            assert response.status_code == 200
+        """Assert `/healthz` returns 200 with mocked, deterministic `psutil` readings.
+
+        `/healthz` (`flask_core.api_utils`) derives from real host CPU/memory via
+        `psutil` -- mock both so this assertion is deterministic regardless of host
+        load. Without this, `psutil.cpu_percent` reading a transient spike (e.g. a
+        heavily loaded shared dev/CI host with unrelated concurrent processes) trips
+        the >95% threshold and flips this test to a flaky, intermittent 503 with no
+        relation to svc-process's own health.
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 10.0
+            async with client as c:
+                response = await c.get("/healthz")
+                assert response.status_code == 200
+
+    async def test_healthz_reports_503_when_resources_degraded(self, client: Any) -> None:
+        """Regression: the degraded-resource branch of `/healthz` must still 503.
+
+        Pinned via mocked `psutil` (independent of real host state) so this can't
+        silently bitrot into an always-200 endpoint while `test_healthz` above is
+        also mocked healthy.
+        """
+        with (
+            patch("flask_core.api_utils.psutil.virtual_memory") as mock_vmem,
+            patch("flask_core.api_utils.psutil.cpu_percent", return_value=10.0),
+        ):
+            mock_vmem.return_value.percent = 95.0
+            async with client as c:
+                response = await c.get("/healthz")
+                assert response.status_code == 503
+                body = await response.get_json()
+                assert body["status"] == "degraded"
 
     async def test_metrics(self, client: Any) -> None:
         async with client as c:

@@ -193,10 +193,12 @@ class BundlePoller:
                 community_id=self._community_id,
             )
         except Exception as exc:  # noqa: BLE001 - poll loop must never crash the runner
+            error_str = str(exc) if str(exc) else repr(exc)
             logger.warning(
-                "stage_runner.poll_failed stage=%s error=%s backoff_s=%s",
+                "stage_runner.poll_failed stage=%s error_type=%s error=%s backoff_s=%s",
                 self._stage,
-                exc,
+                type(exc).__name__,
+                error_str,
                 self._current_backoff_s,
             )
             self._next_delay_s = self._current_backoff_s

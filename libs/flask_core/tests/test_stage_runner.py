@@ -263,3 +263,43 @@ class TestBundlePoller:
         await poller.poll_once()
         assert poller.next_delay_s == 15.0  # stays capped
         await client.aclose()
+
+    async def test_poll_failure_logs_error_type_and_repr_on_empty_str(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Verify poll_failed logs error_type and falls back to repr() when str(exc) is empty.
+
+        Some exceptions (e.g. redis.exceptions.ConnectionError()) have an
+        empty str() representation, which would result in `error=` with no
+        value. The fix ensures error_type is always logged and error falls
+        back to repr(exc) when str(exc) is empty.
+        """
+
+        class EmptyStrException(Exception):
+            """An exception whose str() is empty."""
+
+            def __str__(self) -> str:
+                return ""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise EmptyStrException("some context")
+
+        client = _make_client(handler)
+        poller = sr.BundlePoller(
+            client,
+            "http://hub-api/api/v1/distribution/bundles",
+            stage="ingest",
+            jwt_provider=lambda: "t",
+            base_backoff_s=1.0,
+        )
+
+        with caplog.at_level("WARNING"):
+            await poller.poll_once()
+
+        # Verify error_type is logged with the exception class name
+        assert "error_type=EmptyStrException" in caplog.text
+        # Verify error falls back to repr when str is empty
+        assert "error=" in caplog.text
+        assert "EmptyStrException" in caplog.text  # from repr fallback
+        assert "stage_runner.poll_failed" in caplog.text
+        await client.aclose()
