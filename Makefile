@@ -126,6 +126,19 @@ mobile-test:
 mobile-test-android:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; cd android && ./gradlew testDebugUnitTest jacocoTestReport && cd .. && bash scripts/coverage_gate.sh 90 android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml jacoco"
 
+mobile-test-integration: ## Boot the container-hosted Android emulator (needs /dev/kvm) and run integration_test/ + connectedDebugAndroidTest
+	@test -e /dev/kvm || { echo "ERROR: /dev/kvm not present - integration tests require KVM. Check 'ls -l /dev/kvm' and that your user is in the kvm group; GitHub Actions ubuntu-latest runners enable it via udev rules (see the integration CI job)."; exit 1; }
+	docker run --rm \
+		--device /dev/kvm \
+		--network host \
+		--user $(shell id -u):$(shell id -g) \
+		-v $(PWD)/mobile/gazer:/work \
+		-v gazer-pub-cache:/home/appuser/.pub-cache \
+		-v gazer-gradle:/home/appuser/.gradle \
+		-w /work \
+		gazer-toolchain:3.47.2 \
+		bash scripts/run_integration_test.sh
+
 mobile-build:
 	$(MOBILE_RUN) bash -lc "set -euo pipefail; flutter build apk --split-per-abi --obfuscate --split-debug-info=build/symbols; flutter build appbundle --obfuscate --split-debug-info=build/symbols"
 
