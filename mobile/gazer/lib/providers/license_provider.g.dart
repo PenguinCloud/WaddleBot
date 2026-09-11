@@ -109,7 +109,7 @@ final class LicenseProvider
   }
 }
 
-String _$licenseHash() => r'6a63e5ae404ad9019140c533aa3f105731b8e3a2';
+String _$licenseHash() => r'a62a4adb71d32d7c7afcc55aebb3be657c38c1b0';
 
 /// Read-only view over [license] for flag checks; never throws — while
 /// [license] is loading or has errored, flags default to all-OFF via
