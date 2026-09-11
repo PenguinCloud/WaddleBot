@@ -163,9 +163,17 @@ void main() {
   testWidgets(
     'a retryable error enters ReconnectingState; Stop cancels back to Idle',
     (WidgetTester tester) async {
+      // Pinned to phone width: Flutter's default test viewport (800dp) is
+      // >=600dp, which would otherwise trigger HomeScreen's two-pane tablet
+      // layout (Task 16) and render the "Reconnecting" label twice — once
+      // in the StatusChip, once in StatusPanel's persistent side pane —
+      // making the single-match assertion below ambiguous. Pre-existing
+      // gap from Task 16, surfaced and fixed here since this file is
+      // already in scope for Task 22.
       await pumpGazerApp(
         tester,
         overrides: overrides(license: license(flagsSet: true)),
+        size: const Size(390, 844),
       );
       await tester.tap(find.widgetWithText(FilledButton, 'Go Live'));
       await tester.pumpAndSettle();
