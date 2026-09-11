@@ -235,6 +235,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Container jobs default `run:` steps to `sh`, not `bash`, even when the image has bash
+    # installed (confirmed by run 34547868184: "Illegal option -o pipefail" from dash) -- the
+    # bash-only `set -euo pipefail` used throughout this job's plain run: steps requires this.
+    defaults:
+      run:
+        shell: bash
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
       # root ONLY for the runner's own checkout/cache/artifact steps -- see analyze job's comment
@@ -430,6 +436,11 @@ jobs:
     permissions:
       contents: write
       packages: read  # added so this job's new container: step below can pull the toolchain image
+    # See the `build` job's identical comment above: container jobs default run: steps to sh,
+    # not bash, and the process-substitution + set -o pipefail below need real bash.
+    defaults:
+      run:
+        shell: bash
     container:
       image: ${{ needs.toolchain.outputs.image }}  # zizmor: ignore[unpinned-images] -- resolved to a repo@sha256:<digest> ref by toolchain job's "Resolve image ref" step; static analysis cannot see through the job-output indirection
       # root ONLY for the runner's own checkout/download-artifact steps and the read-only
