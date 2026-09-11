@@ -2101,3 +2101,254 @@ class TestRaidAutoShoutout:
         finally:
             reset_bundle_dal_for_tests()
             raid_shoutout_module.reset_redis_client_for_tests()
+
+
+def _stream_status_envelope(
+    *, community: str | None, event_type: str = "stream.online"
+) -> StageEnvelope:
+    """A `stream.online`/`stream.offline` `StageEnvelope`, shaped like `normalize`'s real output."""
+    return StageEnvelope(
+        tenant=TENANT,
+        community=community,
+        app_id=APP_ID,
+        stage="process",
+        event=PlatformEvent(
+            platform="twitch",
+            event_type=event_type,
+            actor="999",
+            payload={
+                "broadcaster_id": "999",
+                "broadcaster_login": "waddlebot",
+                "user_id": None,
+                "user_login": None,
+                "user_display_name": None,
+                "metadata": {"type": "live", "started_at": "2026-01-01T00:00:00Z"},
+            },
+            occurred_at="2026-01-01T00:00:00+00:00",
+        ),
+        ts="2026-01-01T00:00:00+00:00",
+    )
+
+
+class TestLiveStatusHook:
+    """gh #287 S10: `_transform_and_enqueue` calls `services.live_status.record_live_event`.
+
+    Wiring-only coverage -- the `coordination` upsert itself is covered by
+    `test_live_status.py`. These monkeypatch `runner.record_live_event`/
+    `runner.feature_enabled` (the names imported into `runner.py`'s own
+    namespace), same pattern as `TestRaidAutoShoutout` above.
+    """
+
+    async def _stub_transform(self, event: PlatformEvent) -> PlatformEvent | None:
+        return None
+
+    async def test_calls_record_live_event_for_stream_online(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+        from services.live_status import LiveStatusResult
+
+        captured: dict[str, Any] = {}
+
+        async def _stub_record(event: PlatformEvent, *, community: str | None) -> LiveStatusResult:
+            captured["event"] = event
+            captured["community"] = community
+            return LiveStatusResult(recorded=True, is_live=True, reason="ok")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "record_live_event", _stub_record)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(_stream_status_envelope(community="42").to_dict())
+        )
+
+        processed = await runner.run_once()
+        assert processed == 0  # no chat-command reply -- nothing on the bot's own action key
+
+        assert captured["community"] == "42"
+        assert captured["event"].event_type == "stream.online"
+        assert captured["event"].payload["broadcaster_id"] == "999"
+
+    async def test_non_live_status_event_never_calls_record(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ordinary chat message never triggers the live-status hook."""
+        import runner as runner_module
+
+        calls: list[PlatformEvent] = []
+
+        async def _stub_record(event: PlatformEvent, *, community: str | None) -> Any:
+            calls.append(event)
+            raise AssertionError("must never be called for a non-live-status event")
+
+        monkeypatch.setattr(runner_module, "record_live_event", _stub_record)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.echo_process:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        env_in = _envelope(community="42", stage="process", text="hello there")
+        await redis_client.lpush(process_key, json.dumps(env_in.to_dict()))
+
+        processed = await runner.run_once()
+        assert processed == 1
+        assert calls == []
+
+    async def test_flag_off_skips_record_entirely(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        record_called = False
+
+        async def _stub_record(event: PlatformEvent, *, community: str | None) -> Any:
+            nonlocal record_called
+            record_called = True
+            raise AssertionError("must never be called while the flag is off")
+
+        async def _flag_off(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(runner_module, "record_live_event", _stub_record)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_off)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(_stream_status_envelope(community="42").to_dict())
+        )
+
+        processed = await runner.run_once()
+        assert processed == 0
+        assert record_called is False
+
+    async def test_record_failure_never_breaks_the_pipeline(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import runner as runner_module
+
+        async def _raising_record(event: PlatformEvent, *, community: str | None) -> Any:
+            raise RuntimeError("simulated live_status outage")
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(runner_module, "record_live_event", _raising_record)
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        monkeypatch.setattr(runner_module, "load_entrypoint", lambda ep: self._stub_transform)
+
+        poller = _make_poller(
+            http_client_factory,
+            [
+                {
+                    "appId": APP_ID,
+                    "communityId": 42,
+                    "entrypoint": "bundles.stub:transform",
+                    "spec": {},
+                    "config": {},
+                }
+            ],
+        )
+        runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+        process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+        await redis_client.lpush(
+            process_key, json.dumps(_stream_status_envelope(community="42").to_dict())
+        )
+
+        # Must not raise/crash the drain loop despite record_live_event blowing up.
+        processed = await runner.run_once()
+        assert processed == 0
+
+    async def test_real_record_end_to_end_with_bound_dal(
+        self, redis_client: Any, http_client_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No monkeypatched decision -- the real `live_status.record_live_event` runs."""
+        from flask_core import reset_bundle_dal_for_tests, set_bundle_dal
+
+        import runner as runner_module
+
+        captured_sql: dict[str, Any] = {}
+
+        class _FakeDal:
+            async def execute(self, sql: str, params: list[Any] | None = None) -> list[Any]:
+                captured_sql["sql"] = sql
+                captured_sql["params"] = params
+                return []
+
+        async def _flag_on(*args: Any, **kwargs: Any) -> bool:
+            return True
+
+        set_bundle_dal(_FakeDal())
+        monkeypatch.setattr(runner_module, "feature_enabled", _flag_on)
+        try:
+            poller = _make_poller(
+                http_client_factory,
+                [
+                    {
+                        "appId": APP_ID,
+                        "communityId": 42,
+                        "entrypoint": "bundles.bot_process:transform",
+                        "spec": {},
+                        "config": {},
+                    }
+                ],
+            )
+            runner = ProcessRunner(poller=poller, redis_client=redis_client, tenant_slug=TENANT)
+            process_key = bundle_stream_key(TENANT, "42", APP_ID, "process")
+            await redis_client.lpush(
+                process_key, json.dumps(_stream_status_envelope(community="42").to_dict())
+            )
+
+            processed = await runner.run_once()
+            assert processed == 0  # bot_process itself never replies to a stream.online event
+
+            assert "INSERT INTO coordination" in captured_sql["sql"]
+            assert "ON CONFLICT (platform, channel_id)" in captured_sql["sql"]
+            assert captured_sql["params"][0] == "twitch:999"  # entity_id
+            assert captured_sql["params"][1] == "twitch"  # platform
+            assert captured_sql["params"][2] == "999"  # server_id
+            assert captured_sql["params"][3] == "999"  # channel_id
+            assert captured_sql["params"][5] is True  # is_live
+        finally:
+            reset_bundle_dal_for_tests()

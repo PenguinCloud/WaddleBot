@@ -44,6 +44,22 @@ CONSUMES_TAG = "twitch.eventsub"
 
 #: EventSub subscription types this connector's MVP normalizes -- matches
 #: `bundles/twitch_eventsub_ingest.py`'s own `KNOWN_EVENT_TYPES`.
+#:
+#: gh #287 S10 (live ON/OFF detection): `stream.online`/`stream.offline`
+#: added -- this is the webhook-side companion edit
+#: `bundles/twitch_eventsub_ingest.py`'s own module docstring flagged as
+#: the "known gap" blocking a real Twitch webhook delivery for either type
+#: from ever reaching `normalize()` (this handler's `handle_webhook`
+#: drops any `event_type` not in this set BEFORE `build_raw_event` runs).
+#: Both subscribe the same way `channel.raid` already does -- EventSub
+#: `version="1"`, `condition={"broadcaster_user_id": <id>}`, no extra
+#: condition field (unlike `channel.follow`, which additionally needs
+#: `moderator_user_id`) -- per the legacy module's own
+#: `subscribe_to_events`/`_create_subscription` default list and
+#: condition-building logic (`trigger/receiver/twitch_module/services/
+#: eventsub_handler.py`), which this handler does not itself port (see
+#: this module's own docstring -- subscription *creation* stays out of
+#: scope, only the inbound webhook filter is this set's job).
 DEFAULT_SUBSCRIPTION_TYPES = frozenset(
     {
         "channel.follow",
@@ -51,6 +67,8 @@ DEFAULT_SUBSCRIPTION_TYPES = frozenset(
         "channel.subscription.gift",
         "channel.cheer",
         "channel.raid",
+        "stream.online",
+        "stream.offline",
     }
 )
 
@@ -99,6 +117,20 @@ def build_raw_event(
         metadata = {"viewers": event.get("viewers", 0)}
     elif event_type == "channel.cheer":
         metadata = {"bits": event.get("bits", 0), "is_anonymous": event.get("is_anonymous", False)}
+    elif event_type == "stream.online":
+        # gh #287 S10 -- real Twitch payload: {id, broadcaster_user_id,
+        # broadcaster_user_login, broadcaster_user_name, type, started_at}.
+        # `type` ("live"/"playlist"/"watch_party"/"premiere"/"rerun") and
+        # `started_at` ride in `metadata` exactly like `channel.raid`'s
+        # `viewers` above -- `bundles/twitch_eventsub_ingest.py::normalize`
+        # passes `metadata` straight through onto `PlatformEvent.payload`.
+        metadata = {"type": event.get("type", "live"), "started_at": event.get("started_at", "")}
+    elif event_type == "stream.offline":
+        # Real Twitch payload carries no extra fields beyond
+        # broadcaster_user_id/_login/_name -- metadata is deliberately
+        # empty, matching `test_normalizes_a_stream_offline_event`'s own
+        # assertion in `bundles/twitch_eventsub_ingest.py`'s test suite.
+        metadata = {}
 
     return {
         "platform": "twitch",

@@ -57,3 +57,35 @@ async def test_falls_back_to_broadcaster_id_when_no_user_identity() -> None:
     raw = {"event_type": "channel.raid", "broadcaster_id": "999", "metadata": {"viewers": 10}}
     event = await normalize(raw)
     assert event.actor == "999"
+
+
+async def test_normalizes_a_stream_online_event() -> None:
+    """Gh #287 S10 -- `stream.online` carries no `user_*` identity, only broadcaster fields."""
+    raw = {
+        "platform": "twitch",
+        "event_type": "stream.online",
+        "broadcaster_id": "999",
+        "broadcaster_login": "waddlebot",
+        "metadata": {"type": "live", "started_at": "2026-09-11T12:00:00Z"},
+    }
+    event = await normalize(raw)
+
+    assert event.event_type == "stream.online"
+    assert event.actor == "999"  # falls back to broadcaster_id, no user_* fields present
+    assert event.payload["broadcaster_id"] == "999"
+    assert event.payload["broadcaster_login"] == "waddlebot"
+    assert event.payload["metadata"] == {"type": "live", "started_at": "2026-09-11T12:00:00Z"}
+
+
+async def test_normalizes_a_stream_offline_event() -> None:
+    raw = {
+        "platform": "twitch",
+        "event_type": "stream.offline",
+        "broadcaster_id": "999",
+        "broadcaster_login": "waddlebot",
+    }
+    event = await normalize(raw)
+
+    assert event.event_type == "stream.offline"
+    assert event.payload["broadcaster_id"] == "999"
+    assert event.payload["metadata"] == {}

@@ -606,6 +606,124 @@ def render_music(
 </html>"""
 
 
+#: Pinned HLS.js build (issue #287 S7 §3) -- `core/svc_streaming`'s HLS
+#: egress sink is the only producer this player ever points at, so a fixed
+#: version (not `@latest`) matches this repo's dependency-pinning rule
+#: (`rules/critical-rules.md` Dependency Pinning) even for a CDN script tag.
+_HLS_JS_VERSION = "1.5.13"
+_HLS_JS_SRC = f"https://cdnjs.cloudflare.com/ajax/libs/hls.js/{_HLS_JS_VERSION}/hls.min.js"
+
+
+def render_live(
+    community: str,
+    *,
+    live: bool,
+    master_url: str | None,
+    primary_color: str | None = None,
+    secondary_color: str | None = None,
+    font_family: str | None = None,
+) -> str:
+    """Live-stream (HLS) browser-source surface -- HLS.js player + LIVE/offline badge.
+
+    `live`/`master_url` are the caller's own initial server-side read
+    (`blueprints/live_stream.py`'s own `GET {STREAMING_URL}/live/<community_id>`
+    proxy call) so the first paint never flashes "offline" while the first
+    client-side poll is still in flight. The embedded script then polls this
+    service's own `/overlay/<community>/live/status` endpoint every 10s and
+    swaps the player source / badge state as svc-streaming pipelines start
+    and stop -- same "server holds the internal call, browser polls a local
+    JSON endpoint" shape `render_music`'s queue polling already established
+    for hub-api.
+    """
+    safe_community = html.escape(community)
+    theme_style = _theme_style(
+        primary_color=primary_color, secondary_color=secondary_color, font_family=font_family
+    )
+    initial_url = json.dumps(master_url) if master_url else "null"
+    initial_live = "true" if (live and master_url) else "false"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>svc-presentation -- live -- {safe_community}</title>
+{theme_style}
+<style>
+{_BASE_STYLE}
+    #live-wrap {{ position: fixed; inset: 0; background: #000; }}
+    video {{ width: 100%; height: 100%; object-fit: contain; }}
+    #badge {{ position: fixed; top: 16px; left: 16px; padding: 6px 14px; border-radius: 20px;
+      font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }}
+    #badge.live {{ color: #fff; background: #e0245e; }}
+    #badge.offline {{ color: #aaa; background: rgba(0,0,0,0.6); }}
+    #offline-message {{ position: fixed; inset: 0; display: flex; align-items: center;
+      justify-content: center; color: #888; font-size: 18px; }}
+</style>
+</head>
+<body data-community="{safe_community}" data-surface="live">
+  <div id="live-wrap">
+    <video id="player" autoplay muted playsinline class="hidden"></video>
+    <div id="offline-message">stream offline</div>
+  </div>
+  <div id="badge" class="offline">offline</div>
+  <script src="{_HLS_JS_SRC}"></script>
+  <script>
+    const community = {json.dumps(community)};
+    const POLL_INTERVAL_MS = 10000;
+    let hls = null;
+    let currentUrl = null;
+
+    function setLive(isLive) {{
+      const badge = document.getElementById('badge');
+      const video = document.getElementById('player');
+      const offline = document.getElementById('offline-message');
+      badge.textContent = isLive ? 'LIVE' : 'offline';
+      badge.classList.toggle('live', isLive);
+      badge.classList.toggle('offline', !isLive);
+      video.classList.toggle('hidden', !isLive);
+      offline.classList.toggle('hidden', isLive);
+    }}
+
+    function attach(url) {{
+      if (url === currentUrl) return;
+      currentUrl = url;
+      const video = document.getElementById('player');
+      if (hls) {{ hls.destroy(); hls = null; }}
+      if (!url) {{ video.removeAttribute('src'); return; }}
+      if (window.Hls && Hls.isSupported()) {{
+        hls = new Hls();
+        hls.loadSource(url);
+        hls.attachMedia(video);
+      }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+        video.src = url;
+      }}
+    }}
+
+    async function poll() {{
+      try {{
+        const resp = await fetch(`/overlay/${{community}}/live/status`);
+        if (!resp.ok) {{ setLive(false); attach(null); return; }}
+        const data = await resp.json();
+        const pipelines = data.pipelines || [];
+        const first = pipelines[0];
+        const isLive = !!(data.live && first);
+        setLive(isLive);
+        attach(isLive ? first.url : null);
+      }} catch (err) {{
+        console.error('live status poll failed', err);
+        setLive(false);
+        attach(null);
+      }}
+    }}
+
+    setLive({initial_live});
+    attach({initial_url});
+    poll();
+    setInterval(poll, POLL_INTERVAL_MS);
+  </script>
+</body>
+</html>"""
+
+
 RENDERERS: dict[str, Any] = {
     "full_screen": render_full_screen,
     "media": render_media,

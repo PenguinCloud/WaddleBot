@@ -17,6 +17,7 @@ from flask_core.stream_pipeline import bundle_stream_key
 
 from bundles.twitch_gateway_manifest import register_default_bundles
 from eventsub import (
+    DEFAULT_SUBSCRIPTION_TYPES,
     EVENTSUB_MESSAGE_ID,
     EVENTSUB_MESSAGE_TYPE,
     EVENTSUB_SIGNATURE,
@@ -60,6 +61,13 @@ class TestVerifySignature:
         assert verify_signature(secret=SECRET, headers={}, body=b"{}") is False
 
 
+class TestDefaultSubscriptionTypes:
+    def test_includes_stream_online_and_offline(self) -> None:
+        """Gh #287 S10 -- the webhook-side filter must not drop a real Twitch delivery."""
+        assert "stream.online" in DEFAULT_SUBSCRIPTION_TYPES
+        assert "stream.offline" in DEFAULT_SUBSCRIPTION_TYPES
+
+
 class TestBuildRawEvent:
     def test_follow_event_shape(self) -> None:
         raw = build_raw_event(
@@ -79,6 +87,38 @@ class TestBuildRawEvent:
         )
         assert raw["metadata"] == {"viewers": 42}
         assert raw["user_id"] == "111"
+
+    def test_stream_online_event_metadata(self) -> None:
+        """Gh #287 S10 -- `started_at`/`type` ride in `metadata`, no `user_*` identity."""
+        raw = build_raw_event(
+            "stream.online",
+            {
+                "broadcaster_user_id": "999",
+                "broadcaster_user_login": "waddlebot",
+                "type": "live",
+                "started_at": "2026-09-11T12:00:00Z",
+            },
+            {},
+        )
+        assert raw["event_type"] == "stream.online"
+        assert raw["broadcaster_id"] == "999"
+        assert raw["broadcaster_login"] == "waddlebot"
+        assert raw["user_id"] is None
+        assert raw["metadata"] == {"type": "live", "started_at": "2026-09-11T12:00:00Z"}
+
+    def test_stream_online_event_defaults_type_when_absent(self) -> None:
+        raw = build_raw_event("stream.online", {"broadcaster_user_id": "999"}, {})
+        assert raw["metadata"] == {"type": "live", "started_at": ""}
+
+    def test_stream_offline_event_metadata_is_empty(self) -> None:
+        raw = build_raw_event(
+            "stream.offline",
+            {"broadcaster_user_id": "999", "broadcaster_user_login": "waddlebot"},
+            {},
+        )
+        assert raw["event_type"] == "stream.offline"
+        assert raw["broadcaster_id"] == "999"
+        assert raw["metadata"] == {}
 
 
 class TestTwitchEventSubHandler:
@@ -132,6 +172,66 @@ class TestTwitchEventSubHandler:
         assert raw is not None
         event = json.loads(raw)
         assert event["event_type"] == "channel.follow"
+
+    async def test_notification_fans_out_a_stream_online_event(self, redis_client: Any) -> None:
+        """Gh #287 S10 -- a signed `stream.online` webhook reaches the ingest queue."""
+        handler = self._handler(redis_client)
+        body_json = {
+            "subscription": {
+                "type": "stream.online",
+                "condition": {"broadcaster_user_id": "999"},
+            },
+            "event": {
+                "broadcaster_user_id": "999",
+                "broadcaster_user_login": "waddlebot",
+                "type": "live",
+                "started_at": "2026-09-11T12:00:00Z",
+            },
+        }
+        body = json.dumps(body_json).encode()
+        headers = _signed_headers(message_id="m1", timestamp="t1", body=body)
+        headers[EVENTSUB_MESSAGE_TYPE] = "notification"
+
+        response, status = await handler.handle_webhook(
+            headers=headers, body=body, body_json=body_json
+        )
+        assert status == 200
+        assert response == {"status": "ok"}
+
+        ingest_key = bundle_stream_key(TENANT, None, APP_ID, "ingest")
+        raw = await redis_client.rpop(ingest_key)
+        assert raw is not None
+        event = json.loads(raw)
+        assert event["event_type"] == "stream.online"
+        assert event["broadcaster_id"] == "999"
+        assert event["metadata"] == {"type": "live", "started_at": "2026-09-11T12:00:00Z"}
+
+    async def test_notification_fans_out_a_stream_offline_event(self, redis_client: Any) -> None:
+        handler = self._handler(redis_client)
+        body_json = {
+            "subscription": {
+                "type": "stream.offline",
+                "condition": {"broadcaster_user_id": "999"},
+            },
+            "event": {"broadcaster_user_id": "999", "broadcaster_user_login": "waddlebot"},
+        }
+        body = json.dumps(body_json).encode()
+        headers = _signed_headers(message_id="m1", timestamp="t1", body=body)
+        headers[EVENTSUB_MESSAGE_TYPE] = "notification"
+
+        response, status = await handler.handle_webhook(
+            headers=headers, body=body, body_json=body_json
+        )
+        assert status == 200
+        assert response == {"status": "ok"}
+
+        ingest_key = bundle_stream_key(TENANT, None, APP_ID, "ingest")
+        raw = await redis_client.rpop(ingest_key)
+        assert raw is not None
+        event = json.loads(raw)
+        assert event["event_type"] == "stream.offline"
+        assert event["broadcaster_id"] == "999"
+        assert event["metadata"] == {}
 
     async def test_notification_ignores_an_unknown_event_type(self, redis_client: Any) -> None:
         handler = self._handler(redis_client)

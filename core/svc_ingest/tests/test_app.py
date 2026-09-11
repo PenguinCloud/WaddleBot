@@ -16,16 +16,23 @@ trip, by `test_runner.py`.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import sys
 from typing import Any
 from unittest.mock import patch
 
+import fakeredis
 import pytest
+from flask_core.app_manifest import parse_manifest
+from flask_core.stream_pipeline import bundle_stream_key
 from quart.testing.app import LifespanError
 
 import app as app_module
 from app import app as quart_app
+from bundles.kick_ingest import EVENTSUB_CONSUMES_TAG
 from config import Config
 
 
@@ -544,3 +551,121 @@ class TestKickReceiverRegistration:
             assert "kick_pusher:channelA" in registered
             assert "kick_pusher:channelB" in registered
             assert len(quart_app.config["kick_leased_receivers"]) == 2
+
+
+class TestKickWebhookRoute:
+    """`POST /webhook/kick` (gh #287 S10) -- mounted like `eventsub_bp`'s own Twitch route."""
+
+    def _sign(self, body: bytes, secret: str) -> str:
+        return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+    async def test_returns_503_when_secret_not_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Config, "KICK_WEBHOOK_SECRET", "")
+        body = b'{"type":"StreamStart"}'
+
+        async with quart_app.test_app() as test_app:
+            client = test_app.test_client()
+            response = await client.post(
+                "/webhook/kick",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            assert response.status_code == 503
+
+    async def test_invalid_signature_returns_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(Config, "KICK_WEBHOOK_SECRET", "test-webhook-secret")  # noqa: S105
+        body = b'{"type":"StreamStart"}'
+
+        async with quart_app.test_app() as test_app:
+            client = test_app.test_client()
+            response = await client.post(
+                "/webhook/kick",
+                data=body,
+                headers={"Content-Type": "application/json", "X-Kick-Signature": "bad"},
+            )
+            assert response.status_code == 401
+
+    async def test_valid_signature_acks_a_non_lifecycle_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "test-webhook-secret"  # noqa: S105
+        monkeypatch.setattr(Config, "KICK_WEBHOOK_SECRET", secret)
+        body = b'{"type":"ChannelFollow"}'
+        signature = self._sign(body, secret)
+
+        async with quart_app.test_app() as test_app:
+            client = test_app.test_client()
+            response = await client.post(
+                "/webhook/kick",
+                data=body,
+                headers={"Content-Type": "application/json", "X-Kick-Signature": signature},
+            )
+            assert response.status_code == 200
+            assert await response.get_json() == {"received": True, "event_type": "follow"}
+
+    async def test_stream_start_fans_out_through_the_shared_redis_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real `startup()`-wired `redis_client`/`registry` are what the route reads.
+
+        Swapped to a `fakeredis.FakeAsyncRedis` post-startup (matching
+        `test_bundles_kick_ingest.py`'s own fan-out fixture) so this
+        exercises a genuine LPUSH round trip, not a mocked call, without
+        needing a live Valkey in this test env.
+        """
+        secret = "test-webhook-secret"  # noqa: S105
+        monkeypatch.setattr(Config, "KICK_WEBHOOK_SECRET", secret)
+        body_json = {
+            "type": "StreamStart",
+            "channel_slug": "acme",
+            "channel_id": "555",
+            "started_at": "2026-09-11T12:00:00Z",
+        }
+        body = json.dumps(body_json).encode()
+        signature = self._sign(body, secret)
+
+        async with quart_app.test_app() as test_app:
+            fake_redis = fakeredis.FakeAsyncRedis(decode_responses=True)
+            quart_app.config["redis_client"] = fake_redis
+            registry = quart_app.config["registry"]
+            registry.register(
+                parse_manifest(
+                    {
+                        "app_id": "waddles.bot.kickevents.eventsub",
+                        "name": "waddles.bot.kickevents.eventsub",
+                        "version": "1.0.0",
+                        "feature": "waddles.bot.kickevents",
+                        "module": "bot",
+                        "provider": "builtin",
+                        "is_default": True,
+                        "stages": {
+                            "ingest": {
+                                "entrypoint": "bundles.kick_ingest:normalize",
+                                "consumes": [EVENTSUB_CONSUMES_TAG],
+                            }
+                        },
+                    }
+                )
+            )
+
+            client = test_app.test_client()
+            response = await client.post(
+                "/webhook/kick",
+                data=body,
+                headers={"Content-Type": "application/json", "X-Kick-Signature": signature},
+            )
+            assert response.status_code == 200
+            assert await response.get_json() == {"received": True, "event_type": "stream_start"}
+
+            ingest_key = bundle_stream_key(
+                Config.RUNNER_TENANT_SLUG, None, "waddles.bot.kickevents.eventsub", "ingest"
+            )
+            raw = await fake_redis.rpop(ingest_key)
+            assert raw is not None
+            event = json.loads(raw)
+            assert event["platform"] == "kick"
+            assert event["event_type"] == "stream.online"
+            assert event["payload"]["channel_slug"] == "acme"
+            assert event["payload"]["channel_id"] == "555"

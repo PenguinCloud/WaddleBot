@@ -20,6 +20,22 @@ eventsub_handler.py`'s own `_build_event_data` field set, trimmed to the
 subset this connector's MVP normalizes (follow/subscribe/subscription-gift/
 cheer/raid) -- and produces a `flask_core.PlatformEvent`, the frozen
 stage-to-stage contract (`libs/flask_core/flask_core/stream_pipeline.py`).
+
+gh #287 S10 (live ON/OFF detection): `stream.online`/`stream.offline`
+added to :data:`KNOWN_EVENT_TYPES` below so this bundle can normalize
+them the same way as every other EventSub type -- `started_at`/`type`/
+`viewer_count`, when present, ride in `payload['metadata']` exactly like
+`channel.raid`'s `viewers` or `channel.cheer`'s `bits` above (no
+special-cased top-level payload keys for these two types, consistent
+with every other entry in this table). KNOWN GAP, out of this task's
+edit scope: `eventsub.py`'s own `DEFAULT_SUBSCRIPTION_TYPES` (the
+webhook's inbound filter -- `TwitchEventSubHandler.handle_webhook`
+drops any `event_type` not in that set BEFORE `build_raw_event`/this
+module's `normalize()` ever see it) and `build_raw_event`'s per-type
+`metadata` builder still need the matching addition for a real Twitch
+`stream.online`/`stream.offline` webhook delivery to reach this
+function in production -- this module is ready to normalize them the
+moment that companion edit lands.
 """
 
 from __future__ import annotations
@@ -31,7 +47,9 @@ from flask_core import PlatformEvent
 
 #: EventSub subscription types this connector's MVP normalizes -- matches
 #: `eventsub.py`'s own `DEFAULT_SUBSCRIPTION_TYPES`, ported from the
-#: legacy module's `subscribe_to_events` default list.
+#: legacy module's `subscribe_to_events` default list. `stream.online`/
+#: `stream.offline` (gh #287 S10) are NOT yet in `eventsub.py`'s own set
+#: -- see this module's own docstring for the gap.
 KNOWN_EVENT_TYPES = frozenset(
     {
         "channel.follow",
@@ -39,6 +57,8 @@ KNOWN_EVENT_TYPES = frozenset(
         "channel.subscription.gift",
         "channel.cheer",
         "channel.raid",
+        "stream.online",
+        "stream.offline",
     }
 )
 

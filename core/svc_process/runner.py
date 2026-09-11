@@ -131,6 +131,7 @@ from services.activity_accrual import ActivityAccrualResult
 from services.activity_accrual import record_activity as accrue_activity
 from services.activity_feed import record_activity
 from services.community_resolver import resolve_community
+from services.live_status import LIVE_STATUS_EVENT_TYPES, record_live_event
 from services.moderation_gate import run_moderation_gate
 from services.raid_shoutout import RAID_EVENT_TYPE, SHOUTOUT_APP_ID, maybe_auto_shoutout
 
@@ -144,6 +145,12 @@ logger = logging.getLogger(__name__)
 #: a community's own `shoutout_config.auto_shoutout_mode == 'disabled'`
 #: (checked inside `maybe_auto_shoutout`) only disables that one community.
 _RAID_SHOUTOUT_FEATURE_FLAG = "waddles.bot.shoutout"
+
+#: PostHog flag gating the live ON/OFF status hook (gh #287 S10) --
+#: default ON, same rationale as `_RAID_SHOUTOUT_FEATURE_FLAG`: OFF skips
+#: the hook (and its `coordination` DB write) entirely, before
+#: `services.live_status.record_live_event` is even called.
+_LIVE_STATUS_FEATURE_FLAG = "waddles.streaming.live_status"
 
 #: gh-304 P4 wiring: PostHog flag gating THIS runner-level routing hook (get
 #: an already-stamped `moderation_enforcement` payload onto its own action
@@ -418,6 +425,12 @@ class ProcessRunner:
             envelope_in,
             event_in,
             community_str=community_str,
+            community_for_context=community_for_context,
+            bundle=bundle,
+        )
+        await self._maybe_live_status(
+            envelope_in,
+            event_in,
             community_for_context=community_for_context,
             bundle=bundle,
         )
@@ -763,3 +776,48 @@ class ProcessRunner:
             )
         except Exception as exc:  # noqa: BLE001 - best-effort hook, must never break the pipeline
             logger.warning("process.raid_shoutout_failed app_id=%s error=%s", bundle.app_id, exc)
+
+    async def _maybe_live_status(
+        self,
+        envelope_in: StageEnvelope,
+        event_in: PlatformEvent,
+        *,
+        community_for_context: str | None,
+        bundle: BundleDistribution,
+    ) -> None:
+        """Best-effort live ON/OFF status hook (gh #287 S10) -- alongside the raid-shoutout hook.
+
+        Fires for every inbound `stream.online`/`stream.offline` event,
+        independent of `transform_fn`'s own result -- same "side-additive,
+        never a replacement" posture as `_maybe_shoutout_raid` above.
+        Delegates the actual `coordination` table upsert to
+        `services.live_status.record_live_event`, which never raises on
+        its own; this method's own try/except is a second, defense-in-
+        depth layer (same double-wrap `_maybe_shoutout_raid` uses around
+        `maybe_auto_shoutout`).
+
+        Feature-gated (`_LIVE_STATUS_FEATURE_FLAG`, default ON) -- OFF
+        skips the hook (and its DB round trip) entirely, before
+        `record_live_event` is even called.
+        """
+        if event_in.event_type not in LIVE_STATUS_EVENT_TYPES:
+            return
+
+        enabled = await feature_enabled(
+            _LIVE_STATUS_FEATURE_FLAG,
+            tenant=envelope_in.tenant,
+            community=_community_id_or_none(community_for_context),
+            default=True,
+        )
+        if not enabled:
+            logger.debug("process.live_status_flag_disabled app_id=%s", bundle.app_id)
+            return
+
+        try:
+            result = await record_live_event(event_in, community=community_for_context)
+            if not result.recorded:
+                logger.debug(
+                    "process.live_status_skipped app_id=%s reason=%s", bundle.app_id, result.reason
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort hook, must never break the pipeline
+            logger.warning("process.live_status_failed app_id=%s error=%s", bundle.app_id, exc)

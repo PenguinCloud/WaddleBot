@@ -50,7 +50,12 @@ this fix addresses.
 The EventSub webhook (`POST /eventsub/twitch/webhook`, `eventsub.py`) is a
 genuine inbound HTTP push (not a persistent socket) -- registered as a
 plain Quart route, wired to the same `fanout.fan_out_event` machinery the
-IRC receivers use.
+IRC receivers use. `POST /webhook/kick` (`bundles.kick_ingest.
+handle_kick_webhook`, gh #287 S10) is the identical shape for Kick's own
+signed mod/sub/stream-lifecycle webhook -- a SEPARATE delivery mechanism
+from `receivers/kick_pusher.py`'s Pusher chat socket, always mounted
+(unlike the conditionally-built Twitch handler), gracefully 503ing its
+own self when `Config.KICK_WEBHOOK_SECRET` is unset.
 """
 
 from __future__ import annotations
@@ -73,6 +78,7 @@ from quart import Blueprint, Quart, request
 
 from bundles.discord_gateway_manifest import register_default_bundles as register_discord_bundles
 from bundles.kick_gateway_manifest import register_default_bundles as register_kick_bundles
+from bundles.kick_ingest import handle_kick_webhook
 from bundles.slack_gateway_manifest import register_default_bundles as register_slack_bundles
 from bundles.twitch_gateway_manifest import register_default_bundles as register_twitch_bundles
 from bundles.youtube_live_ingest import register_default_bundles as register_youtube_bundles
@@ -145,6 +151,7 @@ health_bp = create_health_blueprint(Config.MODULE_NAME, Config.MODULE_VERSION)
 app.register_blueprint(health_bp)
 
 eventsub_bp = Blueprint("eventsub", __name__, url_prefix="/eventsub")
+webhook_bp = Blueprint("webhook", __name__, url_prefix="/webhook")
 
 logger = setup_aaa_logging(Config.MODULE_NAME, Config.MODULE_VERSION)
 
@@ -711,6 +718,45 @@ async def twitch_eventsub_webhook():  # type: ignore[no-untyped-def]
 
 
 app.register_blueprint(eventsub_bp)
+
+
+@webhook_bp.route("/kick", methods=["POST"])
+async def kick_webhook():  # type: ignore[no-untyped-def]
+    """Real Kick webhook endpoint -- signature-verified, fans StreamStart/StreamEnd via `fanout.py`.
+
+    Always mounted (unlike `eventsub_bp`'s Twitch route, whose underlying
+    handler is only conditionally built in `startup()`) --
+    `bundles.kick_ingest.handle_kick_webhook` itself returns 503 when
+    `Config.KICK_WEBHOOK_SECRET` is unset, the same graceful
+    "not configured yet" posture without needing a second app.config
+    presence check here. `redis_client`/`registry` are unconditionally set
+    by `startup()` before this app ever serves a request.
+    """
+    raw_body = await request.get_data()
+    # `get_data()`'s own stub type is `str | bytes` regardless of the
+    # (default-False) `as_text` arg, but the DEFAULT call always returns
+    # `bytes` at runtime -- narrowed here rather than `# type: ignore`,
+    # since `handle_kick_webhook`'s `body: bytes` param is a real,
+    # strictly-checked signature (unlike `handler.handle_webhook(...)`
+    # just above, whose `Any`-typed `app.config.get(...)` receiver hides
+    # this exact same latent mismatch from mypy for the Twitch route).
+    body = raw_body if isinstance(raw_body, bytes) else raw_body.encode()
+    body_json = await request.get_json()
+    headers = dict(request.headers)
+
+    response_body, status = await handle_kick_webhook(
+        headers=headers,
+        body=body,
+        body_json=body_json or {},
+        secret=Config.KICK_WEBHOOK_SECRET,
+        redis_client=app.config["redis_client"],
+        registry=app.config["registry"],
+        tenant=Config.RUNNER_TENANT_SLUG,
+    )
+    return response_body, status
+
+
+app.register_blueprint(webhook_bp)
 
 
 if __name__ == "__main__":  # pragma: no cover - process entrypoint, not exercised by unit tests
