@@ -49,6 +49,7 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
+admin/hub_module/frontend/coverage/
 .tox/
 .nox/
 .coverage
@@ -205,3 +206,6 @@ mobile/flutter_gazer/android/build/
 
 # Integration test OAuth2 tokens (local only — NEVER commit)
 *.token
+
+# Per-directory Claude agent scratch memory (session artefacts, never source)
+**/.claude/agent-memory/
