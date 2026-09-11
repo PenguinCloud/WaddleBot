@@ -1,0 +1,63 @@
+# svc-streaming (Rust) -- Waddles A/V data-plane service.
+#
+# Named `Dockerfile.rust` (not `Dockerfile`) while the Python + ffmpeg alpha
+# at this same path (`Dockerfile`, `app.py`, ...) is still the deployed
+# build -- this becomes `Dockerfile` once that build is retired (see
+# README.md Container section and issue #287).
+#
+# Build (context = this directory, not the repo root -- no shared libs to
+# pull in for a Rust crate):
+#   docker build -f Dockerfile.rust -t localhost:32000/waddlebot/svc-streaming:alpha-<epoch> .
+
+FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS builder
+
+# cmake + a C/C++ compiler are required to build aws-lc-sys -- the
+# jsonwebtoken `aws_lc_rs` crypto backend (see Cargo.toml: chosen over the
+# `rust_crypto` feature specifically to avoid RUSTSEC-2023-0071 in the pure
+# -Rust `rsa` crate). `curl` + `ca-certificates` are required at *build*
+# time only -- utoipa-swagger-ui's build script downloads the Swagger UI
+# static assets over HTTPS via the system `curl` binary; this is a
+# builder-stage-only dependency and never ships in the runtime image below.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y cmake build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+
+# Debian bookworm's `ffmpeg` package carries libx264/libx265/libsvtav1/libaom
+# encoders out of the box -- the media engine `pipeline::ffmpeg` (S3) shells
+# out to, once implemented. `ca-certificates` for rustls (webpki/native
+# roots) on outbound TLS (reqwest, sea-orm's runtime-tokio-rustls, OTLP).
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 10001 appuser \
+    && useradd --system --uid 10001 --gid appuser --home-dir /nonexistent \
+       --shell /usr/sbin/nologin appuser \
+    && mkdir -p /var/lib/svc-streaming \
+    && chown -R appuser:appuser /var/lib/svc-streaming
+
+COPY --from=builder --chown=appuser:appuser /build/target/release/svc-streaming /app/svc-streaming
+
+WORKDIR /app
+USER appuser
+
+ENV MODULE_PORT=8208 \
+    METRICS_PORT=9090 \
+    STREAM_DATA_DIR=/var/lib/svc-streaming \
+    FFMPEG_PATH=/usr/bin/ffmpeg
+
+# Native Rust healthcheck subcommand -- never curl (rules/client.md,
+# rules/general.md anti-patterns table).
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD ["/app/svc-streaming", "--healthcheck"]
+
+EXPOSE 8208 9090 1935 9000/udp
+
+ENTRYPOINT ["/app/svc-streaming"]

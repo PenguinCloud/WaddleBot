@@ -1,0 +1,45 @@
+name: Build svc-streaming
+
+# Modeled on build-ai-interaction.yml. NOTE: `build-container.yml` builds
+# `./<module_path>/Dockerfile` unconditionally -- it has no `dockerfile`
+# input. This service's Rust build lives at `core/svc_streaming/Dockerfile.rust`
+# (kept alongside the still-deployed Python alpha's `Dockerfile` until that
+# build retires -- see core/svc_streaming/README.md Container section).
+# Until `build-container.yml` gains a `dockerfile` input (or the Python
+# alpha is retired and this file is renamed to `Dockerfile`), this workflow
+# calling `build-container.yml` would build the *Python* Dockerfile, not
+# this Rust one -- so the container-build job is intentionally left
+# unwired here. `rust-svc-streaming.yml` (fmt/clippy/deny/coverage) is the
+# CI gate for this crate today; wiring the container build is a follow-up
+# once one of the two conditions above is met.
+
+on:
+  push:
+    branches: [main, 'v*', 'release/**', 'feature/**', 'fix/**', 'chore/**', 'hotfix/**', 'docs/**', 'refactor/**']
+    paths:
+      - 'core/svc_streaming/**'
+      - '.version'
+      - '.github/workflows/build-svc-streaming.yml'
+      - '.github/workflows/build-container.yml'
+  pull_request:
+    branches: [main, 'v*', 'release/**', 'feature/**', 'fix/**', 'chore/**', 'hotfix/**', 'docs/**', 'refactor/**']
+    paths:
+      - 'core/svc_streaming/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build svc-streaming Container
+    # DISABLED pending the `dockerfile` input / rename described above --
+    # see this file's header comment. Flip `if: false` off once resolved.
+    if: false
+    uses: ./.github/workflows/build-container.yml
+    with:
+      module_path: 'core/svc_streaming'
+      module_name: 'svc-streaming'
+      module_port: '8208'
+    secrets: inherit

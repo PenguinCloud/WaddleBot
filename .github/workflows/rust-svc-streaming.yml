@@ -1,0 +1,58 @@
+name: Rust svc-streaming (lint + test)
+
+on:
+  push:
+    branches: [main, 'release/**']
+    paths:
+      - 'core/svc_streaming/**'
+      - '.github/workflows/rust-svc-streaming.yml'
+  pull_request:
+    branches: [main, 'release/**']
+    paths:
+      - 'core/svc_streaming/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    name: fmt + clippy + deny + coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core/svc_streaming
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install build deps for aws-lc-sys (cmake, C/C++ toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake build-essential
+
+      - name: Install Rust 1.97.1 (rustfmt, clippy, llvm-tools-preview)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable branch snapshot
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-deny + cargo-llvm-cov
+        uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481  # v2.9.4
+        with:
+          tool: cargo-deny,cargo-llvm-cov
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo deny check (advisories, licenses, bans, sources)
+        run: cargo deny check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo llvm-cov (>=90% line coverage gate)
+        run: cargo llvm-cov --fail-under-lines 90

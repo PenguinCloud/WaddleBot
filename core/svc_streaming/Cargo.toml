@@ -1,0 +1,109 @@
+[package]
+name = "svc-streaming"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.0"
+license = "Apache-2.0"
+publish = false
+description = "Waddles A/V data-plane service -- RTMP/SRT/WHIP ingest, ffmpeg transcode, HLS/WHEP/relay/record/Discord-voice egress."
+
+[lib]
+name = "svc_streaming"
+path = "src/lib.rs"
+
+[[bin]]
+name = "svc-streaming"
+path = "src/main.rs"
+
+# Exact-version pins only (no ^ / * ranges) -- see rules/critical-rules.md
+# Dependency Pinning. Cargo.lock is committed alongside this file.
+[dependencies]
+tokio = { version = "=1.53.1", features = ["full"] }
+axum = "=0.8.9"
+tower = { version = "=0.5.3", features = ["util"] }
+tower-http = { version = "=0.7.1", features = ["trace", "cors"] }
+hyper = { version = "=1.11.1", features = ["full"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+opentelemetry = "=0.32.0"
+opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "=0.32.1", features = ["rt-tokio"] }
+tracing-opentelemetry = "=0.33.0"
+prometheus = "=0.14.0"
+utoipa = { version = "=5.5.0", features = ["axum_extras", "uuid"] }
+utoipa-swagger-ui = { version = "=9.0.2", features = ["axum"] }
+# `aws_lc_rs` (not `rust_crypto`): the `rust_crypto` feature pulls in the
+# pure-Rust `rsa` crate, which carries RUSTSEC-2023-0071 (Marvin Attack --
+# RSA private-key timing side-channel, no fix available) -- a live network
+# service verifying tokens is exactly the exposed scenario the advisory
+# warns about, even though this scaffold only exercises the HS256 path.
+# `aws_lc_rs` avoids that dependency entirely (requires cmake + a C/C++
+# compiler in the Docker builder stage -- see `Dockerfile.rust`).
+jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+uuid = { version = "=1.26.1", features = ["v4", "serde"] }
+chrono = { version = "=0.4.45", features = ["serde"] }
+thiserror = "=2.0.20"
+anyhow = "=1.0.104"
+clap = { version = "=4.6.6", features = ["derive", "env"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+sea-orm = { version = "=2.0.2", default-features = false, features = [
+    "sqlx-postgres",
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+] }
+
+# Media crates -- declared for later chunks (pipeline/ingest/egress owners),
+# NOT implemented in this scaffold. Never add `xiu` (PRC-origin) or
+# `ffmpeg-next` -- see deny.toml bans and rules/general.md Supply Chain.
+rml_rtmp = "=0.8.0"
+srt-tokio = "=0.4.4"
+# `srt-tokio`'s `SrtSocket`/`SrtListener` public API is expressed entirely
+# via `futures_core::Stream`/`Sink` (its accept loop, payload stream, and
+# statistics stream all require `StreamExt`/`SinkExt`); `bytes::Bytes` is
+# its payload item type. Both are already transitively resolved (pulled in
+# by `srt-tokio`/`webrtc`/`sea-orm`) at the exact versions pinned below --
+# promoting them to direct dependencies changes no resolved version in
+# Cargo.lock, it only makes their traits nameable from this crate, which
+# `ingest::srt` (S5) requires to consume `srt-tokio` at all.
+futures = { version = "=0.3.34", default-features = false, features = ["std", "async-await"] }
+bytes = "=1.12.1"
+# `runtime-tokio` is already `webrtc`'s default feature (mirrors this crate's
+# sole async runtime, see rules/backend-rust.md); pinned explicitly so a
+# future default-feature change upstream can't silently swap it.
+webrtc = { version = "=0.20.5", default-features = false, features = ["runtime-tokio"] }
+# `rtc` and `async-trait` -- NOT new supply-chain surface: both are already
+# transitively resolved at these exact versions/checksums in Cargo.lock via
+# `webrtc` above. They are required as *direct* dependencies because
+# `webrtc`'s own public API surface names their types without re-exporting
+# them: `TrackLocal::write_rtp(rtc::rtp::Packet)`,
+# `TrackRemoteEvent::OnRtpPacket(rtc::rtp::Packet)`, and
+# `rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodingParameters,
+# RTCRtpEncodingParameters, RtpCodecKind}` (needed to build a
+# `TrackLocalStaticRTP`) are usable only via `rtc::`, never `webrtc::`; and
+# implementing `webrtc::peer_connection::PeerConnectionEventHandler`
+# requires `#[async_trait::async_trait]` on the `impl` block, matching how
+# the trait itself is declared. Exceeds this chunk's stated "features only"
+# Cargo.toml scope -- flagged explicitly in the S6 completion report rather
+# than silently expanded; the alternative is code that cannot compile.
+rtc = "=0.20.5"
+async-trait = "=0.1.92"
+ffmpeg-sidecar = "=2.5.2"
+hls_m3u8 = "=0.7.0"
+object_store = { version = "=0.14.1", features = ["aws"] }
+
+[dev-dependencies]
+http-body-util = "=0.1.3"
+# `test-util` (already-declared `tokio` crate, dev-only feature) unlocks
+# `tokio::time::{pause,advance}` so `ingest::rtmp`'s >5s backpressure-stall
+# disconnect path can be tested against a virtual clock instead of a real
+# 5s sleep in the suite. Never linked into the release binary.
+tokio = { version = "=1.53.1", features = ["test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
