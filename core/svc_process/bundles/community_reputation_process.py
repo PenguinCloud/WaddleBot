@@ -25,6 +25,17 @@ Matches the requester by `(platform, platform_user_id)` when the event
 carries a native platform user id (`event.payload["author_id"]`, same
 field `social_welcome_process` uses), else falls back to matching
 `display_name == event.actor`.
+
+`REPUTATION_TIERS` (gh-310) is the ONE tier-label table shared with
+`hub_api/services/community_reputation_service.py`'s webui-facing reads
+-- mirrored, not imported: `hub_api` and this service are independently
+deployed processes with separate dependency trees, and both happen to
+own a top-level `services` package, so a cross-import would silently
+resolve to the wrong one. See that module's own docstring for the full
+0-1000 -> 300-850 rescale derivation this table encodes.
+`tests/test_bundles_community_reputation_process.py::
+test_tier_table_matches_hub_api` parses hub-api's source file directly
+(no import) to assert the two stay byte-identical.
 """
 
 from __future__ import annotations
@@ -58,19 +69,27 @@ _COMMUNITY_LABEL_SQL = (
 _GLOBAL_SCORE_SQL = "SELECT score FROM reputation_global WHERE hub_user_id = $1"
 
 
+#: Ascending `(exclusive_upper_bound, label)` cut points -- MUST stay
+#: byte-identical to `hub_api/services/community_reputation_service.py`'s
+#: own `REPUTATION_TIERS` (see module docstring). A score strictly below
+#: the first threshold is "Newcomer"; a score at or above the last
+#: threshold falls through to `_TOP_TIER_LABEL` ("Legend").
+REPUTATION_TIERS: tuple[tuple[int, str], ...] = (
+    (465, "Newcomer"),
+    (575, "Regular"),
+    (658, "Trusted"),
+    (740, "Respected"),
+    (795, "Champion"),
+)
+_TOP_TIER_LABEL = "Legend"
+
+
 def _reputation_label(score: int) -> str:
-    """Map a 300-850 FICO-style reputation score to a human tier label."""
-    if score < 550:
-        return "Menace"
-    if score < 600:
-        return "Troll"
-    if score < 650:
-        return "Fair"
-    if score < 700:
-        return "Good"
-    if score < 750:
-        return "Outstanding"
-    return "Saint"
+    """Map a 300-850 FICO-style reputation score to a human tier label -- see `REPUTATION_TIERS`."""
+    for threshold, label in REPUTATION_TIERS:
+        if score < threshold:
+            return label
+    return _TOP_TIER_LABEL
 
 
 async def _fetch_community_label(community_id: int) -> str:

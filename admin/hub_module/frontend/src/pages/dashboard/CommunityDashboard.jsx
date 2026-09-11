@@ -7,6 +7,7 @@ import BotScoreBadge from '../../components/BotScoreBadge';
 import BotScoreCard from '../../components/BotScoreCard';
 import CommunityStatsWidget from '../../components/dashboard/CommunityStatsWidget';
 import QuickActionsWidget from '../../components/dashboard/QuickActionsWidget';
+import CommunityReputationPanel from '../../components/dashboard/CommunityReputationPanel';
 import { MegaphoneIcon, MapPinIcon } from '@heroicons/react/24/outline';
 
 function CommunityDashboard() {
@@ -278,6 +279,9 @@ function CommunityDashboard() {
               isPremium={community.isPremium || false}
             />
           )}
+
+          {/* Reputation (gh-310): my score/tier + top-10 community leaderboard */}
+          <CommunityReputationPanel communityId={id} />
 
           {/* Leaderboards */}
           <LeaderboardCard

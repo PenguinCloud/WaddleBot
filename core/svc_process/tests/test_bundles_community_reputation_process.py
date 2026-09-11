@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from typing import Any
 
 import pytest
 from flask_core import PlatformEvent, bundle_context, reset_bundle_dal_for_tests, set_bundle_dal
 
-from bundles.community_reputation_process import _reputation_label, transform
+from bundles.community_reputation_process import REPUTATION_TIERS, _reputation_label, transform
 
 
 class _FakeDal:
@@ -100,7 +102,7 @@ class TestLookup:
         result = await _run(dal, "!reputation", author_id="u-123")
         assert result is not None
         assert result.payload["text"] == (
-            "\U0001f427 penguinzplays — Global: 600 (Fair) · " "Waddlebot HQ: 720 (Outstanding)"
+            "\U0001f427 penguinzplays — Global: 600 (Trusted) · " "Waddlebot HQ: 720 (Respected)"
         )
 
     async def test_falls_back_to_display_name_when_no_author_id(self) -> None:
@@ -113,24 +115,24 @@ class TestLookup:
         dal.community_labels[4] = {"label": "Waddlebot HQ"}
         result = await _run(dal, "!rep")
         assert result is not None
-        assert "Waddlebot HQ: 655 (Good)" in result.payload["text"]
-        assert "Global: 600 (Fair)" in result.payload["text"]
+        assert "Waddlebot HQ: 655 (Trusted)" in result.payload["text"]
+        assert "Global: 600 (Trusted)" in result.payload["text"]
 
     async def test_new_user_defaults_both_sides_to_600(self) -> None:
-        """No `community_members` row and no `reputation_global` row -> 600 (Fair) both sides."""
+        """No `community_members` row and no `reputation_global` row -> 600 (Trusted) both sides."""
         dal = _FakeDal()
         dal.community_labels[4] = {"label": "Waddlebot HQ"}
         result = await _run(dal, "!reputation", actor="stranger")
         assert result is not None
         assert result.payload["text"] == (
-            "\U0001f427 stranger — Global: 600 (Fair) · Waddlebot HQ: 600 (Fair)"
+            "\U0001f427 stranger — Global: 600 (Trusted) · Waddlebot HQ: 600 (Trusted)"
         )
 
     async def test_community_without_display_name_falls_back_to_id(self) -> None:
         dal = _FakeDal()  # no community_labels entry at all
         result = await _run(dal, "!reputation", actor="stranger")
         assert result is not None
-        assert "community 4: 600 (Fair)" in result.payload["text"]
+        assert "community 4: 600 (Trusted)" in result.payload["text"]
 
     async def test_missing_community_context_is_graceful(self) -> None:
         set_bundle_dal(_FakeDal())
@@ -153,18 +155,61 @@ class TestReputationLabel:
     @pytest.mark.parametrize(
         ("score", "expected"),
         [
-            (549, "Menace"),
-            (550, "Troll"),
-            (599, "Troll"),
-            (600, "Fair"),
-            (649, "Fair"),
-            (650, "Good"),
-            (699, "Good"),
-            (700, "Outstanding"),
-            (749, "Outstanding"),
-            (750, "Saint"),
-            (850, "Saint"),
+            (300, "Newcomer"),
+            (464, "Newcomer"),
+            (465, "Regular"),
+            (574, "Regular"),
+            (575, "Trusted"),
+            (600, "Trusted"),  # REPUTATION_DEFAULT
+            (657, "Trusted"),
+            (658, "Respected"),
+            (739, "Respected"),
+            (740, "Champion"),
+            (794, "Champion"),
+            (795, "Legend"),
+            (850, "Legend"),  # REPUTATION_MAX
         ],
     )
     def test_boundaries(self, score: int, expected: str) -> None:
         assert _reputation_label(score) == expected
+
+    def test_tier_table_matches_hub_api(self) -> None:
+        """Parses `hub_api`'s source directly (no import -- see module docstring) for parity.
+
+        `hub_api` and this service are independently deployed processes
+        with separate dependency trees and a colliding top-level
+        `services` package name (both own one) -- a runtime cross-import
+        would silently resolve to the wrong package, so this reads
+        hub-api's module as plain text/AST instead of importing it.
+        Skipped (not failed) only when the whole `hub_api` checkout is
+        absent -- a genuinely different repo layout, not a drift signal;
+        any AST/constant-shape problem *within* an existing checkout is a
+        real failure, never swallowed.
+        """
+        hub_api_file = (
+            Path(__file__).resolve().parents[3]
+            / "hub_api"
+            / "services"
+            / "community_reputation_service.py"
+        )
+        if not hub_api_file.exists():
+            pytest.skip(f"hub_api checkout not present at {hub_api_file}")
+
+        tree = ast.parse(hub_api_file.read_text(encoding="utf-8"), filename=str(hub_api_file))
+        hub_api_tiers = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "REPUTATION_TIERS"
+                and node.value is not None
+            ):
+                hub_api_tiers = ast.literal_eval(node.value)
+                break
+        assert (
+            hub_api_tiers is not None
+        ), f"REPUTATION_TIERS not found in {hub_api_file} -- did it get renamed?"
+        assert hub_api_tiers == REPUTATION_TIERS, (
+            "bundle's REPUTATION_TIERS drifted from hub_api's -- keep the two mirrored copies "
+            "(this file + hub_api/services/community_reputation_service.py) byte-identical"
+        )
