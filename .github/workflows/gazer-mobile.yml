@@ -310,9 +310,14 @@ jobs:
         run: |
           set -euo pipefail
           APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
-          COUNT=$("${APKSIGNER}" verify --print-certs build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | grep -c 'Signer #1 certificate SHA-256')
-          echo "signer count: ${COUNT}"
-          test "${COUNT}" -eq 1
+          # Matching 'Signer #1 certificate SHA-256' literally can never detect a second signer --
+          # apksigner labels additional signers 'Signer #2 ...', 'Signer #3 ...', etc. Count every
+          # signer's SHA-256 digest line instead. `|| :` only absorbs grep's exit 1 for zero
+          # matches (not a real failure by itself); the `test` line right after is the actual gate.
+          OUTPUT=$("${APKSIGNER}" verify --print-certs build/app/outputs/flutter-apk/app-arm64-v8a-release.apk)
+          echo "${OUTPUT}"
+          COUNT=$(echo "${OUTPUT}" | grep -c 'certificate SHA-256' || :)
+          test "${COUNT}" = 1 || { echo "expected exactly 1 signer cert, got ${COUNT}" >&2; exit 1; }
 
       - name: Upload APKs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -440,6 +445,14 @@ jobs:
             echo "checking: ${apk}"
             OUTPUT=$("${APKSIGNER}" verify --print-certs "${apk}")
             echo "${OUTPUT}"
+            # Count every signer's SHA-256 digest line (not just 'Signer #1 ...', which can never
+            # detect a second signer) -- same fix as the build job's equivalent check above.
+            # `|| :` only absorbs grep's exit 1 for zero matches; FOUND=1 below is the real gate.
+            COUNT=$(echo "${OUTPUT}" | grep -c 'certificate SHA-256' || :)
+            if [ "${COUNT}" != 1 ]; then
+              echo "FAIL: ${apk} expected exactly 1 signer cert, got ${COUNT}" >&2
+              FOUND=1
+            fi
             if echo "${OUTPUT}" | grep -q 'CN=Android Debug'; then
               echo "FAIL: ${apk} is signed with the well-known Android debug certificate" >&2
               FOUND=1

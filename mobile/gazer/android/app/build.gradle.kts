@@ -64,6 +64,10 @@ android {
     }
 
     signingConfigs {
+        // This is the Play App Signing *upload* key, not the app signing key -- Google Play
+        // holds the real app signing key and re-signs the app for distribution; this key only
+        // proves uploads to Play's ingestion come from PenguinTech. It is recoverable if lost
+        // (Play Console upload-key-reset flow), unlike the app signing key.
         if (keyPropsFile.exists()) {
             create("upload") {
                 storeFile = rootProject.file(keyProps.getProperty("storeFile"))
