@@ -209,17 +209,16 @@ tasks.register<JacocoReport>("jacocoTestReport") {
             "**/Manifest*.*",
             "**/*Test*.*",
             "**/pigeon/**",
-            // Why: MainActivity.kt is stock flutter-create boilerplate (Task 2 leaves it
-            // untouched) with no JVM-testable logic of its own -- its default constructor is
-            // never invoked by a plain JVM unit test (Activities need Robolectric/instrumentation,
-            // out of scope here), so leaving it in this JaCoCo scan drags the LINE ratio down with
-            // a permanently-uncoverable phantom miss unrelated to anything Task 2 introduces.
-            // Constraint (controller ruling R11): this exclusion may stay ONLY as long as
-            // MainActivity stays a flutter-create-boilerplate Activity with no testable logic.
-            // Task 20 MUST keep MainActivity.kt a <=3-line bridge that delegates all real logic to
-            // a separately unit-tested factory/class, and MUST revisit (narrow or remove) this
-            // exclusion when it touches MainActivity.kt -- do not let this scope grow to cover
-            // real logic added later.
+            // Why: MainActivity.kt's constructor/lifecycle methods are never invoked by a plain
+            // JVM unit test (Activities need Robolectric/instrumentation, out of scope here), so
+            // leaving it in this JaCoCo scan drags the LINE ratio down with a permanently-
+            // uncoverable phantom miss. Constraint (controller ruling R11, satisfied by Task 20):
+            // MainActivity.kt stays a <=3-line bridge -- configureFlutterEngine's body is exactly
+            // `super.configureFlutterEngine(flutterEngine); GazerFlutterBindings.install(...)` --
+            // and every real wiring decision (messenger, CameraManager, PigeonHostApiImpl
+            // construction, GazerHostApi.setUp) lives in GazerFlutterBindings.install, covered by
+            // GazerFlutterBindingsTest.kt on the JVM unit-test target. Do not let this exclusion's
+            // scope grow beyond MainActivity itself if real logic is ever added back to it.
             "**/MainActivity.class",
             "**/MainActivity\$*.class",
             // RootEncoderEngine wraps RootEncoder's GenericStream (real Camera2/MediaCodec/

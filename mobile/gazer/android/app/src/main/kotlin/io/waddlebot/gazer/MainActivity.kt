@@ -1,5 +1,19 @@
 package io.waddlebot.gazer
 
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
 
-class MainActivity : FlutterActivity()
+/**
+ * Sole platform-channel entry point. Runtime permission requests (CAMERA, RECORD_AUDIO,
+ * POST_NOTIFICATIONS) are handled entirely in Dart via permission_handler before Go Live is ever
+ * called - this activity never requests permissions itself. All real Pigeon wiring lives in
+ * GazerFlutterBindings.install (controller ruling R11): this class must stay a thin, JaCoCo-
+ * excluded bridge, since Activities need Robolectric/instrumentation to construct and cannot be
+ * exercised by a plain JVM unit test.
+ */
+class MainActivity : FlutterActivity() {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        GazerFlutterBindings.install(flutterEngine, applicationContext)
+    }
+}
