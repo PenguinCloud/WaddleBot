@@ -14,9 +14,15 @@ class CommunityWeights:
     """Weight configuration for a community."""
     community_id: int
     is_premium: bool = False
-    # Activity weights
-    chat_message: float = 0.01
-    command_usage: float = -0.1
+    # Activity weights -- whole, positive integers (gh-310): community_members
+    # .reputation / reputation_global.score are INTEGER columns with no
+    # remainder-tracking column, so a magnitude < 0.5 per-event weight never
+    # moves an integer-scored table across repeated events (see
+    # ReputationService._clamp_score's docstring for the full rule). Farming
+    # via rapid chat/command spam is bounded by svc-process's own per-user
+    # cooldowns (60s/10s), not by using a fractional weight here.
+    chat_message: float = 1.0
+    command_usage: float = 1.0
     giveaway_entry: float = -1.0  # Larger penalty to dissuade giveaway bots
     follow: float = 1.0
     subscription: float = 5.0
@@ -94,8 +100,8 @@ class WeightManager:
         return CommunityWeights(
             community_id=0,
             is_premium=False,
-            chat_message=defaults.get('chat_message', 0.01),
-            command_usage=defaults.get('command_usage', -0.1),
+            chat_message=defaults.get('chat_message', 1.0),
+            command_usage=defaults.get('command_usage', 1.0),
             giveaway_entry=defaults.get('giveaway_entry', -1.0),
             follow=defaults.get('follow', 1.0),
             subscription=defaults.get('subscription', 5.0),
@@ -181,8 +187,8 @@ class WeightManager:
                     weights = CommunityWeights(
                         community_id=community_id,
                         is_premium=True,
-                        chat_message=float(row[1]) if row[1] else 0.01,
-                        command_usage=float(row[2]) if row[2] else -0.1,
+                        chat_message=float(row[1]) if row[1] else 1.0,
+                        command_usage=float(row[2]) if row[2] else 1.0,
                         giveaway_entry=float(row[3]) if row[3] else -1.0,
                         follow=float(row[4]) if row[4] else 1.0,
                         subscription=float(row[5]) if row[5] else 5.0,

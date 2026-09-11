@@ -2,12 +2,29 @@
 Reputation Service - Core CRUD and calculation logic for reputation scores.
 Handles both per-community and global reputation tracking.
 """
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 
 from config import Config
+
+
+def _round_half_away_from_zero(value: float) -> int:
+    """Round to the nearest int, ties rounding away from zero.
+
+    Python's builtin `round()` uses banker's rounding (ties to even),
+    which silently drops exact `.5` deltas at an even score --
+    `round(600.5) == 600`. Reputation weights are admin-configured values
+    (see `community_reputation_config`) where a `.5`-magnitude weight is
+    expected to move the score on every event it fires; ties-to-even
+    would make that depend on whether the current score happens to be
+    even, which is not a rule anyone configuring a weight could predict.
+    """
+    if value >= 0:
+        return math.floor(value + 0.5)
+    return math.ceil(value - 0.5)
 
 
 @dataclass
@@ -68,8 +85,29 @@ class ReputationService:
         return 'poor', 'Poor'
 
     def _clamp_score(self, score: float, min_score: int, max_score: int) -> int:
-        """Clamp score to valid bounds."""
-        return max(min_score, min(max_score, int(round(score))))
+        """Clamp `score` to `[min_score, max_score]`, rounding once via round-half-away-from-zero.
+
+        `community_members.reputation` / `reputation_global.score` are
+        INTEGER columns (`config/postgres/migrations/080_add_reputation_
+        tables.sql`) with no column to carry a fractional remainder across
+        separate events -- adding one is a migration, out of scope here
+        (gh-310). Every caller (`adjust()`, `_update_global_reputation()`,
+        `set_reputation()`) MUST pass `stored + delta` computed once and
+        round/clamp exactly once here, never re-round an already-rounded
+        stored value a second time.
+
+        Documented, intentional consequence (no carried remainder): a
+        per-event weight whose magnitude is < 0.5 truncates to a zero
+        delta on that call, every call, forever -- it never accrues across
+        repeated events. A weight whose magnitude is >= 0.5 moves the
+        score by at least +/-1 on every single event (ties always round
+        away from zero, unlike Python's `round()`). Default weights
+        (`WeightManager.CommunityWeights`) are whole numbers for exactly
+        this reason; only a premium community's custom
+        `community_reputation_config` override can hit the truncation
+        case, and that is a deliberate admin choice, not a bug.
+        """
+        return max(min_score, min(max_score, _round_half_away_from_zero(score)))
 
     async def get_reputation(
         self,
@@ -288,6 +326,19 @@ class ReputationService:
             )
             score_after = new_score
 
+            self.logger.debug(
+                "Community reputation weight applied",
+                # `reputation_event_type`, not `event_type` -- see the
+                # `.audit()` call below; `.debug()` reserves the same
+                # positional `event_type` name internally.
+                reputation_event_type=event_type,
+                weight=base_weight,
+                delta=score_change,
+                community_id=community_id,
+                score_before=score_before,
+                score_after=score_after,
+            )
+
             # Update community reputation
             self.dal.executesql(
                 """UPDATE community_members
@@ -312,7 +363,7 @@ class ReputationService:
 
             # Update global reputation if user is linked
             if user_id:
-                await self._update_global_reputation(user_id, score_change)
+                await self._update_global_reputation(user_id, score_change, event_type, base_weight)
 
             self.dal.commit()
 
@@ -356,22 +407,70 @@ class ReputationService:
     async def _update_global_reputation(
         self,
         user_id: int,
-        score_change: float
+        score_change: float,
+        event_type: str = '',
+        weight: float = 0.0
     ) -> None:
-        """Update global reputation for a linked user."""
+        """Update global reputation for a linked user.
+
+        Applies `score_change` -- the same raw delta already computed once
+        by the community-scope caller, never re-derived from
+        `community_members`' rounded integer -- directly against the
+        stored global score via `_clamp_score`, the identical
+        round-half-away-from-zero rule the community scope uses (see its
+        docstring). Previously this let the delta flow through raw SQL
+        arithmetic against the INTEGER column and relied on Postgres'
+        implicit numeric-to-int cast to round, which could diverge from
+        the app-level rule enforced everywhere else; computing the final
+        integer once in Python before writing it keeps both scopes on one
+        rounding implementation.
+        """
         try:
-            # Upsert global reputation record
-            result = self.dal.executesql(
-                """INSERT INTO reputation_global (hub_user_id, score, total_events)
-                   VALUES (%s, %s, 1)
-                   ON CONFLICT (hub_user_id) DO UPDATE
-                   SET score = LEAST(850, GREATEST(300,
-                       reputation_global.score + EXCLUDED.score - %s)),
-                       total_events = reputation_global.total_events + 1,
-                       last_event_at = NOW(),
-                       updated_at = NOW()""",
-                [user_id, Config.REPUTATION_DEFAULT + score_change,
-                 Config.REPUTATION_DEFAULT]
+            existing = self.dal.executesql(
+                "SELECT score FROM reputation_global WHERE hub_user_id = %s",
+                [user_id]
+            )
+            if existing:
+                score_before = existing[0][0]
+                score_after = self._clamp_score(
+                    score_before + score_change,
+                    Config.REPUTATION_MIN,
+                    Config.REPUTATION_MAX
+                )
+                self.dal.executesql(
+                    """UPDATE reputation_global
+                       SET score = %s, total_events = total_events + 1,
+                           last_event_at = NOW(), updated_at = NOW()
+                       WHERE hub_user_id = %s""",
+                    [score_after, user_id]
+                )
+            else:
+                score_before = Config.REPUTATION_DEFAULT
+                score_after = self._clamp_score(
+                    score_before + score_change,
+                    Config.REPUTATION_MIN,
+                    Config.REPUTATION_MAX
+                )
+                # Select-then-insert, not INSERT ... ON CONFLICT: matches the
+                # same non-atomic lookup-then-write pattern adjust() already
+                # uses for community_members above -- a pre-existing,
+                # out-of-scope race (two concurrent first-events for the same
+                # never-before-seen hub_user_id) shared by both, not
+                # introduced here.
+                self.dal.executesql(
+                    """INSERT INTO reputation_global (hub_user_id, score, total_events)
+                       VALUES (%s, %s, 1)""",
+                    [user_id, score_after]
+                )
+
+            self.logger.debug(
+                "Global reputation weight applied",
+                reputation_event_type=event_type,
+                weight=weight,
+                delta=score_change,
+                hub_user_id=user_id,
+                score_before=score_before,
+                score_after=score_after,
             )
         except Exception as e:
             self.logger.warning(f"Failed to update global reputation: {e}")

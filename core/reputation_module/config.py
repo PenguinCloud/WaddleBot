@@ -19,6 +19,7 @@ class Config:
     MODULE_VERSION = '2.0.0'
     MODULE_PORT = int(os.getenv('MODULE_PORT', '8021'))
     GRPC_PORT = int(os.getenv('GRPC_PORT', '50021'))
+    DEPLOYMENT_TIER = os.getenv('DEPLOYMENT_TIER', 'development').lower()  # development, alpha, beta, gamma, production
     DATABASE_URL = os.getenv(
         'DATABASE_URL',
         'postgresql://waddlebot:password@localhost:5432/waddlebot'
@@ -54,10 +55,14 @@ class Config:
     # Cache settings
     WEIGHT_CACHE_TTL = int(os.getenv('WEIGHT_CACHE_TTL', '300'))
 
-    # Default weights (used for all non-premium communities)
+    # Default weights (used for all non-premium communities). chat_message/
+    # command_usage are whole, positive ints (gh-310) -- see
+    # WeightManager.CommunityWeights and ReputationService._clamp_score for
+    # why sub-1.0-magnitude weights never move the INTEGER-typed score
+    # columns across repeated events.
     DEFAULT_WEIGHTS = {
-        'chat_message': 0.01,
-        'command_usage': -0.1,
+        'chat_message': 1.0,
+        'command_usage': 1.0,
         'giveaway_entry': -1.0,  # Larger penalty to dissuade giveaway bots
         'follow': 1.0,
         'subscription': 5.0,

@@ -111,15 +111,56 @@ async def startup():
     reputation_pb2_grpc.add_ReputationServiceServicer_to_server(servicer, grpc_server)
 
     grpc_server_address = f"0.0.0.0:{Config.GRPC_PORT}"
-    bind_secure_port(grpc_server, grpc_server_address)
-    await grpc_server.start()
 
-    logger.system(
-        "gRPC server started (TLS)",
-        action="grpc_startup",
-        port=Config.GRPC_PORT,
-        address=grpc_server_address
-    )
+    # gRPC TLS mode decision (upfront, not fallback on failure)
+    grpc_tls_insecure_flag = os.getenv('GRPC_TLS_INSECURE_DEV', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    dev_tiers = {'development', 'alpha', 'local', 'test'}
+    use_insecure = grpc_tls_insecure_flag and Config.DEPLOYMENT_TIER in dev_tiers
+
+    if use_insecure:
+        # Deliberate insecure mode for dev tiers only
+        logger.warning(
+            "gRPC server starting in INSECURE mode",
+            action="grpc_startup_mode",
+            tier=Config.DEPLOYMENT_TIER,
+            insecure_flag_set=grpc_tls_insecure_flag,
+            note="Only valid for development/alpha/local/test"
+        )
+        grpc_server.add_insecure_port(grpc_server_address)
+        await grpc_server.start()
+        logger.system(
+            "gRPC server started (insecure)",
+            action="grpc_startup",
+            port=Config.GRPC_PORT,
+            address=grpc_server_address
+        )
+    elif grpc_tls_insecure_flag and Config.DEPLOYMENT_TIER not in dev_tiers:
+        # Refuse insecure mode in production tiers even if flag is set
+        logger.error(
+            "GRPC_TLS_INSECURE_DEV set in non-dev tier (refusing startup)",
+            action="grpc_security_violation",
+            tier=Config.DEPLOYMENT_TIER
+        )
+        sys.exit(1)
+    else:
+        # TLS required: fail closed if setup fails
+        try:
+            bind_secure_port(grpc_server, grpc_server_address)
+            await grpc_server.start()
+            logger.system(
+                "gRPC server started (TLS)",
+                action="grpc_startup",
+                port=Config.GRPC_PORT,
+                address=grpc_server_address
+            )
+        except Exception as e:
+            logger.error(
+                f"gRPC TLS setup failed (fail closed): {e}",
+                action="grpc_startup_error",
+                tier=Config.DEPLOYMENT_TIER
+            )
+            sys.exit(1)
+
     logger.system("reputation_module started", result="SUCCESS")
 
 

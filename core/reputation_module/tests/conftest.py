@@ -54,6 +54,9 @@ def _try_connect() -> DAL | None:
 class NullLogger:
     """No-op logger satisfying ReputationService/WeightManager's logger interface."""
 
+    def debug(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
     def error(self, *args: Any, **kwargs: Any) -> None:
         pass
 

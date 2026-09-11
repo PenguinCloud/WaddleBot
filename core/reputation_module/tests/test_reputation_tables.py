@@ -248,3 +248,105 @@ async def test_adjust_writes_community_and_global_reputation(
         [hub_user_id],
     )
     assert global_row[0][0] == Config.REPUTATION_DEFAULT + result.score_change
+
+
+async def test_adjust_chat_message_accrues_community_and_global_reputation(
+    dal: DAL, seeded_ids: tuple[int, int]
+) -> None:
+    # regression: gh-310
+    """`adjust(event_type="chat_message")` must process end to end and audit-log the real weight.
+
+    `services/activity_accrual.py` (svc-process) is the first production
+    caller of `adjust()` with a positive-activity `event_type` -- before
+    gh-310, the sole caller was `svc_process.services.moderation_gate` with
+    a fixed `event_type="warn"` (a penalty), so reputation never accrued
+    from ordinary activity at all. This exercises `adjust()` against the
+    real migrated schema for `chat_message` specifically: the write
+    succeeds, a `reputation_global` row is created for the (now
+    hub-linked) user with `total_events` incremented, and exactly one
+    `reputation_events` audit row is written preserving the full-precision
+    `score_change` (that column is `DECIMAL(10,4)`, migration
+    080_add_reputation_tables.sql).
+
+    FIXED (gh-310): `WeightManager`'s default `chat_message`/`command_usage`
+    weights were previously ``0.01``/``-0.1`` (`CommunityWeights`,
+    `services/weight_manager.py`) against `INTEGER`-typed
+    `community_members.reputation`/`reputation_global.score` columns --
+    `_clamp_score()` re-rounded the already-STORED integer on every call
+    with no column to carry the sub-1.0 remainder across events, so
+    ``round(600 + 0.01) == 600`` on every single call, forever (empirically
+    verified against a live migrated Postgres: 100 consecutive
+    `chat_message` adjustments left both scores unchanged at 600). Fixed by
+    making both defaults whole, positive integers (``1.0`` each -- activity
+    farming is bounded by svc-process's own per-user cooldowns, not by a
+    fractional weight) so a single event always moves the score by exactly
+    the configured amount; `_clamp_score()`'s documented, still-real
+    behavior for a *premium* community that configures its own sub-1.0
+    override is exercised separately in
+    `tests/test_reputation_fractional_weights.py`.
+    """
+    community_id, hub_user_id = seeded_ids
+    weight_manager = WeightManager(dal, NullLogger())
+    service = ReputationService(dal, weight_manager, NullLogger())
+
+    platform = "twitch"
+    platform_user_id = f"repmig-chat-{hub_user_id}"
+    expected_weight = weight_manager._default_weights.chat_message
+    assert expected_weight != 0.0  # sanity: this event type must actually carry weight
+
+    # Seed the community_members row adjust() will update -- linked to the
+    # hub user via the table's real `user_id` column, same convention
+    # `test_adjust_writes_community_and_global_reputation` uses above.
+    dal.executesql(
+        """INSERT INTO community_members
+           (community_id, user_id, platform, platform_user_id, reputation, role)
+           VALUES (%s, %s, %s, %s, %s, 'member')""",
+        [community_id, str(hub_user_id), platform, platform_user_id, 600],
+    )
+    dal.commit()
+
+    assert await service.get_history(community_id, hub_user_id) == []
+
+    result = await service.adjust(
+        community_id=community_id,
+        user_id=hub_user_id,
+        event_type="chat_message",
+        platform=platform,
+        platform_user_id=platform_user_id,
+        metadata={"event_id": "evt-repmig-310", "source": "activity_accrual"},
+    )
+
+    assert result.success, result.error
+    assert result.error is None
+    assert result.score_change == pytest.approx(expected_weight)
+    assert result.score_before == 600
+    # gh-310 fix: a whole-number weight always moves the score by exactly
+    # that amount on a single event.
+    assert result.score_after == 600 + int(expected_weight)
+
+    community_row = dal.executesql(
+        "SELECT reputation FROM community_members WHERE community_id = %s AND user_id = %s",
+        [community_id, str(hub_user_id)],
+    )
+    assert community_row[0][0] == 600 + int(expected_weight)
+
+    # reputation_global row is created for this now-hub-linked user, with
+    # the same delta applied via ReputationService._clamp_score (see
+    # _update_global_reputation's docstring) and total_events incremented.
+    global_row = dal.executesql(
+        "SELECT score, total_events FROM reputation_global WHERE hub_user_id = %s",
+        [hub_user_id],
+    )
+    assert global_row[0][0] == Config.REPUTATION_DEFAULT + int(expected_weight)
+    assert global_row[0][1] == 1
+
+    # Exactly one reputation_events audit row was written for this accrual,
+    # preserving the full-precision configured weight (DECIMAL column).
+    history = await service.get_history(community_id, hub_user_id)
+    assert len(history) == 1
+    event = history[0]
+    assert event.event_type == "chat_message"
+    assert event.score_change == pytest.approx(expected_weight)
+    assert event.score_before == 600
+    assert event.score_after == 600 + int(expected_weight)
+    assert event.metadata == {"event_id": "evt-repmig-310", "source": "activity_accrual"}

@@ -26,6 +26,10 @@ RUN useradd --create-home --shell /bin/bash appuser
 # Set proper permissions for app directory and log directory
 RUN chown -R appuser:appuser /app /var/log/waddlebotlog
 
+# Copy and make entrypoint script executable
+COPY core/reputation_module/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 USER appuser
 
-CMD ["hypercorn", "app:app", "--bind", "0.0.0.0:8021", "--workers", "4"]
+ENTRYPOINT ["/app/entrypoint.sh"]
