@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:gazer/app.dart';
+import 'package:gazer/config/seed.dart';
+import 'package:gazer/services/settings_repository.dart';
 
 /// Which physical form factor this capture run targets, set at build time
 /// via `--dart-define=GAZER_SCREENSHOT_FORM_FACTOR=phone|tablet`. Controls
@@ -22,6 +26,21 @@ void main() {
       IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   testWidgets('capture docs/screenshots/gazer marketing set ($_formFactor)', (WidgetTester tester) async {
+    // `flutter build apk --target=integration_test/screenshots_test.dart`
+    // makes THIS file's `main()` the app's actual Dart entrypoint --
+    // lib/main.dart (and its applySeedIfRequested call before runApp) never
+    // executes in this flow, exactly like every other integration_test/
+    // entrypoint in this app (see go_live_unreachable_test.dart, which
+    // populates settings via the UI instead for the same reason). Seed the
+    // same underlying platform storage GazerApp's own SecureSettingsRepository
+    // will read from, directly, before pumping the widget tree.
+    await applySeedIfRequested(
+      SecureSettingsRepository(
+        secure: const FlutterSecureStorage(),
+        prefs: SharedPreferencesAsync(),
+      ),
+    );
+
     await tester.pumpWidget(const ProviderScope(child: GazerApp()));
     await tester.pumpAndSettle(const Duration(seconds: 5));
 
