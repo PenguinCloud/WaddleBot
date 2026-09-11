@@ -4,6 +4,7 @@ import '../models/pipeline_state.dart';
 import '../models/stream_stats.dart';
 import '../pigeon/pipeline.g.dart';
 import '../services/native_event_bridge.dart';
+import '../services/permission_gate.dart';
 import '../services/pipeline_controller.dart';
 import '../services/reconnect_policy.dart';
 import 'devices_provider.dart';
@@ -55,3 +56,9 @@ Stream<StreamStats> streamStats(Ref ref) async* {
   yield StreamStats.zero();
   yield* controller.stats;
 }
+
+/// The [PermissionGate] HomeScreen's Go Live handler consults before ever
+/// calling [PipelineController.goLive]; overridden with a fake in widget
+/// tests so no real `permission_handler` platform channel is ever hit.
+@Riverpod(keepAlive: true)
+PermissionGate permissionGate(Ref ref) => PermissionHandlerGate();

@@ -15,6 +15,7 @@ import 'package:gazer/providers/license_provider.dart';
 import 'package:gazer/providers/pipeline_provider.dart';
 import 'package:gazer/providers/settings_provider.dart';
 import 'package:gazer/providers/update_provider.dart';
+import 'package:gazer/services/permission_gate.dart';
 import 'package:gazer/services/pipeline_controller.dart';
 import 'package:gazer/services/reconnect_policy.dart';
 
@@ -61,7 +62,10 @@ void main() {
     );
   });
 
-  List<Override> overrides({required LicenseState license}) => <Override>[
+  List<Override> overrides({
+    required LicenseState license,
+    PermissionGate? permissionGate,
+  }) => <Override>[
     settingsRepositoryProvider.overrideWithValue(settingsRepo),
     gazerHostApiProvider.overrideWithValue(hostApi),
     // Wires hostApi.bridge into the controller under test so
@@ -81,6 +85,9 @@ void main() {
     isOnlineProvider.overrideWith((Ref ref) => Stream<bool>.value(true)),
     updateCheckerProvider.overrideWith(
       (Ref ref) async => FakeUpdateChecker(null),
+    ),
+    permissionGateProvider.overrideWithValue(
+      permissionGate ?? FakePermissionGate(),
     ),
   ];
 
@@ -315,5 +322,66 @@ void main() {
       find.text('Check camera permission in system settings.'),
       findsOneWidget,
     );
+  });
+
+  testWidgets(
+    'denied permission shows a SnackBar with a retry action, and does not prepare',
+    (WidgetTester tester) async {
+      final gate = FakePermissionGate(PermissionOutcome.denied);
+      await pumpGazerApp(
+        tester,
+        overrides: overrides(
+          license: license(flagsSet: true),
+          permissionGate: gate,
+        ),
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Go Live'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Camera and microphone permission are needed to go live.'),
+        findsOneWidget,
+      );
+      expect(find.text('Retry'), findsOneWidget);
+      expect(hostApi.prepareCalls, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'permanentlyDenied permission shows a dialog with an Open settings button, and does not prepare',
+    (WidgetTester tester) async {
+      final gate = FakePermissionGate(PermissionOutcome.permanentlyDenied);
+      await pumpGazerApp(
+        tester,
+        overrides: overrides(
+          license: license(flagsSet: true),
+          permissionGate: gate,
+        ),
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Go Live'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Camera or microphone permission was permanently denied.'),
+        findsOneWidget,
+      );
+      expect(find.text('Open settings'), findsOneWidget);
+      expect(hostApi.prepareCalls, isEmpty);
+    },
+  );
+
+  testWidgets('granted permission proceeds to call prepare', (
+    WidgetTester tester,
+  ) async {
+    final gate = FakePermissionGate(PermissionOutcome.granted);
+    await pumpGazerApp(
+      tester,
+      overrides: overrides(
+        license: license(flagsSet: true),
+        permissionGate: gate,
+      ),
+    );
+    await tester.tap(find.widgetWithText(FilledButton, 'Go Live'));
+    await tester.pumpAndSettle();
+    expect(gate.callCount, 1);
+    expect(hostApi.prepareCalls, hasLength(1));
   });
 }

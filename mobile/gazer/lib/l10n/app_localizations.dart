@@ -819,6 +819,30 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Could not open the release page. Please try again.'**
   String get updateOpenFailed;
+
+  /// No description provided for @permissionDeniedMessage.
+  ///
+  /// In en, this message translates to:
+  /// **'Camera and microphone permission are needed to go live.'**
+  String get permissionDeniedMessage;
+
+  /// No description provided for @permissionDeniedRetryLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get permissionDeniedRetryLabel;
+
+  /// No description provided for @permissionPermanentlyDeniedMessage.
+  ///
+  /// In en, this message translates to:
+  /// **'Camera or microphone permission was permanently denied.'**
+  String get permissionPermanentlyDeniedMessage;
+
+  /// No description provided for @permissionOpenSettingsLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Open settings'**
+  String get permissionOpenSettingsLabel;
 }
 
 class _AppLocalizationsDelegate

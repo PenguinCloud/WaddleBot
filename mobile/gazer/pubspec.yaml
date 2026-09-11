@@ -96,6 +96,19 @@ dev_dependencies:
   # via MockPlatformInterfaceMixin (plugin_platform_interface) to test the
   # canLaunchUrl/launchUrl failure paths without a real platform channel.
   url_launcher_platform_interface: 2.3.2
+  # Already resolved transitively (via permission_handler 12.0.3) at this
+  # exact version per pubspec.lock -- declared directly, not newly
+  # introduced, because permission_gate_test.dart imports
+  # PermissionHandlerPlatform from it directly (to mock the platform
+  # channel) and `depend_on_referenced_packages` requires every
+  # directly-imported package to be a direct dependency. Pinned exact
+  # version, no ^/~, per Dependency Pinning -- same pattern as
+  # shared_preferences_platform_interface above (Task 7).
+  permission_handler_platform_interface: 4.4.1
+  # Already resolved transitively (via permission_handler_platform_interface)
+  # at this exact version per pubspec.lock -- declared directly because
+  # permission_gate_test.dart imports MockPlatformInterfaceMixin from it
+  # directly. Pinned exact version, no ^/~, per Dependency Pinning.
   plugin_platform_interface: 2.1.8
 
 flutter:

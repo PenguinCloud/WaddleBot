@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../config/flag_keys.dart';
 import '../l10n/app_localizations.dart';
@@ -14,6 +15,7 @@ import '../providers/license_provider.dart';
 import '../providers/pipeline_provider.dart';
 import '../providers/settings_provider.dart';
 import '../services/feature_flags.dart';
+import '../services/permission_gate.dart';
 import '../services/pipeline_controller.dart';
 import '../services/settings_validation.dart';
 import '../widgets/source_picker.dart';
@@ -67,6 +69,68 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     } on ArgumentError catch (_) {
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(content: Text(l10n.goLiveFailedMessage)));
+    }
+  }
+
+  /// Requests camera/microphone/notification permission via
+  /// [permissionGateProvider] before ever calling [_handleGoLive].
+  ///
+  /// Denied shows a retryable [SnackBar]; permanently denied opens a
+  /// dialog linking to the system app settings page; granted proceeds
+  /// exactly as the pre-permission-gate Go Live handler did.
+  Future<void> _requestGoLivePermissions({
+    required PipelineController controller,
+    required GazerSettings settings,
+    required List<VideoDevice> devices,
+    required FeatureFlags flags,
+  }) async {
+    final AppLocalizations l10n = AppLocalizations.of(context);
+    final PermissionGate gate = ref.read(permissionGateProvider);
+    final PermissionOutcome outcome = await gate.ensureLivePermissions();
+    if (!mounted) return;
+
+    switch (outcome) {
+      case PermissionOutcome.granted:
+        await _handleGoLive(
+          controller: controller,
+          settings: settings,
+          devices: devices,
+          flags: flags,
+          orientation: MediaQuery.orientationOf(context) == Orientation.portrait
+              ? OutputOrientation.portrait
+              : OutputOrientation.landscape,
+        );
+      case PermissionOutcome.denied:
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(l10n.permissionDeniedMessage),
+            action: SnackBarAction(
+              label: l10n.permissionDeniedRetryLabel,
+              onPressed: () => _requestGoLivePermissions(
+                controller: controller,
+                settings: settings,
+                devices: devices,
+                flags: flags,
+              ),
+            ),
+          ),
+        );
+      case PermissionOutcome.permanentlyDenied:
+        await showDialog<void>(
+          context: context,
+          builder: (BuildContext dialogContext) => AlertDialog(
+            content: Text(l10n.permissionPermanentlyDeniedMessage),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () {
+                  Navigator.of(dialogContext).pop();
+                  openAppSettings();
+                },
+                child: Text(l10n.permissionOpenSettingsLabel),
+              ),
+            ],
+          ),
+        );
     }
   }
 
@@ -132,16 +196,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               child: FilledButton(
                 key: const Key('goLiveButton'),
                 onPressed: canGoLive
-                    ? () => _handleGoLive(
+                    ? () => _requestGoLivePermissions(
                         controller: controller,
                         settings: settings,
                         devices: devices,
                         flags: flags,
-                        orientation:
-                            MediaQuery.orientationOf(context) ==
-                                Orientation.portrait
-                            ? OutputOrientation.portrait
-                            : OutputOrientation.landscape,
                       )
                     : null,
                 child: Text(l10n.goLiveButtonLabel),

@@ -2,6 +2,7 @@ import 'package:gazer/models/gazer_settings.dart';
 import 'package:gazer/models/license_state.dart';
 import 'package:gazer/models/update_info.dart';
 import 'package:gazer/services/license_client.dart';
+import 'package:gazer/services/permission_gate.dart';
 import 'package:gazer/services/settings_repository.dart';
 import 'package:gazer/services/update_checker.dart';
 
@@ -87,4 +88,22 @@ class FakeUpdateChecker implements UpdateChecker {
 
   @override
   Future<UpdateInfo?> check() async => infoToReturn;
+}
+
+/// Test double for [PermissionGate] — returns a canned [PermissionOutcome]
+/// instead of touching the real `permission_handler` platform channel.
+class FakePermissionGate implements PermissionGate {
+  FakePermissionGate([this.outcome = PermissionOutcome.granted]);
+
+  /// The value every [ensureLivePermissions] call resolves to.
+  final PermissionOutcome outcome;
+
+  /// Number of times [ensureLivePermissions] was called.
+  int callCount = 0;
+
+  @override
+  Future<PermissionOutcome> ensureLivePermissions() async {
+    callCount++;
+    return outcome;
+  }
 }

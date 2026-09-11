@@ -134,5 +134,9 @@
   "goLiveFailedMessage": "Could not start the stream. Please try again.",
   "settingsSaveFailed": "Failed to save settings. Please try again.",
   "settingsDebugLogsLabel": "Debug logs",
-  "updateOpenFailed": "Could not open the release page. Please try again."
+  "updateOpenFailed": "Could not open the release page. Please try again.",
+  "permissionDeniedMessage": "Camera and microphone permission are needed to go live.",
+  "permissionDeniedRetryLabel": "Retry",
+  "permissionPermanentlyDeniedMessage": "Camera or microphone permission was permanently denied.",
+  "permissionOpenSettingsLabel": "Open settings"
 }

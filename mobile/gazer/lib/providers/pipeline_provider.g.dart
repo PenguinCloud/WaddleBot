@@ -184,3 +184,55 @@ final class StreamStatsProvider
 }
 
 String _$streamStatsHash() => r'25c93e8ee590c268dd6c67f235e25f66a3e70fa5';
+
+/// The [PermissionGate] HomeScreen's Go Live handler consults before ever
+/// calling [PipelineController.goLive]; overridden with a fake in widget
+/// tests so no real `permission_handler` platform channel is ever hit.
+
+@ProviderFor(permissionGate)
+final permissionGateProvider = PermissionGateProvider._();
+
+/// The [PermissionGate] HomeScreen's Go Live handler consults before ever
+/// calling [PipelineController.goLive]; overridden with a fake in widget
+/// tests so no real `permission_handler` platform channel is ever hit.
+
+final class PermissionGateProvider
+    extends $FunctionalProvider<PermissionGate, PermissionGate, PermissionGate>
+    with $Provider<PermissionGate> {
+  /// The [PermissionGate] HomeScreen's Go Live handler consults before ever
+  /// calling [PipelineController.goLive]; overridden with a fake in widget
+  /// tests so no real `permission_handler` platform channel is ever hit.
+  PermissionGateProvider._()
+    : super(
+        from: null,
+        argument: null,
+        retry: null,
+        name: r'permissionGateProvider',
+        isAutoDispose: false,
+        dependencies: null,
+        $allTransitiveDependencies: null,
+      );
+
+  @override
+  String debugGetCreateSourceHash() => _$permissionGateHash();
+
+  @$internal
+  @override
+  $ProviderElement<PermissionGate> $createElement($ProviderPointer pointer) =>
+      $ProviderElement(pointer);
+
+  @override
+  PermissionGate create(Ref ref) {
+    return permissionGate(ref);
+  }
+
+  /// {@macro riverpod.override_with_value}
+  Override overrideWithValue(PermissionGate value) {
+    return $ProviderOverride(
+      origin: this,
+      providerOverride: $SyncValueProvider<PermissionGate>(value),
+    );
+  }
+}
+
+String _$permissionGateHash() => r'85de867fd4ca0f798507ee9a9e4929f3137cc7b6';
