@@ -31,7 +31,18 @@ void main() {
 
       final Element appElement = tester.element(find.byType(GazerApp));
       final ProviderContainer container = ProviderScope.containerOf(appElement);
-      final AppLocalizations l10n = AppLocalizations.of(appElement);
+      // `ProviderScope` genuinely is an ancestor of `GazerApp`, so
+      // `containerOf(appElement)` above is correct. `AppLocalizations.of` is
+      // not symmetric with it: it is `Localizations.of<AppLocalizations>(...)!`,
+      // an *ancestor* lookup, and the `Localizations` widget is built by
+      // `MaterialApp` *inside* `GazerApp` -- from `GazerApp`'s own element
+      // there is no `Localizations` ancestor and the `!` throws. Resolve it
+      // from a descendant instead: the settings gear lives in `HomeScreen`'s
+      // `AppBar`, below `MaterialApp`, and is tapped on the very next line, so
+      // it is guaranteed present and unambiguous here.
+      final AppLocalizations l10n = AppLocalizations.of(
+        tester.element(find.byKey(const Key('settingsGearButton'))),
+      );
 
       // --- Settings: point at the emulator host loopback, nothing listens there ---
       await tester.tap(find.byKey(const Key('settingsGearButton')));

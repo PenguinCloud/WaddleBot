@@ -572,11 +572,18 @@ jobs:
           # Fix round 5: `--use-application-binary` runs the APK the pre-build step already
           # produced rather than letting drive build a single-ABI one that breaks R23's Gradle
           # dependency lock -- see that step's comment for the full reasoning.
+          # Fix round 6: POST_NOTIFICATIONS is granted alongside CAMERA/RECORD_AUDIO.
+          # PermissionHandlerGate requests it whenever sdkInt >= 33 (this AVD is android-34),
+          # and the resulting system dialog lives outside the Flutter view, so the integration
+          # test cannot dismiss it -- the gate would resolve to `denied` and Go Live would
+          # never reach ConnectingState. mobile/gazer/scripts/run_integration_test.sh grants
+          # the identical three so the local and CI paths do not diverge.
           working-directory: mobile/gazer
           script: |
             adb install -r build/app/outputs/flutter-apk/app-debug.apk
             adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
             adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
+            adb shell pm grant io.waddlebot.gazer android.permission.POST_NOTIFICATIONS
             bash -eo pipefail -c "flutter drive --driver=test_driver/integration_test.dart --target=integration_test/go_live_unreachable_test.dart --use-application-binary=build/app/outputs/flutter-apk/app-debug.apk -d emulator-5554 --dart-define=GAZER_FLAGS_OVERRIDE=camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture 2>&1 | tee /tmp/flutter_integration.log"
             grep -qE '\+[1-9][0-9]*' /tmp/flutter_integration.log
             python3 scripts/decode_screenshots.py

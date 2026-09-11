@@ -11,6 +11,7 @@
 # already-running emulator/device instead, run
 #   adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
 #   adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
+#   adb shell pm grant io.waddlebot.gazer android.permission.POST_NOTIFICATIONS
 set -euo pipefail
 
 FLAGS_DEFINE="camera-stream,adaptive-bitrate,rtmp-auth,uvc-capture"
@@ -50,6 +51,13 @@ flutter build apk --debug \
 adb install -r build/app/outputs/flutter-apk/app-debug.apk
 adb shell pm grant io.waddlebot.gazer android.permission.CAMERA
 adb shell pm grant io.waddlebot.gazer android.permission.RECORD_AUDIO
+# API 33+ made POST_NOTIFICATIONS a runtime permission, and PermissionHandlerGate
+# requests it alongside camera/microphone whenever sdkInt >= 33 (this AVD is
+# android-34). Without this grant, `permissions.request()` raises the system
+# permission dialog -- which lives outside the Flutter view, so the integration
+# test cannot dismiss it -- the gate resolves to `denied`, Go Live never starts
+# the pipeline, and the ConnectingState assertion fails.
+adb shell pm grant io.waddlebot.gazer android.permission.POST_NOTIFICATIONS
 
 # `flutter drive`, not `flutter test`: only integrationDriver() (test_driver/
 # integration_test.dart) writes build/integration_response_data.json, which is
